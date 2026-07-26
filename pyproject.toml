@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-riva-frontend"
+version = "0.1.0"
+description = "Downstream Riva and Speech NIM frontend for vLLM-Omni"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+dependencies = [
+    "grpcio>=1.60",
+    "grpcio-health-checking>=1.60",
+    "grpcio-reflection>=1.60",
+    "nvidia-riva-client==2.26.0",
+    "numpy>=1.26",
+    "python-multipart>=0.0.9",
+    "pyyaml>=6",
+    "scipy>=1.14",
+]
+
+[project.urls]
+Repository = "https://github.com/pdtgct/vllm-riva-frontend"
+
+[project.scripts]
+vllm-riva-frontend-render = "vllm_riva_frontend.deployment:main"
+
+[project.entry-points."vllm_omni.application_plugins"]
+riva_frontend = "vllm_riva_frontend:plugin"
+
+[dependency-groups]
+dev = ["mypy>=1.11", "pytest>=8", "ruff>=0.15", "types-pyyaml>=6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_riva_frontend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 80
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "D", "UP", "B", "SIM"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["vllm_riva_frontend"]
+
+[[tool.mypy.overrides]]
+module = [
+    "grpc",
+    "grpc.*",
+    "grpc_health",
+    "grpc_health.*",
+    "grpc_reflection",
+    "grpc_reflection.*",
+    "riva",
+    "riva.*",
+    "scipy",
+    "scipy.*",
+]
+ignore_missing_imports = true

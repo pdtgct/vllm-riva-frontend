@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${SERVICE_NAME}-config
+  annotations:
+    port.nemotron/gpu-class: "${GPU_CLASS}"
+data:
+  riva_frontend.json: |
+${PLUGIN_CONFIG_JSON}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SERVICE_NAME}
+  annotations:
+    port.nemotron/gpu-class: "${GPU_CLASS}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${SERVICE_NAME}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${SERVICE_NAME}
+      annotations:
+        port.nemotron/gpu-class: "${GPU_CLASS}"
+    spec:
+      containers:
+        - name: frontend
+          image: ${IMAGE}
+          imagePullPolicy: ${IMAGE_PULL_POLICY}
+          command:
+            - /opt/venv-port/bin/vllm-omni
+          args:
+            - serve
+            - ${MODEL}
+            - --omni
+            - --stage-configs-path
+            - ${STAGE_CONFIG_PATH}
+            - --served-model-name
+            - ${SERVED_MODEL_NAME}
+            - --host
+            - ${HTTP_HOST}
+            - --port
+            - "${HTTP_PORT}"
+            - --api-server-count
+            - "1"
+            - --application-plugin
+            - riva_frontend
+            - --application-plugin-config
+            - riva_frontend=/etc/vllm_riva_frontend/riva_frontend.json
+            - --ws-max-size
+            - "${WS_RECEIVE_MAX_BYTES}"
+            - --h11-max-incomplete-event-size
+            - "${HTTP_REQUEST_HEADER_MAX_BYTES}"
+          ports:
+            - name: http
+              containerPort: ${HTTP_PORT}
+            - name: grpc
+              containerPort: ${GRPC_SERVICE_PORT}
+          resources:
+            limits:
+              ${GPU_RESOURCE}: 1
+          volumeMounts:
+            - name: plugin-config
+              mountPath: /etc/vllm_riva_frontend
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: plugin-config
+          configMap:
+            name: ${SERVICE_NAME}-config
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: ${WORKSPACE_CLAIM_NAME}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}
+spec:
+  selector:
+    app.kubernetes.io/name: ${SERVICE_NAME}
+  ports:
+    - name: http
+      port: ${HTTP_PORT}
+      targetPort: http
+    - name: grpc
+      port: ${GRPC_SERVICE_PORT}
+      targetPort: grpc
