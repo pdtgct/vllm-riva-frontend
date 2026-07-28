@@ -2,11 +2,25 @@
 
 import json
 import math
+import re
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 from vllm_riva_frontend.frontend import RESAMPLER_ID
+
+#: A NIM-owned model-selection identifier.  This deployment's own
+#: server-authored provenance must never publish one; see
+#: ``build_deployment_provenance``, which makes that structurally true
+#: for *keys* rather than filtering for it, and ``load_plugin_config``
+#: / ``_validate_provenance_value``, which does the same for *values*.
+FORBIDDEN_PROVENANCE_KEY = "selectedModelProfileId"
+
+#: A bare hex token, either case, spanning the whole value -- the shape a
+#: NIM profile hash takes.  Deliberately does not match a "sha256:<hex>"
+#: image digest, which is colon-prefixed rather than a full-string match.
+_BARE_HEX_HASH = re.compile(r"^[0-9A-Fa-f]{8,64}$")
+_SCHEME_SEPARATOR = "://"
 
 
 @dataclass(frozen=True)
@@ -43,11 +57,67 @@ class FrontendConfig:
 
 @dataclass(frozen=True)
 class DeploymentMetadata:
-    """Deployment-owned identifiers exposed by compatibility metadata."""
+    """Deployment-owned identifiers exposed by compatibility metadata.
+
+    Only ``load_plugin_config`` constructs this; its fields' *values*,
+    not only their allowlisted set of keys, are validated there (see
+    ``_validate_provenance_value``) before this dataclass can exist.
+    """
 
     image: str
     pin: str
     precision_policy: str
+
+
+# @spec ING-SHIM-002
+def _validate_provenance_value(name: str, value: str) -> None:
+    """Reject a server-authored provenance value shaped like NIM identity.
+
+    Applied to every provenance-bound field (image, pin, precision_policy,
+    resampler) at configuration ingestion -- the only place any of these
+    values ever originates -- so the allowlist-by-construction claim in
+    ``build_deployment_provenance`` is honest about values, not only keys:
+    a scheme-smuggled registry reference (``ngc://...`` or any other
+    ``scheme://`` form) or a bare NIM profile hash cannot reach
+    /v1/metadata through any of the four fields, fail-closed at startup.
+
+    A ``sha256:<hex>`` image digest remains legal: it is colon-prefixed,
+    not ``://``-scheme-prefixed, and (with that prefix included) is not a
+    full-string bare-hex value either.
+    """
+    if value != value.strip():
+        raise ValueError(f"{name} must not carry leading/trailing whitespace")
+    if _SCHEME_SEPARATOR in value:
+        raise ValueError(f"{name} must not contain a scheme reference (://)")
+    if _BARE_HEX_HASH.fullmatch(value):
+        raise ValueError(f"{name} must not be a bare hex identifier")
+
+
+# @spec ING-SHIM-002
+def build_deployment_provenance(
+    metadata: DeploymentMetadata, *, resampler_identifier: str
+) -> dict[str, str]:
+    """Build the one server-authored provenance object by allowlist.
+
+    This is allowlist construction, not filtered copying, for *keys*: the
+    return value can only ever contain these four factual identifiers,
+    because the signature takes exactly those typed fields and nothing
+    else to draw from.  No compatibility surface may build its own
+    server-authored provenance by copying an arbitrary mapping.
+
+    The *values* of those four fields are constrained separately, at
+    configuration ingestion (``load_plugin_config``, via
+    ``_validate_provenance_value``): a NIM registry identity or a bare
+    NIM profile hash is rejected there, fail-closed, before a
+    ``DeploymentMetadata`` can exist to be threaded through here.  This
+    function trusts that gate rather than re-validating.
+    """
+    return {
+        "image": metadata.image,
+        "pin": metadata.pin,
+        "precision_policy": metadata.precision_policy,
+        "resampler": resampler_identifier,
+    }
 
 
 def is_positive_finite(value: int | float) -> bool:
@@ -260,6 +330,15 @@ def load_plugin_config(
     for name, metadata_value in metadata_values.items():
         if not isinstance(metadata_value, str) or not metadata_value.strip():
             raise ValueError(f"{name} must be a non-empty string")
+    # Every provenance-bound value, not only the three DeploymentMetadata
+    # fields: build_deployment_provenance also threads resampler_identifier
+    # into /v1/metadata, so it is validated by the same shared rule here.
+    provenance_bound_values = {
+        **metadata_values,
+        "resampler_identifier": frontend.resampler_identifier,
+    }
+    for name, value in provenance_bound_values.items():
+        _validate_provenance_value(name, value)
     metadata = DeploymentMetadata(
         image=metadata_values["deployment_image"],
         pin=metadata_values["pin"],

@@ -264,6 +264,32 @@ def test_endpoint_drives_one_direct_lease_to_release() -> None:
     assert owner_events == ["register", "release"]
 
 
+# @spec ING-VEH-013, ING-HTTP-002, ING-HTTP-010, ING-LIFE-012
+def test_accepted_alias_selector_still_opens_the_bound_lease() -> None:
+    """An accepted alias must delegate, not vanish before the factory.
+
+    ``_validate`` gates the ``model`` field on exact equality to the
+    served alias, but the accepted value itself is never threaded into
+    ``SessionFactory.open`` (this deployment serves exactly one model).
+    The one observable guarantee available here is that acceptance still
+    results in a real delegated lease -- the historical shim accepted any
+    nonempty model and then quietly never opened one.
+    """
+    factory = Factory()
+    body = _multipart([("file", _wav()), ("model", b"nemotron")])
+    response = asyncio.run(
+        _endpoint(factory).handle(
+            scope={"type": "http", "method": "POST", "headers": _headers()},
+            receive=Receive([body]),
+        )
+    )
+
+    assert response.status == 200
+    assert json.loads(response.body) == {"text": "transcript"}
+    assert factory.calls == [("1120ms", "auto")]
+    assert factory.lease.events[-3:] == ["flush", "finish", "release"]
+
+
 # @spec ING-HTTP-001, ING-HTTP-009
 def test_raw_asgi_mount_writes_one_complete_response() -> None:
     factory = Factory()

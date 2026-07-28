@@ -343,6 +343,25 @@ def test_canonical_checkpoint_is_not_an_alias_when_public_name_is_set() -> None:
     assert factory.opened == []
 
 
+# @spec ING-VEH-013, ING-GRPC-005, ING-GRPC-009
+def test_accepted_alias_selector_still_opens_the_bound_lease() -> None:
+    """An accepted alias must delegate, not vanish before the factory.
+
+    Complements the rejection above: the exact-alias case must not be a
+    silent no-op either -- it must reach the one bound session factory,
+    the same as an unset (omitted) model does.
+    """
+    factory = FakeFactory()
+    config = _recognition()
+    config.model = "nemotron"
+    request = rasr.RecognizeRequest(config=config, audio=b"\x00\x00")
+
+    response = asyncio.run(_servicer(factory).Recognize(request, FakeContext()))
+
+    assert factory.opened == [("1120ms", "en-US")]
+    assert response.results[0].alternatives[0].transcript == "final"
+
+
 # @spec ING-GRPC-003, ING-GRPC-009, ING-GRPC-010
 def test_unary_real_proto_uses_1120ms_direct_lease_without_file_io() -> None:
     factory = FakeFactory()

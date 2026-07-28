@@ -1,7 +1,6 @@
 """Plugin-owned compatibility operations without host-route shadowing."""
 
 from collections.abc import Mapping
-from typing import Any
 
 OPERATIONAL_PATHS = frozenset(
     {
@@ -38,9 +37,15 @@ def operational_response(
     release: str = "unknown",
     api: str = "v1",
     model: str = "unknown",
-    provenance: Mapping[str, Any] | None = None,
+    provenance: Mapping[str, str] | None = None,
 ) -> tuple[int, object] | None:
-    """Return one plugin-owned response or pass an unowned path through."""
+    """Return one plugin-owned response or pass an unowned path through.
+
+    ``provenance`` must already be this deployment's own server-authored
+    identifiers -- see ``build_deployment_provenance``, the only allowed
+    constructor -- and is embedded verbatim; this function does not (and
+    structurally cannot, given a flat ``Mapping[str, str]``) filter it.
+    """
     if path == "/v1/health/ready":
         return _health("ready", available=ready)
     if path == "/v1/health/live":
