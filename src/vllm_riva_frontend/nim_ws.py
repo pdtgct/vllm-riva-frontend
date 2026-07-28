@@ -846,6 +846,14 @@ class _Connection:
         effective_transcription["model"] = effective_model
         provenance = getattr(self._config, "provenance", None)
         if "provenance" not in session and isinstance(provenance, dict):
+            # Deployment-owned path only: `provenance` here is always the
+            # output of build_deployment_provenance (allowlist-built from
+            # DeploymentMetadata), never an arbitrary copied mapping, so
+            # embedding it verbatim is safe.  A client-supplied
+            # `session["provenance"]` was already copied into `effective`
+            # above and is intentionally left untouched -- the ING-NIMWS-008
+            # echo-key contract requires echoing client session fields, not
+            # rewriting them.
             effective["provenance"] = dict(provenance)
         self._initial_session = effective
         self._configured_at = time.monotonic()

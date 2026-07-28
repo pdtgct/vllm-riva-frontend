@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,12 @@ import pytest
 
 from vllm_riva_frontend import PluginContext, plugin
 from vllm_riva_frontend import lifecycle as lifecycle_module
-from vllm_riva_frontend.config import DeploymentMetadata, FrontendConfig
+from vllm_riva_frontend.config import (
+    FORBIDDEN_PROVENANCE_KEY,
+    DeploymentMetadata,
+    FrontendConfig,
+    build_deployment_provenance,
+)
 from vllm_riva_frontend.lifecycle import (
     CompatibilityOwnerRegistry,
     PluginAdmission,
@@ -20,6 +26,54 @@ from vllm_riva_frontend.operational import (
     OPERATIONAL_PATHS,
     operational_response,
 )
+
+#: A bare hex token, either case, standalone, the shape a NIM profile hash
+#: (e.g. "profileHash": "deadbeef") takes.  This deliberately does not
+#: match this deployment's own "sha256:<hex>" image digest, which is
+#: always scheme-prefixed rather than a bare hex string.
+_HASH_SHAPED = re.compile(r"^[0-9A-Fa-f]{8,64}$")
+_NGC_SCHEME = "ngc://"
+
+
+def _walk(node: object) -> list[tuple[str, object]]:
+    """Return every (key, value) pair reachable at any depth of a JSON tree.
+
+    Walks both mapping and list nodes, so a forbidden key or value hidden
+    inside an array is found the same as one directly inside a dict.
+    """
+    pairs: list[tuple[str, object]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            pairs.append((key, value))
+            pairs.extend(_walk(value))
+    elif isinstance(node, list):
+        for item in node:
+            pairs.extend(_walk(item))
+    return pairs
+
+
+def _assert_no_nim_identity_leak(body: object) -> None:
+    """Fail on a NIM registry/profile identity anywhere in a JSON tree.
+
+    Checked at every depth, through both dicts and lists: no
+    FORBIDDEN_PROVENANCE_KEY key or substring, no ``ngc://`` reference,
+    and no bare hex NIM-profile-hash-shaped value.
+    """
+    for key, value in _walk(body):
+        assert key != FORBIDDEN_PROVENANCE_KEY, (
+            f"forbidden key present at some depth: {key!r}"
+        )
+        if not isinstance(value, str):
+            continue
+        assert FORBIDDEN_PROVENANCE_KEY not in value, (
+            f"forbidden identifier present in a value: {value!r}"
+        )
+        assert _NGC_SCHEME not in value, (
+            f"an ngc:// reference is present in a value: {value!r}"
+        )
+        assert not _HASH_SHAPED.fullmatch(value), (
+            f"a NIM-profile-hash-shaped value is present: {value!r}"
+        )
 
 
 def _frontend_config() -> FrontendConfig:
@@ -242,6 +296,46 @@ def test_operational_routes_do_not_shadow_host() -> None:
     assert "/v1/metrics" not in OPERATIONAL_PATHS
     assert "/v1/models" not in OPERATIONAL_PATHS
     assert operational_response("/v1/models", ready=True, live=True) is None
+
+
+# @spec ING-SHIM-001, ING-SHIM-006
+def test_metadata_provenance_is_allowlist_built_never_a_copied_mapping() -> (
+    None
+):
+    """/v1/metadata cannot leak a NIM identity because none can reach it.
+
+    Earlier this guarantee was a denylist filter over an arbitrary
+    mapping (recursed into dicts only, checked only one forbidden key)
+    and missed an offender hidden in a list, an ``ngc://`` reference, or
+    a bare profile hash under a different key.  There is no fixture that
+    reproduces that class of leak against the current design, because
+    ``build_deployment_provenance`` -- the only allowed constructor for
+    this response's provenance -- takes typed deployment fields, not a
+    mapping to filter; this test pins that the real construction path
+    stays clean under the strengthened (list-aware, ngc://- and
+    hash-aware) walker.
+    """
+    metadata = DeploymentMetadata(
+        image="sha256:test",
+        pin="vllm==0.24.0",
+        precision_policy="nemotron-asr-fp32-v1",
+    )
+    provenance = build_deployment_provenance(
+        metadata, resampler_identifier="scipy-poly-v1"
+    )
+
+    status, body = operational_response(
+        "/v1/metadata",
+        ready=True,
+        live=True,
+        release="1.2.3",
+        model="nemotron-asr",
+        provenance=provenance,
+    )
+
+    assert status == 200
+    _assert_no_nim_identity_leak(body)
+    assert body["provenance"] == provenance
 
 
 # @spec ING-VEH-012, ING-VEH-016, ING-GRPC-011

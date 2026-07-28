@@ -3,11 +3,16 @@
 import asyncio
 import base64
 import json
+import re
 from dataclasses import dataclass, field, replace
 
 import pytest
 
 from vllm_riva_frontend.admission import LoadShedGate
+from vllm_riva_frontend.config import (
+    DeploymentMetadata,
+    build_deployment_provenance,
+)
 from vllm_riva_frontend.lease import DirectLeaseOwner
 from vllm_riva_frontend.nim_ws import (
     DispatchDecision,
@@ -16,6 +21,44 @@ from vllm_riva_frontend.nim_ws import (
     dispatch_nim_realtime,
     project_event,
 )
+
+#: See test_operational_plugin.py's identically-named constants; kept as a
+#: local copy so this file's negative tests stand alone.
+_FORBIDDEN_PROVENANCE_KEY = "selectedModelProfileId"
+_HASH_SHAPED = re.compile(r"^[0-9A-Fa-f]{8,64}$")
+_NGC_SCHEME = "ngc://"
+
+
+def _walk(node: object) -> list[tuple[str, object]]:
+    """Return every (key, value) pair reachable at any depth of a JSON tree."""
+    pairs: list[tuple[str, object]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            pairs.append((key, value))
+            pairs.extend(_walk(value))
+    elif isinstance(node, list):
+        for item in node:
+            pairs.extend(_walk(item))
+    return pairs
+
+
+def _assert_no_nim_identity_leak(body: object) -> None:
+    """Fail on a NIM registry/profile identity anywhere in a JSON tree."""
+    for key, value in _walk(body):
+        assert key != _FORBIDDEN_PROVENANCE_KEY, (
+            f"forbidden key present at some depth: {key!r}"
+        )
+        if not isinstance(value, str):
+            continue
+        assert _FORBIDDEN_PROVENANCE_KEY not in value, (
+            f"forbidden identifier present in a value: {value!r}"
+        )
+        assert _NGC_SCHEME not in value, (
+            f"an ngc:// reference is present in a value: {value!r}"
+        )
+        assert not _HASH_SHAPED.fullmatch(value), (
+            f"a NIM-profile-hash-shaped value is present: {value!r}"
+        )
 
 
 def _scope(query_string: bytes) -> dict[str, object]:
@@ -72,6 +115,7 @@ class _Config:
     preconfiguration_timeout: float = 1.0
     session_idle_timeout: float = 1.0
     max_session_duration: float | None = None
+    provenance: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +212,34 @@ def test_canonical_checkpoint_is_rejected_when_realtime_alias_is_set() -> None:
     assert factory.opens == []
 
 
+# @spec ING-VEH-013, ING-NIMWS-004, ING-NIMWS-008
+def test_accepted_alias_selector_still_opens_the_bound_lease() -> None:
+    """An accepted alias must delegate, not vanish before the factory.
+
+    Complements the rejection above: the exact-alias case must not be a
+    silent no-op either -- it must reach the one bound session factory
+    and the accepted identity must be the one echoed back to the client.
+    """
+    update = _session()
+    session = update["session"]
+    assert isinstance(session, dict)
+    transcription = session["input_audio_transcription"]
+    assert isinstance(transcription, dict)
+    transcription["model"] = "nemotron"
+
+    sent, factory = asyncio.run(_drive([_event(update)], config=_ModelConfig()))
+    events = _json_events(sent)
+    updated = next(
+        event
+        for event in events
+        if event["type"] == "transcription_session.updated"
+    )
+    assert (
+        updated["session"]["input_audio_transcription"]["model"] == "nemotron"
+    )
+    assert factory.opens == [("560ms", "auto")]
+
+
 # @spec ING-NIMWS-003, ING-CORE-007, ING-NIMWS-004, ING-LIFE-002
 def test_raw_asgi_update_append_done_emits_suffix_and_completes() -> None:
     audio = base64.b64encode(b"\x01\x00").decode()
@@ -195,6 +267,43 @@ def test_raw_asgi_update_append_done_emits_suffix_and_completes() -> None:
     assert factory.opens == [("560ms", "auto")]
     assert factory.lease.calls == ["feed:1", "flush", "finish", "release"]
     assert sent[-1] == {"type": "websocket.close", "code": 1000}
+
+
+# @spec ING-SHIM-001, ING-NIMWS-004
+def test_deployment_owned_session_provenance_never_leaks_nim_identity() -> (
+    None
+):
+    """The server-authored provenance path cannot leak a NIM identity.
+
+    ``transcription_session.updated`` echoes deployment-owned provenance
+    the same as /v1/metadata does.  There is no fixture that reproduces a
+    leak against the current design here either, because the config's
+    ``provenance`` is always ``build_deployment_provenance``'s output --
+    this pins the real construction path clean under the same
+    list-aware, ngc://- and hash-aware walker used for /v1/metadata.
+    Client-supplied ``session.provenance`` is a distinct, intentionally
+    unfiltered path -- see test_initial_provenance_is_an_echo_key.
+    """
+    metadata = DeploymentMetadata(
+        image="sha256:test",
+        pin="vllm==0.24.0",
+        precision_policy="nemotron-asr-fp32-v1",
+    )
+    provenance = build_deployment_provenance(
+        metadata, resampler_identifier="scipy-poly-v1"
+    )
+    config = replace(_Config(), provenance=provenance)
+
+    sent, factory = asyncio.run(_drive([_event(_session())], config=config))
+    del factory
+    updated = next(
+        event
+        for event in _json_events(sent)
+        if event["type"] == "transcription_session.updated"
+    )
+    session = updated["session"]
+    _assert_no_nim_identity_leak(session)
+    assert session["provenance"] == provenance
 
 
 # @spec ING-LIFE-001, ING-NIMWS-004
@@ -611,4 +720,38 @@ def test_initial_provenance_is_an_echo_key() -> None:
     event["session"]["provenance"] = {"precision_policy": "fp32"}  # type: ignore[index]
     sent, factory = asyncio.run(_drive([_event(event)]))
     assert factory.opens == [("560ms", "auto")]
-    assert _json_events(sent)[1]["type"] == "transcription_session.updated"
+    updated = _json_events(sent)[1]
+    assert updated["type"] == "transcription_session.updated"
+    assert updated["session"]["provenance"] == {"precision_policy": "fp32"}
+
+
+# @spec ING-NIMWS-008
+def test_client_supplied_provenance_is_echoed_verbatim_not_filtered() -> (
+    None
+):
+    """The echo-key contract, not a leak: this scope choice is deliberate.
+
+    Only the deployment-owned provenance path (built exclusively by
+    ``build_deployment_provenance``, see
+    test_deployment_owned_session_provenance_never_leaks_nim_identity) is
+    covered by the no-NIM-identity guarantee.  A client that echoes its
+    own ``session.provenance`` -- including content that would be
+    forbidden if this deployment had authored it -- gets it back
+    unmodified, per ING-NIMWS-008; rewriting a client's own session
+    field would break the documented echo contract and canonical-client
+    round-trip conformance.
+    """
+    event = _session()
+    client_supplied = {
+        "selectedModelProfileId": "client-owns-this-value",
+        "modelUrl": "ngc://nim/model",
+        "profileHash": "deadbeef",
+    }
+    event["session"]["provenance"] = client_supplied  # type: ignore[index]
+
+    sent, factory = asyncio.run(_drive([_event(event)]))
+
+    assert factory.opens == [("560ms", "auto")]
+    updated = _json_events(sent)[1]
+    assert updated["type"] == "transcription_session.updated"
+    assert updated["session"]["provenance"] == client_supplied

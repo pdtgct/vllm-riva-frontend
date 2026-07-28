@@ -8,6 +8,7 @@ import pytest
 from vllm_riva_frontend.config import (
     DeploymentMetadata,
     FrontendConfig,
+    build_deployment_provenance,
     dispositioned_fields,
     is_positive_finite,
     load_plugin_config,
@@ -237,3 +238,111 @@ def test_unsupported_sections_share_capability_disposition() -> None:
         "diarization_config": "unsupported_capability",
         "speech_contexts": "unsupported_capability",
     }
+
+
+# @spec ING-SHIM-002
+def test_deployment_provenance_is_built_by_allowlist_not_by_copy() -> None:
+    """The only four fields this function can ever emit, and no others.
+
+    Unlike a filter over an arbitrary mapping, there is no input shape
+    here that could smuggle a fifth key through: the signature accepts
+    exactly a ``DeploymentMetadata`` and a resampler string.
+    """
+    metadata = DeploymentMetadata(
+        image="sha256:test",
+        pin="vllm==0.24.0",
+        precision_policy="nemotron-asr-fp32-v1",
+    )
+    provenance = build_deployment_provenance(
+        metadata, resampler_identifier="scipy-poly-v1"
+    )
+    assert provenance == {
+        "image": "sha256:test",
+        "pin": "vllm==0.24.0",
+        "precision_policy": "nemotron-asr-fp32-v1",
+        "resampler": "scipy-poly-v1",
+    }
+    assert set(provenance) == {"image", "pin", "precision_policy", "resampler"}
+
+
+# @spec ING-SHIM-002
+def test_configuration_ingestion_rejects_a_scheme_smuggled_image() -> None:
+    """A NIM registry reference must fail startup, not reach /v1/metadata.
+
+    Allowlisting the four provenance *keys* (see
+    test_deployment_provenance_is_built_by_allowlist_not_by_copy) does not
+    by itself constrain their *values*; this pins that the value itself
+    is schema-validated where it originates, at configuration ingestion.
+    """
+    raw = {
+        **vars(_valid_config()),
+        "deployment_image": "ngc://nim/model",
+        "pin": "vllm==0.24.0",
+        "precision_policy": "nemotron-asr-fp32-v1",
+    }
+    with pytest.raises(ValueError, match="deployment_image"):
+        load_plugin_config(json.dumps(raw))
+
+
+# @spec ING-SHIM-002
+def test_configuration_ingestion_rejects_a_bare_hex_pin() -> None:
+    """A NIM profile hash must fail startup no matter which field carries it."""
+    raw = {
+        **vars(_valid_config()),
+        "deployment_image": "sha256:test",
+        "pin": "deadbeef",
+        "precision_policy": "nemotron-asr-fp32-v1",
+    }
+    with pytest.raises(ValueError, match="pin"):
+        load_plugin_config(json.dumps(raw))
+
+
+# @spec ING-SHIM-002
+def test_configuration_ingestion_rejects_uppercase_bare_hex() -> None:
+    """Hex case must not bypass the bare-hash rejection."""
+    raw = {
+        **vars(_valid_config()),
+        "deployment_image": "sha256:test",
+        "pin": "DEADBEEF",
+        "precision_policy": "nemotron-asr-fp32-v1",
+    }
+    with pytest.raises(ValueError, match="pin"):
+        load_plugin_config(json.dumps(raw))
+
+
+# @spec ING-SHIM-002
+def test_configuration_ingestion_rejects_whitespace_padded_values() -> None:
+    """Padding must not bypass validation; whitespace itself is rejected."""
+    raw = {
+        **vars(_valid_config()),
+        "deployment_image": "sha256:test",
+        "pin": " deadbeef ",
+        "precision_policy": "nemotron-asr-fp32-v1",
+    }
+    with pytest.raises(ValueError, match="pin"):
+        load_plugin_config(json.dumps(raw))
+
+
+# @spec ING-SHIM-002
+def test_configuration_ingestion_accepts_the_real_legit_provenance_shapes() -> (
+    None
+):
+    """The rule that rejects ngc:// and bare hex does not over-restrict.
+
+    A real ``sha256:<hex>`` image digest and a real pin string like
+    ``vllm==0.24.0`` are exactly the shapes production configuration
+    uses, and must still load.
+    """
+    raw = {
+        **vars(_valid_config()),
+        "deployment_image": "sha256:test",
+        "pin": "vllm==0.24.0",
+        "precision_policy": "nemotron-asr-fp32-v1",
+    }
+    frontend, metadata = load_plugin_config(json.dumps(raw))
+    assert frontend == _valid_config()
+    assert metadata == DeploymentMetadata(
+        image="sha256:test",
+        pin="vllm==0.24.0",
+        precision_policy="nemotron-asr-fp32-v1",
+    )

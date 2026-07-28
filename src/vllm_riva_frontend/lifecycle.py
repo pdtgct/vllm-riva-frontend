@@ -20,6 +20,7 @@ from vllm_riva_frontend.admission import LoadShedGate
 from vllm_riva_frontend.config import (
     DeploymentMetadata,
     FrontendConfig,
+    build_deployment_provenance,
     load_plugin_config,
 )
 from vllm_riva_frontend.grpc import (
@@ -395,12 +396,10 @@ class PluginLifetime:
         """Return only this deployment's factual public identifiers."""
         if self._metadata is None or self._config is None:
             return {}
-        return {
-            "image": self._metadata.image,
-            "pin": self._metadata.pin,
-            "precision_policy": self._metadata.precision_policy,
-            "resampler": self._config.resampler_identifier,
-        }
+        return build_deployment_provenance(
+            self._metadata,
+            resampler_identifier=self._config.resampler_identifier,
+        )
 
     @property
     def shutdown_grace(self) -> float:
