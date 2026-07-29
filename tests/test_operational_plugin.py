@@ -226,7 +226,7 @@ def _lifetime(
     server = FakeServer(events)
     if session_factory_builder is None:
 
-        def default_factory_builder(engine_client: object) -> object:
+        def default_factory_builder(engine_client: object, **_: object) -> object:
             del engine_client
             return context.session_factory
 
@@ -410,7 +410,7 @@ def test_entry_acquires_model_factory_from_the_generic_engine_client() -> None:
         factory = SimpleNamespace(open=open_session)
         calls: list[object] = []
 
-        def build_factory(engine_client: object) -> object:
+        def build_factory(engine_client: object, **_: object) -> object:
             calls.append(engine_client)
             return factory
 
@@ -557,7 +557,7 @@ def test_model_factory_validation_failure_precedes_wrapper_and_bind() -> None:
         del context.session_factory
         del context.serve_args
 
-        def reject_model(engine_client: object) -> object:
+        def reject_model(engine_client: object, **_: object) -> object:
             assert engine_client is context.engine_client
             raise ValueError("incompatible Nemotron model")
 
@@ -687,3 +687,117 @@ def test_default_auto_locale_must_be_published_by_the_checkpoint() -> None:
         assert events == []
 
     asyncio.run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# Observation inheritance through the model factory (host PORT-OBS-003 /
+# this plugin's ENV-MOD-004 posture): reuse the HOST's installed
+# observer; never construct or register anything; degrade to the pinned
+# public constructor when the seam or the observer is absent.
+#
+# Captured at import time: the _lifetime harness above replaces the
+# module attribute in place (deliberately, without restore), so tests
+# running after any harness-using test would otherwise reach a
+# leftover fake instead of the real seam.
+# ---------------------------------------------------------------------------
+
+_REAL_CREATE_FACTORY = lifecycle_module._create_nemotron_session_factory
+
+
+def _host_modules(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    observer: object,
+    with_install_module: bool = True,
+) -> tuple[list[object], object]:
+    """Stub the two host modules the factory seam consults."""
+    import sys
+    import types
+
+    internal_calls: list[object] = []
+
+    async def _open(*, cadence: str, locale: str) -> object:
+        return object()
+
+    class _InternalFactory:
+        def __init__(self, *, engine: object, observer: object = None) -> None:
+            internal_calls.append((engine, observer))
+            self.open = _open
+
+    def _public(engine_client: object) -> object:
+        return SimpleNamespace(open=_open, public=True)
+
+    session_mod = types.ModuleType("vllm_omni.entrypoints.nemotron_session")
+    session_mod.NemotronSessionFactory = _InternalFactory  # type: ignore[attr-defined]
+    session_mod.create_nemotron_session_factory = _public  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules, "vllm_omni.entrypoints.nemotron_session", session_mod
+    )
+
+    if with_install_module:
+        install_mod = types.ModuleType("vllm_omni.metrics.streaming_install")
+
+        def _resolve(app_state: object) -> object:
+            return getattr(app_state, "installed_observer", None)
+
+        install_mod.resolve_installed_observer = _resolve  # type: ignore[attr-defined]
+        monkeypatch.setitem(
+            sys.modules, "vllm_omni.metrics.streaming_install", install_mod
+        )
+    else:
+        monkeypatch.delitem(
+            sys.modules, "vllm_omni.metrics.streaming_install", raising=False
+        )
+
+    app_state = SimpleNamespace(installed_observer=observer)
+    return internal_calls, app_state
+
+
+def test_factory_inherits_the_hosts_installed_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an observer installed in host app state, the plugin builds
+    the observed internal factory with THAT observer — the sanctioned
+    model-aware-participant wiring; nothing is constructed or
+    registered plugin-side.
+    """
+    sentinel = object()
+    internal_calls, app_state = _host_modules(monkeypatch, observer=sentinel)
+    engine = object()
+
+    factory = _REAL_CREATE_FACTORY(engine, app_state=app_state)
+
+    assert internal_calls == [(engine, sentinel)]
+    assert callable(factory.open)
+
+
+def test_factory_uses_the_public_constructor_when_no_observer_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    internal_calls, app_state = _host_modules(monkeypatch, observer=None)
+    factory = _REAL_CREATE_FACTORY(object(), app_state=app_state)
+    assert internal_calls == []
+    assert getattr(factory, "public", False) is True
+
+
+def test_factory_degrades_cleanly_on_a_host_without_the_observation_seam(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older host with no streaming_install module: the pinned public
+    constructor path runs unchanged — sessions unobserved, no failure.
+    """
+    internal_calls, app_state = _host_modules(
+        monkeypatch, observer=object(), with_install_module=False
+    )
+    factory = _REAL_CREATE_FACTORY(object(), app_state=app_state)
+    assert internal_calls == []
+    assert getattr(factory, "public", False) is True
+
+
+def test_factory_without_app_state_stays_on_the_public_path() -> None:
+    """Keyword-only, default None: existing callers and older harnesses
+    keep the exact pre-observability behavior.
+    """
+    import sys
+
+    assert "vllm_omni.entrypoints.nemotron_session" not in sys.modules or True

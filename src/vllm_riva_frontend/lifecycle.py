@@ -190,9 +190,51 @@ def _validate_supported_version(version: str) -> None:
 # @spec ING-VEH-012, ING-VEH-014, PORT-RTC-003
 def _create_nemotron_session_factory(
     engine_client: object,
+    *,
+    app_state: object = None,
 ) -> SessionFactory:
-    """Acquire the model-specific public factory from the selected host."""
+    """Acquire the model-specific session factory from the selected host.
+
+    Observation inheritance (host PORT-OBS-003): when the host has a
+    streaming observer installed in its serving app state, this plugin
+    is the "model-aware downstream participant" the host's factory
+    docstring names — it wires observation by constructing the internal
+    ``NemotronSessionFactory(engine=..., observer=...)`` with the HOST'S
+    installed observer, resolved via the host's own
+    ``resolve_installed_observer`` seam. The plugin never constructs,
+    registers, or duplicates any metric family itself (ENV-MOD-004);
+    it only reuses the one observer the host installed. On a host
+    without the observation seam, or with no observer installed, the
+    pinned public constructor is used unchanged and sessions are simply
+    unobserved — exactly the pre-observability behavior.
+    """
     module = importlib.import_module("vllm_omni.entrypoints.nemotron_session")
+
+    observer: object = None
+    if app_state is not None:
+        try:
+            install_module = importlib.import_module(
+                "vllm_omni.metrics.streaming_install"
+            )
+        except ModuleNotFoundError:
+            install_module = None
+        if install_module is not None:
+            resolve = getattr(
+                install_module, "resolve_installed_observer", None
+            )
+            if callable(resolve):
+                observer = resolve(app_state)
+
+    if observer is not None:
+        internal = getattr(module, "NemotronSessionFactory", None)
+        if callable(internal):
+            factory = internal(engine=engine_client, observer=observer)
+            if not callable(getattr(factory, "open", None)):
+                raise TypeError(
+                    "Nemotron session factory must expose async open"
+                )
+            return cast(SessionFactory, factory)
+
     constructor = getattr(module, "create_nemotron_session_factory", None)
     if not callable(constructor):
         raise TypeError(
@@ -489,7 +531,8 @@ class PluginLifetime:
         self.model_name = _served_model(self.context)
         self.locales = _supported_locales(self.context)
         self.session_factory = _create_nemotron_session_factory(
-            self.context.engine_client
+            self.context.engine_client,
+            app_state=getattr(getattr(self.context, "app", None), "state", None),
         )
         self.load_shed = LoadShedGate(
             self._config.load_shed_max_sessions,
