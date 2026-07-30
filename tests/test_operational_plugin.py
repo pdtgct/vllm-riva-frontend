@@ -299,7 +299,7 @@ def test_distribution_import_and_entry_point_identity_are_exact() -> None:
             predicate=inspect.isfunction,
         )
         if not name.startswith("_")
-    } == {"is_open"}
+    } == {"try_acquire"}
 
 
 # @spec ING-VEH-003, ING-VEH-009, ING-VEH-016
@@ -370,6 +370,7 @@ def test_plugin_starts_not_serving_then_follows_host_linearization() -> None:
         context = FakeContext()
         lifetime = _lifetime(context, events)
         async with lifetime:
+            await lifetime.wait_ready()
             assert lifetime.ready is False
             assert events[-1] == "grpc-start"
             assert events[:4] == [
@@ -378,16 +379,9 @@ def test_plugin_starts_not_serving_then_follows_host_linearization() -> None:
                 ("bind", "127.0.0.1:50051"),
                 "grpc-start",
             ]
-            with pytest.raises(
-                RuntimeError,
-                match="admission must open",
-            ):
-                await lifetime.mark_serving()
-            context.admission.open = True
             await lifetime.mark_serving()
             assert lifetime.ready is True
             assert events[-1][0] == "health"
-            context.admission.open = False
             await lifetime.quiesce_and_drain()
             assert lifetime.ready is False
             assert events[-1] == ("grpc-stop", 0)
@@ -422,6 +416,38 @@ def test_participant_attests_readiness_and_latches_cleanup_failure() -> None:
             await failure
 
         lifetime._cleanup_faults.clear()
+        await lifetime.quiesce_and_drain()
+        await lifetime.__aexit__(None, None, None)
+
+    asyncio.run(exercise())
+
+
+# @spec ING-VEH-017, ING-VEH-018, ING-GRPC-011
+def test_participant_rejects_preentry_waits_and_reports_listener_exit() -> None:
+    async def exercise() -> None:
+        events: list[object] = []
+        lifetime = _lifetime(FakeContext(), events)
+        assert lifetime.provenance == {}
+        with pytest.raises(RuntimeError, match="shutdown grace"):
+            _ = lifetime.shutdown_grace
+        with pytest.raises(RuntimeError, match="wait_ready"):
+            await lifetime.wait_ready()
+        with pytest.raises(RuntimeError, match="wait_failed"):
+            await lifetime.wait_failed()
+        with pytest.raises(RuntimeError, match="mark_serving"):
+            await lifetime.mark_serving()
+
+        await lifetime.__aenter__()
+        await lifetime.wait_ready()
+        assert lifetime._server is not None
+        lifetime._server.terminated.set()
+        with pytest.raises(RuntimeError, match="terminated unexpectedly"):
+            await lifetime.wait_failed()
+        assert lifetime.live is False
+        assert lifetime.ready is False
+
+        lifetime._cleanup_faults.clear()
+        await lifetime.quiesce_and_drain()
         await lifetime.quiesce_and_drain()
         await lifetime.__aexit__(None, None, None)
 
@@ -473,6 +499,30 @@ def test_preflight_rejects_version_and_route_collision_before_bind() -> None:
         assert events == []
 
     asyncio.run(exercise())
+
+
+# @spec ING-VEH-010, ING-VEH-012
+def test_context_version_and_locale_preflight_fail_closed() -> None:
+    with pytest.raises(ValueError, match="invalid installed"):
+        lifecycle_module._validate_supported_version("not a version")
+    lifecycle_module._validate_supported_version("0.25.0.dev0")
+    lifecycle_module._validate_supported_version("0.25.0+local")
+
+    context = FakeContext()
+    context.plugin_name = "other"
+    with pytest.raises(ValueError, match="entry-point name"):
+        lifecycle_module._validate_context(context)
+
+    context = FakeContext()
+    context.install_asgi_wrapper = None  # type: ignore[assignment]
+    with pytest.raises(TypeError, match="install_asgi_wrapper"):
+        lifecycle_module._validate_context(context)
+
+    for prompts in ({}, {"en-US": "prompt"}, {"auto": "prompt", "": "bad"}):
+        context = FakeContext()
+        context.engine_client.model_config.hf_config.prompt_dictionary = prompts
+        with pytest.raises(ValueError, match="prompt_dictionary"):
+            lifecycle_module._supported_locales(context)
 
 
 # @spec ING-VEH-012, ING-VEH-014, PORT-RTC-003
@@ -741,6 +791,38 @@ def test_installed_inner_wrapper_owns_only_approved_http_routes() -> None:
                 == "nvidia/nemotron-asr"
             )
 
+            for path, expected_status in (
+                ("/v1/health/ready", 503),
+                ("/v1/health/live", 200),
+                ("/v1/version", 200),
+                ("/v1/metadata", 200),
+            ):
+                sent.clear()
+                await middleware(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": path,
+                    },
+                    receive,
+                    send,
+                )
+                assert sent[0]["status"] == expected_status
+
+            context.admission.open = True
+            sent.clear()
+            await middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/audio/transcriptions",
+                    "headers": [],
+                },
+                receive,
+                send,
+            )
+            assert sent[0]["status"] == 400
+
             sent.clear()
             await middleware(
                 {
@@ -888,3 +970,54 @@ def test_factory_without_app_state_stays_on_the_public_path() -> None:
     import sys
 
     assert "vllm_omni.entrypoints.nemotron_session" not in sys.modules or True  # noqa: SIM222
+
+
+# @spec ING-VEH-010, ING-VEH-012
+def test_host_version_fallback_requires_a_string_module_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_distribution(name: str) -> str:
+        raise lifecycle_module.importlib_metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(
+        lifecycle_module.importlib_metadata,
+        "version",
+        missing_distribution,
+    )
+    monkeypatch.setattr(
+        lifecycle_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(__version__="0.24.0"),
+    )
+    assert lifecycle_module._resolve_host_version() == "0.24.0"
+
+    monkeypatch.setattr(
+        lifecycle_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(__version__=None),
+    )
+    with pytest.raises(RuntimeError, match="cannot resolve"):
+        lifecycle_module._resolve_host_version()
+
+
+# @spec ING-VEH-010, ING-VEH-012, ING-VEH-014
+def test_model_factory_seam_rejects_missing_or_malformed_factories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    _, app_state = _host_modules(monkeypatch, observer=object())
+    module = sys.modules["vllm_omni.entrypoints.nemotron_session"]
+
+    module.NemotronSessionFactory = lambda **kwargs: object()  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="must expose async open"):
+        _REAL_CREATE_FACTORY(object(), app_state=app_state)
+
+    app_state = SimpleNamespace(installed_observer=None)
+    module.create_nemotron_session_factory = None  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="does not expose"):
+        _REAL_CREATE_FACTORY(object(), app_state=app_state)
+
+    module.create_nemotron_session_factory = lambda engine: object()  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="must expose async open"):
+        _REAL_CREATE_FACTORY(object(), app_state=app_state)

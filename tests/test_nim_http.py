@@ -6,6 +6,8 @@ import asyncio
 import json
 from dataclasses import replace
 
+import pytest
+
 import vllm_riva_frontend.nim_http as nim_http
 from vllm_riva_frontend.admission import LoadShedGate
 from vllm_riva_frontend.lease import DirectLeaseOwner, SessionFactory
@@ -256,6 +258,144 @@ def test_multipart_limits_are_413_audio_limit_is_400() -> None:
     assert semantic == HttpFailure(
         400, {"detail": "request_too_large: audio too long"}
     )
+
+
+# @spec ING-HTTP-004, ING-HTTP-005, ING-HTTP-007, ING-HTTP-010
+def test_header_parsers_reject_ambiguous_or_unbounded_shapes() -> None:
+    limits = _limits()
+    content_type_cases = [
+        [],
+        _headers() + _headers(),
+        [(b"content-type", b"x" * 257)],
+        [(b"content-type", b"\xff")],
+        [(b"content-type", b"application/json")],
+        [(b"content-type", b"multipart/form-data; malformed")],
+        [(b"content-type", b"multipart/form-data; charset=utf-8")],
+        [(b"content-type", b"multipart/form-data")],
+        [(b"content-type", b"multipart/form-data; boundary=x; boundary=y")],
+        [(b"content-type", b"multipart/form-data; boundary=bad space")],
+    ]
+    assert all(
+        isinstance(nim_http._parse_content_type(case, limits), HttpFailure)
+        for case in content_type_cases
+    )
+    assert (
+        nim_http._parse_content_type(
+            [(b"content-type", b'multipart/form-data; boundary="x"')],
+            limits,
+        )
+        == b"x"
+    )
+
+    assert isinstance(
+        nim_http._parse_content_length(
+            [(b"content-length", b"1"), (b"content-length", b"1")],
+            limits,
+        ),
+        HttpFailure,
+    )
+    assert nim_http._parse_content_length([], limits) is None
+    for value in (b"\xff", b"-1", b"99999"):
+        assert isinstance(
+            nim_http._parse_content_length(
+                [(b"content-length", value)], limits
+            ),
+            HttpFailure,
+        )
+    assert (
+        nim_http._parse_content_length([(b"content-length", b"12")], limits)
+        == 12
+    )
+
+
+# @spec ING-HTTP-004, ING-HTTP-007
+def test_part_disposition_and_parser_bounds_fail_closed() -> None:
+    bad_headers = [
+        {},
+        {b"content-disposition": b"\xff"},
+        {b"content-disposition": b"attachment; name=x"},
+        {b"content-disposition": b"form-data"},
+        {b"content-disposition": b'form-data; name=""'},
+    ]
+    assert all(
+        isinstance(nim_http._disposition_name(case), HttpFailure)
+        for case in bad_headers
+    )
+    assert (
+        nim_http._disposition_name(
+            {b"content-disposition": b'form-data; name="model"'}
+        )
+        == "model"
+    )
+
+    with pytest.raises(ValueError, match="positive integers"):
+        MultipartLimits(0, 1, 1, 1, 1, 1, 1)
+    with pytest.raises(ValueError, match="finite"):
+        replace(_config(), request_timeout=float("inf"))
+    with pytest.raises(ValueError, match="positive"):
+        replace(_config(), cleanup_timeout=0)
+    with pytest.raises(ValueError, match="pre_submit"):
+        replace(_config(), pre_submit_max_samples=0)
+
+
+# @spec ING-HTTP-002, ING-HTTP-010
+@pytest.mark.parametrize(
+    "parsed",
+    [
+        {"file": b"x", "model": "nemotron", "unknown": "x"},
+        {"file": b"x", "model": "other"},
+        {"file": b"x", "language": "auto"},
+        {"file": b"x"},
+        {"file": b"x", "model": "nemotron", "response_format": "xml"},
+        {"file": b"x", "model": "nemotron", "temperature": "nan"},
+        {"file": b"x", "model": "nemotron"},
+    ],
+)
+def test_http_semantic_validation_rejects_each_invalid_family(
+    parsed: dict[str, str | bytes],
+) -> None:
+    result = _endpoint(Factory())._validate(parsed)
+    assert isinstance(result, HttpFailure)
+
+
+# @spec ING-FE-005, ING-HTTP-008
+def test_bounded_feed_rejects_missing_credit_and_queue_overflow() -> None:
+    class MissingCredit:
+        async def feed(self, samples, *, on_accepted):
+            del samples, on_accepted
+            return []
+
+    assert (
+        asyncio.run(
+            nim_http._bounded_feed(
+                MissingCredit(),
+                [],
+                [0],
+                maximum=1,  # type: ignore[arg-type]
+            )
+        )
+        == []
+    )
+    with pytest.raises(nim_http._PreSubmitOverflow):
+        asyncio.run(
+            nim_http._bounded_feed(
+                MissingCredit(),
+                [0],
+                [1],
+                maximum=1,  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(nim_http._InvalidAcceptanceCredit):
+        asyncio.run(
+            nim_http._bounded_feed(
+                MissingCredit(),
+                [0],
+                [0],
+                maximum=1,  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(TypeError, match="must have a length"):
+        nim_http._sample_count(object())
 
 
 # @spec ING-HTTP-001, ING-HTTP-002, ING-HTTP-003, ING-HTTP-008, ING-HTTP-011

@@ -10,9 +10,10 @@ from grpc_health.v1 import health
 from riva.client.proto import riva_asr_pb2 as rasr
 from riva.client.proto import riva_audio_pb2 as raud
 
+import vllm_riva_frontend.grpc as grpc_frontend
 from vllm_riva_frontend.admission import LoadShedGate
 from vllm_riva_frontend.config import FrontendConfig
-from vllm_riva_frontend.frontend import RiffFormat
+from vllm_riva_frontend.frontend import FormatError, RiffFormat
 from vllm_riva_frontend.grpc import (
     RivaServicer,
     build_servicer,
@@ -437,6 +438,115 @@ def test_invalid_config_and_runtime_rider_are_named_before_open() -> None:
     assert gate.active == 0
 
 
+# @spec ING-GRPC-005, ING-GRPC-006, ING-GRPC-013
+def test_config_validation_collects_every_unsupported_field_family() -> None:
+    config = rasr.RecognitionConfig(
+        encoding=999,
+        sample_rate_hertz=44100,
+        language_code="bad",
+        max_alternatives=2,
+        audio_channel_count=2,
+        model="other",
+        profanity_filter=True,
+        enable_word_time_offsets=True,
+        enable_separate_recognition_per_channel=True,
+    )
+    config.speech_contexts.add().phrases.append("boost")
+    config.diarization_config.enable_speaker_diarization = True
+    config.custom_configuration["custom"] = "value"
+    config.endpointing_config.start_history = 1
+
+    rejected = grpc_frontend.validate_recognition_config(
+        config,
+        model_name="nemotron",
+        locales=frozenset({"auto", "en-US"}),
+    )
+
+    assert ("unsupported_format", "encoding, sample_rate_hertz") in rejected
+    assert ("unknown_locale", "language_code") in rejected
+    assert ("invalid_config_field", "max_alternatives") in rejected
+    assert ("invalid_config_field", "audio_channel_count") in rejected
+    assert ("invalid_config_field", "model") in rejected
+    assert ("invalid_config_field", "profanity_filter") in rejected
+    assert ("unsupported_capability", "speech_contexts") in rejected
+    assert (
+        "invalid_config_field",
+        "enable_word_time_offsets",
+    ) in rejected
+
+
+# @spec ING-ERR-001, ING-GRPC-008
+def test_abort_and_deadline_helpers_require_terminal_context_behavior() -> None:
+    servicer = _servicer(FakeFactory())
+    with pytest.raises(TypeError, match="must expose abort"):
+        asyncio.run(servicer._abort(object(), "internal", "bad"))
+
+    class ReturningContext:
+        def abort(self, code: grpc.StatusCode, details: str) -> None:
+            del code, details
+
+    with pytest.raises(RuntimeError, match="must terminate"):
+        asyncio.run(servicer._abort(ReturningContext(), "internal", "bad"))
+
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            servicer._await_until(
+                lambda: asyncio.sleep(0),
+                deadline=-1.0,
+                context=FakeContext(),
+                timeout_code="configuration_timeout",
+                timeout_fields="config",
+            )
+        )
+    assert error.value.code is grpc.StatusCode.DEADLINE_EXCEEDED
+
+
+# @spec ING-FE-001, ING-GRPC-009
+@pytest.mark.parametrize(
+    ("resolved", "recognition", "field"),
+    [
+        (
+            FormatError("unsupported_format", ("encoding",)),
+            _recognition(),
+            "encoding",
+        ),
+        (
+            RiffFormat("LINEAR_PCM", 8000, 1, 44, 2),
+            rasr.RecognitionConfig(sample_rate_hertz=16000),
+            "sample_rate_hertz",
+        ),
+        (
+            RiffFormat("LINEAR_PCM", 16000, 2, 44, 2),
+            rasr.RecognitionConfig(audio_channel_count=1),
+            "audio_channel_count",
+        ),
+        (
+            RiffFormat("MULAW", 16000, 1, 44, 2),
+            rasr.RecognitionConfig(),
+            "encoding",
+        ),
+    ],
+)
+def test_deferred_riff_rejections_name_the_conflicting_field(
+    resolved: RiffFormat | FormatError,
+    recognition: rasr.RecognitionConfig,
+    field: str,
+) -> None:
+    servicer = _servicer(
+        FakeFactory(),
+        riff_resolver=lambda data, **kwargs: resolved,
+    )
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            servicer._resolve_riff_or_abort(
+                b"RIFF",
+                recognition,
+                FakeContext(),
+            )
+        )
+    assert field in error.value.details
+
+
 # @spec ING-GRPC-004, ING-GRPC-006
 def test_static_config_rpc_uses_real_proto_and_honest_model_intrinsics() -> (
     None
@@ -468,6 +578,44 @@ def test_unary_bound_and_cancelled_context_never_emit_fabricated_final() -> (
         )
     )
     assert not response.results
+
+
+# @spec ING-FE-001, ING-GRPC-008, ING-GRPC-009
+def test_unary_rejects_missing_truncated_and_overduration_audio() -> None:
+    unspecified = rasr.RecognitionConfig(language_code="en-US")
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            _servicer(FakeFactory()).Recognize(
+                rasr.RecognizeRequest(config=unspecified, audio=b"not-riff"),
+                FakeContext(),
+            )
+        )
+    assert error.value.details.startswith("unsupported_format:")
+
+    truncated_servicer = _servicer(
+        FakeFactory(),
+        riff_resolver=lambda data, **kwargs: RiffFormat(
+            "LINEAR_PCM", 16000, 1, 0, 100
+        ),
+    )
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            truncated_servicer.Recognize(
+                rasr.RecognizeRequest(config=unspecified, audio=b"RIFF"),
+                FakeContext(),
+            )
+        )
+    assert error.value.details.startswith("invalid_audio:")
+
+    short_limit = replace(_config(), unary_max_decoded_duration_seconds=0.00001)
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            _servicer(FakeFactory(), config=short_limit).Recognize(
+                rasr.RecognizeRequest(config=_recognition(), audio=b"\x00\x00"),
+                FakeContext(),
+            )
+        )
+    assert error.value.details.startswith("request_too_large:")
 
 
 # @spec ING-LIFE-001, ING-GRPC-001, ING-VEH-019
@@ -546,6 +694,40 @@ def test_unary_holds_host_admission_until_terminal_cleanup() -> None:
 
     assert response.results[0].alternatives[0].transcript == "final"
     assert events == ["admission:try", "admission:release"]
+    assert admission.leases[0].released
+
+
+# @spec ING-VEH-019, ING-VEH-022
+def test_owner_release_failure_cannot_leak_host_admission() -> None:
+    events: list[str] = []
+    admission = FakeAdmission(events=events)
+
+    class FailingOwner:
+        async def release(self) -> None:
+            events.append("owner:release")
+            raise RuntimeError("owner release failed")
+
+    async def register(kind: str) -> FailingOwner:
+        assert kind == "grpc_recognize"
+        return FailingOwner()
+
+    with pytest.raises(RuntimeError, match="owner release failed"):
+        asyncio.run(
+            _servicer(
+                FakeFactory(),
+                admission=admission,
+                owner_register=register,
+            ).Recognize(
+                rasr.RecognizeRequest(config=_recognition(), audio=b"\x00\x00"),
+                FakeContext(),
+            )
+        )
+
+    assert events == [
+        "admission:try",
+        "owner:release",
+        "admission:release",
+    ]
     assert admission.leases[0].released
 
 
