@@ -106,6 +106,36 @@ class _Factory:
         return self.lease
 
 
+class _HostAdmissionLease:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self._events.append("admission:release")
+
+
+class _HostAdmission:
+    def __init__(self, *, opened: bool, events: list[str]) -> None:
+        self._opened = opened
+        self._events = events
+        self.leases: list[_HostAdmissionLease] = []
+
+    def is_open(self) -> bool:
+        return self._opened
+
+    def try_acquire(self) -> _HostAdmissionLease | None:
+        self._events.append("admission:try")
+        if not self._opened:
+            return None
+        lease = _HostAdmissionLease(self._events)
+        self.leases.append(lease)
+        return lease
+
+
 @dataclass(frozen=True)
 class _Config:
     load_shed_max_sessions: int = 2
@@ -270,9 +300,7 @@ def test_raw_asgi_update_append_done_emits_suffix_and_completes() -> None:
 
 
 # @spec ING-SHIM-001, ING-NIMWS-004
-def test_deployment_owned_session_provenance_never_leaks_nim_identity() -> (
-    None
-):
+def test_deployment_owned_session_provenance_never_leaks_nim_identity() -> None:
     """The server-authored provenance path cannot leak a NIM identity.
 
     ``transcription_session.updated`` echoes deployment-owned provenance
@@ -402,9 +430,8 @@ def test_pure_projection_uses_true_suffix() -> None:
 
 # @spec ING-VEH-016, ING-VEH-019
 def test_closed_host_admission_rejects_before_owner_creation() -> None:
-    class Closed:
-        def is_open(self) -> bool:
-            return False
+    events: list[str] = []
+    admission = _HostAdmission(opened=False, events=events)
 
     async def case() -> tuple[list[dict[str, object]], _Factory]:
         sent: list[dict[str, object]] = []
@@ -423,15 +450,75 @@ def test_closed_host_admission_rejects_before_owner_creation() -> None:
             app=native,
             factory=factory,
             config=_Config(),
-            admission=Closed(),
+            admission=admission,
         )
         await app(_scope(b"intent=transcription"), receive, send)
         return sent, factory
 
     sent, factory = asyncio.run(case())
-    assert _json_events(sent)[0]["error"]["code"] == "service_unavailable"
-    assert sent[-1] == {"type": "websocket.close", "code": 1013}
+    assert sent == [{"type": "websocket.close"}]
+    assert events == ["admission:try"]
+    assert admission.leases == []
     assert factory.opens == []
+
+
+# @spec ING-VEH-019
+def test_claimed_websocket_holds_host_admission_until_cleanup() -> None:
+    events: list[str] = []
+    admission = _HostAdmission(opened=True, events=events)
+    sent: list[dict[str, object]] = []
+    factory = _Factory()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "websocket.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    async def native(scope: object, receive: object, send: object) -> None:
+        raise AssertionError("claimed NIM scope must not pass through")
+
+    app = dispatch_nim_realtime(
+        app=native,
+        factory=factory,
+        config=_Config(),
+        admission=admission,
+    )
+    asyncio.run(app(_scope(b"intent=transcription"), receive, send))
+
+    assert sent[0] == {"type": "websocket.accept"}
+    assert events == ["admission:try", "admission:release"]
+    assert len(admission.leases) == 1
+    assert admission.leases[0].released
+
+
+# @spec ING-VEH-019, ING-NIMWS-002
+def test_passthrough_websocket_does_not_acquire_host_admission() -> None:
+    events: list[str] = []
+    admission = _HostAdmission(opened=True, events=events)
+    native_scopes: list[object] = []
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError
+
+    async def send(message: dict[str, object]) -> None:
+        raise AssertionError
+
+    async def native(scope: object, receive: object, send: object) -> None:
+        del receive, send
+        native_scopes.append(scope)
+
+    app = dispatch_nim_realtime(
+        app=native,
+        factory=_Factory(),
+        config=_Config(),
+        admission=admission,
+    )
+    asyncio.run(app(_scope(b""), receive, send))
+
+    assert native_scopes == [_scope(b"")]
+    assert events == []
+    assert admission.leases == []
 
 
 # @spec ING-NIMWS-002, ING-ERR-001
@@ -726,9 +813,7 @@ def test_initial_provenance_is_an_echo_key() -> None:
 
 
 # @spec ING-NIMWS-008
-def test_client_supplied_provenance_is_echoed_verbatim_not_filtered() -> (
-    None
-):
+def test_client_supplied_provenance_is_echoed_verbatim_not_filtered() -> None:
     """The echo-key contract, not a leak: this scope choice is deliberate.
 
     Only the deployment-owned provenance path (built exclusively by

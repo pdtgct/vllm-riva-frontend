@@ -30,14 +30,25 @@ vllm-riva-frontend-render = "vllm_riva_frontend.deployment:main"
 riva_frontend = "vllm_riva_frontend:plugin"
 
 [dependency-groups]
-dev = ["mypy>=1.11", "pytest>=8", "ruff>=0.15", "types-pyyaml>=6"]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "pytest-cov>=7",
+    "ruff>=0.15",
+    "types-pyyaml>=6",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_riva_frontend"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = [
+    "-ra",
+    "--cov=vllm_riva_frontend",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90.01",
+]
 
 [tool.ruff]
 line-length = 80

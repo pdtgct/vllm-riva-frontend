@@ -79,14 +79,40 @@ class FakeContext:
         raise RpcAbort(code, details)
 
 
-class FakeAdmission:
-    """Host readiness authority with an explicitly controllable state."""
+class FakeAdmissionLease:
+    """One synchronously releasable host-admission owner."""
 
-    def __init__(self, open_: bool = True) -> None:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.events.append("admission:release")
+
+
+class FakeAdmission:
+    """Host admission capability with an explicitly controllable state."""
+
+    def __init__(
+        self, open_: bool = True, *, events: list[str] | None = None
+    ) -> None:
         self.open_ = open_
+        self.events = events if events is not None else []
+        self.leases: list[FakeAdmissionLease] = []
 
     def is_open(self) -> bool:
         return self.open_
+
+    def try_acquire(self) -> FakeAdmissionLease | None:
+        self.events.append("admission:try")
+        if not self.open_:
+            return None
+        lease = FakeAdmissionLease(self.events)
+        self.leases.append(lease)
+        return lease
 
 
 class RecordingOwnerToken:
@@ -237,6 +263,8 @@ async def _collect_stream(
 # @spec ING-GRPC-001, ING-GRPC-002, ING-CORE-007
 def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
     factory = FakeFactory()
+    events: list[str] = []
+    admission = FakeAdmission(events=events)
     config = rasr.StreamingRecognitionConfig(
         config=_recognition(), interim_results=True
     )
@@ -246,9 +274,9 @@ def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
     async def exercise() -> list[rasr.StreamingRecognizeResponse]:
         return [
             response
-            async for response in _servicer(factory).StreamingRecognize(
-                _requests([first, audio]), FakeContext()
-            )
+            async for response in _servicer(
+                factory, admission=admission
+            ).StreamingRecognize(_requests([first, audio]), FakeContext())
         ]
 
     responses = asyncio.run(exercise())
@@ -261,6 +289,9 @@ def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
         "final",
     ]
     assert factory.lease.calls == ["feed", "flush", "finish", "release"]
+    assert events == ["admission:try", "admission:release"]
+    assert len(admission.leases) == 1
+    assert admission.leases[0].released
 
 
 # @spec ING-GRPC-002, ING-CORE-005
@@ -456,9 +487,10 @@ def test_closed_host_admission_does_not_consume_stream_or_register_owner() -> (
         yield rasr.StreamingRecognizeRequest()
 
     async def exercise() -> None:
+        admission = FakeAdmission(False, events=events)
         async for _ in _servicer(
             factory,
-            admission=FakeAdmission(False),
+            admission=admission,
             load_shed=gate,
             owner_register=owner_register,
         ).StreamingRecognize(unread(), FakeContext()):
@@ -467,7 +499,7 @@ def test_closed_host_admission_does_not_consume_stream_or_register_owner() -> (
     with pytest.raises(RpcAbort) as error:
         asyncio.run(exercise())
     assert error.value.code is grpc.StatusCode.UNAVAILABLE
-    assert events == []
+    assert events == ["admission:try"]
     assert gate.active == 0
     assert not factory.opened
 
@@ -482,17 +514,39 @@ def test_closed_admission_does_not_register_unary_owner() -> None:
         return RecordingOwnerToken(events)
 
     request = rasr.RecognizeRequest(config=_recognition(), audio=b"\x00\x00")
+    admission = FakeAdmission(False, events=events)
     with pytest.raises(RpcAbort) as error:
         asyncio.run(
             _servicer(
                 factory,
-                admission=FakeAdmission(False),
+                admission=admission,
                 owner_register=owner_register,
             ).Recognize(request, FakeContext())
         )
     assert error.value.code is grpc.StatusCode.UNAVAILABLE
-    assert events == []
+    assert events == ["admission:try"]
     assert not factory.opened
+
+
+# @spec ING-VEH-019, ING-GRPC-003, ING-LIFE-010
+def test_unary_holds_host_admission_until_terminal_cleanup() -> None:
+    events: list[str] = []
+    admission = FakeAdmission(events=events)
+    request = rasr.RecognizeRequest(
+        config=_recognition(),
+        audio=b"\x00\x00",
+    )
+
+    response = asyncio.run(
+        _servicer(FakeFactory(), admission=admission).Recognize(
+            request,
+            FakeContext(),
+        )
+    )
+
+    assert response.results[0].alternatives[0].transcript == "final"
+    assert events == ["admission:try", "admission:release"]
+    assert admission.leases[0].released
 
 
 # @spec ING-LIFE-001, ING-GRPC-001, ING-ADM-006

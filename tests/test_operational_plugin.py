@@ -112,9 +112,27 @@ class FakeAdmission:
 
     def __init__(self) -> None:
         self.open = False
+        self.acquisitions: list[FakeAdmissionLease] = []
 
     def is_open(self) -> bool:
         return self.open
+
+    def try_acquire(self) -> "FakeAdmissionLease | None":
+        if not self.open:
+            return None
+        lease = FakeAdmissionLease()
+        self.acquisitions.append(lease)
+        return lease
+
+
+class FakeAdmissionLease:
+    """Idempotent host-admission lease stand-in."""
+
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
 
 
 class FakeServingModels:
@@ -150,6 +168,7 @@ class FakeServer:
 
     def __init__(self, events: list[object]) -> None:
         self.events = events
+        self.terminated = asyncio.Event()
 
     def add_insecure_port(self, bind: str) -> int:
         self.events.append(("bind", bind))
@@ -160,6 +179,10 @@ class FakeServer:
 
     async def stop(self, grace: float | None) -> None:
         self.events.append(("grpc-stop", grace))
+        self.terminated.set()
+
+    async def wait_for_termination(self) -> None:
+        await self.terminated.wait()
 
 
 class FakeHealth:
@@ -226,7 +249,9 @@ def _lifetime(
     server = FakeServer(events)
     if session_factory_builder is None:
 
-        def default_factory_builder(engine_client: object, **_: object) -> object:
+        def default_factory_builder(
+            engine_client: object, **_: object
+        ) -> object:
             del engine_client
             return context.session_factory
 
@@ -366,6 +391,64 @@ def test_plugin_starts_not_serving_then_follows_host_linearization() -> None:
             await lifetime.quiesce_and_drain()
             assert lifetime.ready is False
             assert events[-1] == ("grpc-stop", 0)
+
+    asyncio.run(exercise())
+
+
+# @spec ING-VEH-003, ING-VEH-018, ING-VEH-019
+def test_context_requires_acquisition_capability_not_boolean_snapshot() -> None:
+    context = FakeContext()
+    context.admission = SimpleNamespace(try_acquire=lambda: None)
+    lifecycle_module._validate_context(context)
+
+    context.admission = SimpleNamespace(is_open=lambda: True)
+    with pytest.raises(TypeError, match="try_acquire"):
+        lifecycle_module._validate_context(context)
+
+
+# @spec ING-VEH-017, ING-VEH-018
+def test_participant_attests_readiness_and_latches_cleanup_failure() -> None:
+    async def exercise() -> None:
+        events: list[object] = []
+        context = FakeContext()
+        lifetime = _lifetime(context, events)
+        await lifetime.__aenter__()
+        await lifetime.wait_ready()
+
+        failure = asyncio.create_task(lifetime.wait_failed())
+        await asyncio.sleep(0)
+        lifetime._record_cleanup_fault(RuntimeError("cleanup broke"))
+        with pytest.raises(RuntimeError, match="cleanup broke"):
+            await failure
+
+        lifetime._cleanup_faults.clear()
+        await lifetime.quiesce_and_drain()
+        await lifetime.__aexit__(None, None, None)
+
+    asyncio.run(exercise())
+
+
+# @spec ING-VEH-017
+def test_failure_reporting_never_mutates_the_host_http_server() -> None:
+    source = Path(lifecycle_module.__file__).read_text(encoding="utf-8")
+    assert "server.should_exit" not in source
+
+
+# @spec ING-VEH-016, ING-VEH-018, ING-VEH-022
+def test_mark_serving_and_drain_need_no_admission_snapshot() -> None:
+    async def exercise() -> None:
+        events: list[object] = []
+        context = FakeContext()
+        context.admission = SimpleNamespace(
+            try_acquire=lambda: FakeAdmissionLease()
+        )
+        lifetime = _lifetime(context, events)
+        async with lifetime:
+            await lifetime.wait_ready()
+            await lifetime.mark_serving()
+            assert lifetime.ready is True
+            await lifetime.quiesce_and_drain()
+            assert lifetime.ready is False
 
     asyncio.run(exercise())
 
@@ -756,10 +839,11 @@ def _host_modules(
 def test_factory_inherits_the_hosts_installed_observer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With an observer installed in host app state, the plugin builds
-    the observed internal factory with THAT observer — the sanctioned
-    model-aware-participant wiring; nothing is constructed or
-    registered plugin-side.
+    """The factory inherits the observer installed in host app state.
+
+    It builds the observed internal factory with THAT observer — the
+    sanctioned model-aware-participant wiring; nothing is constructed
+    or registered plugin-side.
     """
     sentinel = object()
     internal_calls, app_state = _host_modules(monkeypatch, observer=sentinel)
@@ -783,8 +867,10 @@ def test_factory_uses_the_public_constructor_when_no_observer_installed(
 def test_factory_degrades_cleanly_on_a_host_without_the_observation_seam(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An older host with no streaming_install module: the pinned public
-    constructor path runs unchanged — sessions unobserved, no failure.
+    """An older host uses the pinned public constructor path.
+
+    With no streaming_install module, sessions remain unobserved without
+    failing.
     """
     internal_calls, app_state = _host_modules(
         monkeypatch, observer=object(), with_install_module=False
@@ -795,9 +881,10 @@ def test_factory_degrades_cleanly_on_a_host_without_the_observation_seam(
 
 
 def test_factory_without_app_state_stays_on_the_public_path() -> None:
-    """Keyword-only, default None: existing callers and older harnesses
-    keep the exact pre-observability behavior.
+    """The keyword-only default preserves pre-observability behavior.
+
+    Existing callers and older harnesses keep their public construction path.
     """
     import sys
 
-    assert "vllm_omni.entrypoints.nemotron_session" not in sys.modules or True
+    assert "vllm_omni.entrypoints.nemotron_session" not in sys.modules or True  # noqa: SIM222

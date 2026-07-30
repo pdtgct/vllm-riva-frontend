@@ -84,6 +84,36 @@ class Factory:
         return self.lease
 
 
+class HostAdmissionLease:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self._events.append("admission:release")
+
+
+class HostAdmission:
+    def __init__(self, *, opened: bool, events: list[str]) -> None:
+        self._opened = opened
+        self._events = events
+        self.leases: list[HostAdmissionLease] = []
+
+    def is_open(self) -> bool:
+        return self._opened
+
+    def try_acquire(self) -> HostAdmissionLease | None:
+        self._events.append("admission:try")
+        if not self._opened:
+            return None
+        lease = HostAdmissionLease(self._events)
+        self.leases.append(lease)
+        return lease
+
+
 def _limits() -> MultipartLimits:
     return MultipartLimits(4096, 4608, 256, 64, 4, 256, 128)
 
@@ -373,16 +403,15 @@ def test_owner_registration_precedes_http_body_and_releases() -> None:
 
 # @spec ING-VEH-017, ING-VEH-019, ING-LIFE-006
 def test_not_ready_rejection_does_not_register_an_owner() -> None:
-    class ClosedAdmission:
-        def is_open(self) -> bool:
-            return False
+    events: list[str] = []
+    admission = HostAdmission(opened=False, events=events)
 
     async def register() -> object:
         raise AssertionError("not-ready request must not register an owner")
 
     response = asyncio.run(
         _endpoint(
-            Factory(), admission=ClosedAdmission(), owner_register=register
+            Factory(), admission=admission, owner_register=register
         ).handle(
             scope={"type": "http", "method": "POST", "headers": _headers()},
             receive=Receive([]),
@@ -390,6 +419,29 @@ def test_not_ready_rejection_does_not_register_an_owner() -> None:
     )
 
     assert response.status == 503
+    assert events == ["admission:try"]
+    assert admission.leases == []
+
+
+# @spec ING-VEH-019
+def test_http_holds_host_admission_until_terminal_cleanup() -> None:
+    events: list[str] = []
+    admission = HostAdmission(opened=True, events=events)
+    factory = Factory()
+    body = _multipart([("file", _wav()), ("model", b"nemotron")])
+
+    response = asyncio.run(
+        _endpoint(factory, admission=admission).handle(
+            scope={"type": "http", "method": "POST", "headers": _headers()},
+            receive=Receive([body]),
+        )
+    )
+
+    assert response.status == 200
+    assert factory.lease.events[-3:] == ["flush", "finish", "release"]
+    assert events == ["admission:try", "admission:release"]
+    assert len(admission.leases) == 1
+    assert admission.leases[0].released
 
 
 # @spec ING-FE-005, ING-FE-006, ING-VEH-004
