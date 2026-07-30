@@ -1,5 +1,6 @@
 """Static no-second-stack invariants for the downstream plugin package."""
 
+import tomllib
 from pathlib import Path
 
 
@@ -53,3 +54,21 @@ def test_plugin_never_registers_host_streaming_metric_families() -> None:
         project_root / "pyproject.toml"
     ).read_text(encoding="utf-8")
     assert "vllm_omni:streaming_" not in source
+
+
+# Qualification gate: downstream package coverage policy (not runtime EARS).
+def test_default_gate_enforces_more_than_ninety_percent_line_coverage() -> None:
+    project_root = Path(__file__).parents[1]
+    with (project_root / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)
+
+    dev_dependencies = project["dependency-groups"]["dev"]
+    addopts = project["tool"]["pytest"]["ini_options"]["addopts"]
+
+    assert any(item.startswith("pytest-cov") for item in dev_dependencies)
+    thresholds = [
+        float(item.removeprefix("--cov-fail-under="))
+        for item in addopts
+        if item.startswith("--cov-fail-under=")
+    ]
+    assert thresholds and min(thresholds) > 90.0

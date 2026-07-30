@@ -4,10 +4,12 @@ import asyncio
 import base64
 import json
 import re
+import time
 from dataclasses import dataclass, field, replace
 
 import pytest
 
+import vllm_riva_frontend.nim_ws as nim_ws
 from vllm_riva_frontend.admission import LoadShedGate
 from vllm_riva_frontend.config import (
     DeploymentMetadata,
@@ -106,6 +108,36 @@ class _Factory:
         return self.lease
 
 
+class _HostAdmissionLease:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.released = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self._events.append("admission:release")
+
+
+class _HostAdmission:
+    def __init__(self, *, opened: bool, events: list[str]) -> None:
+        self._opened = opened
+        self._events = events
+        self.leases: list[_HostAdmissionLease] = []
+
+    def is_open(self) -> bool:
+        return self._opened
+
+    def try_acquire(self) -> _HostAdmissionLease | None:
+        self._events.append("admission:try")
+        if not self._opened:
+            return None
+        lease = _HostAdmissionLease(self._events)
+        self.leases.append(lease)
+        return lease
+
+
 @dataclass(frozen=True)
 class _Config:
     load_shed_max_sessions: int = 2
@@ -170,6 +202,24 @@ def _json_events(sent: list[dict[str, object]]) -> list[dict[str, object]]:
         for message in sent
         if message["type"] == "websocket.send"
     ]
+
+
+def _private_connection(
+    *,
+    config: _Config | None = None,
+) -> nim_ws._Connection:
+    admission_lease = nim_ws.try_acquire_admission(None)
+    assert admission_lease is not None
+    return nim_ws._Connection(
+        _Factory(),
+        config or _ModelConfig(),
+        LoadShedGate(2),
+        None,
+        lambda factory, *, cleanup_timeout: DirectLeaseOwner(
+            factory, cleanup_timeout=cleanup_timeout
+        ),
+        admission_lease,
+    )
 
 
 # @spec ING-NIMWS-002
@@ -270,9 +320,7 @@ def test_raw_asgi_update_append_done_emits_suffix_and_completes() -> None:
 
 
 # @spec ING-SHIM-001, ING-NIMWS-004
-def test_deployment_owned_session_provenance_never_leaks_nim_identity() -> (
-    None
-):
+def test_deployment_owned_session_provenance_never_leaks_nim_identity() -> None:
     """The server-authored provenance path cannot leak a NIM identity.
 
     ``transcription_session.updated`` echoes deployment-owned provenance
@@ -400,11 +448,332 @@ def test_pure_projection_uses_true_suffix() -> None:
     )
 
 
+# @spec ING-NIMWS-004, ING-NIMWS-008
+def test_structural_validation_names_every_nested_type_failure() -> None:
+    invalid = nim_ws._structural_session_fields(
+        {
+            "id": 1,
+            "object": [],
+            "provenance": "not-a-map",
+            "modalities": ["text", 1],
+            "input_audio_format": 3,
+            "input_audio_params": {
+                "sample_rate_hz": "16000",
+                "num_channels": True,
+            },
+            "input_audio_transcription": {
+                "language": 1,
+                "model": [],
+                "prompt": {},
+            },
+            "recognition_config": {
+                "max_alternatives": "1",
+                "enable_word_time_offsets": "false",
+            },
+            "speaker_diarization": {"enable_speaker_diarization": "false"},
+            "word_boosting": {
+                "enable_word_boosting": "false",
+                "word_boosting_list": ["ok", 1],
+            },
+            "endpointing_config": [],
+        }
+    )
+
+    assert set(invalid) == {
+        "id",
+        "object",
+        "provenance",
+        "modalities",
+        "input_audio_format",
+        "input_audio_params.sample_rate_hz",
+        "input_audio_params.num_channels",
+        "input_audio_transcription.language",
+        "input_audio_transcription.model",
+        "input_audio_transcription.prompt",
+        "recognition_config.max_alternatives",
+        "recognition_config.enable_word_time_offsets",
+        "speaker_diarization.enable_speaker_diarization",
+        "word_boosting.enable_word_boosting",
+        "word_boosting.word_boosting_list",
+        "endpointing_config",
+    }
+
+
+# @spec ING-NIMWS-004, ING-NIMWS-008
+def test_semantic_validation_collects_all_unsupported_fields() -> None:
+    rejected = nim_ws._session_rejections(
+        {
+            "unknown": True,
+            "modalities": ["audio"],
+            "input_audio_params": {"extra": 1},
+            "input_audio_transcription": {
+                "extra": True,
+                "prompt": "bias me",
+            },
+            "speaker_diarization": {"enable_speaker_diarization": True},
+            "word_boosting": {"enable_word_boosting": True},
+            "endpointing_config": {"start_history": 1},
+            "recognition_config": {
+                "unknown": True,
+                "max_alternatives": 2,
+                "enable_word_time_offsets": True,
+                "enable_profanity_filter": True,
+            },
+        }
+    )
+
+    assert ("invalid_config_field", "unknown") in rejected
+    assert ("invalid_config_field", "modalities") in rejected
+    assert (
+        "unsupported_capability",
+        "input_audio_transcription.prompt",
+    ) in rejected
+    assert ("unsupported_capability", "speaker_diarization") in rejected
+    assert ("unsupported_capability", "word_boosting") in rejected
+    assert ("unsupported_capability", "endpointing_config") in rejected
+    assert (
+        "invalid_config_field",
+        "recognition_config.max_alternatives",
+    ) in rejected
+    assert (
+        "unsupported_capability",
+        "recognition_config.enable_word_time_offsets",
+    ) in rejected
+
+
+# @spec ING-CORE-005, ING-NIMWS-004, ING-NIMWS-005, ING-NIMWS-006
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"type": "connect"}, "conversation.created"),
+        (
+            {"type": "input_audio_buffer.done"},
+            "conversation.item.input_audio_transcription.completed",
+        ),
+        ({"type": "input_audio_buffer.clear"}, "input_audio_buffer.cleared"),
+        (
+            {"type": "transcription_session.update", "rate": "16000"},
+            "error",
+        ),
+        (
+            {
+                "type": "transcription_session.update",
+                "format": "g711_ulaw",
+                "rate": 16000,
+            },
+            None,
+        ),
+        (
+            {
+                "type": "transcription_session.update",
+                "locale": "en-US",
+            },
+            "transcription_session.updated",
+        ),
+        ({"type": "idle_timeout"}, None),
+        ({"type": "unknown"}, "error"),
+    ],
+)
+def test_projection_covers_every_sans_io_event_family(
+    event: dict[str, object], expected: str | None
+) -> None:
+    projected = project_event(event)
+    if expected is not None:
+        assert projected["type"] == expected
+    else:
+        assert "code" in projected
+
+
+# @spec ING-NIMWS-001, ING-NIMWS-002, ING-ERR-001
+def test_bootstrap_query_and_error_helpers_fail_closed() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        bootstrap_session("")
+    assert (
+        dispatch_decision(
+            {
+                "type": "websocket",
+                "path": "/v1/realtime",
+                "query_string": "intent=transcription",
+            }
+        )
+        is DispatchDecision.DENY
+    )
+    assert dispatch_decision(_scope(b"intent=%0")) is DispatchDecision.DENY
+    assert dispatch_decision(_scope(b"intent=%ZZ")) is DispatchDecision.DENY
+    assert nim_ws._suffix("old", "replacement") == "replacement"
+    error = nim_ws._error("not-in-catalog", "bad", ["a", "b"])
+    assert error["type"] == "error"
+    assert error["error"]["param"] == "a,b"
+
+
+# @spec ING-NIMWS-004, ING-NIMWS-008
+def test_private_connection_update_edges_project_named_failures() -> None:
+    async def exercise() -> list[dict[str, object]]:
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        missing = _private_connection()
+        await missing._update({"type": "transcription_session.update"}, send)
+
+        unknown_locale = _private_connection()
+        event = _session()
+        event["session"]["input_audio_transcription"]["language"] = "xx-XX"  # type: ignore[index]
+        await unknown_locale._update(event, send)
+
+        configured = _private_connection()
+        configured._configured = True
+        configured._configured_at = time.monotonic()
+        configured._last_accepted_audio_at = configured._configured_at
+        configured._initial_session = bootstrap_session("nemotron")
+        configured._owner = _Lease()  # type: ignore[assignment]
+        await configured._update(_session(), send)
+
+        locale_update = _session()
+        locale_update["session"]["input_audio_transcription"]["language"] = (  # type: ignore[index]
+            "en-US"
+        )
+        await configured._update(locale_update, send)
+
+        immutable = _session()
+        immutable["session"]["input_audio_params"]["sample_rate_hz"] = 8000  # type: ignore[index]
+        await configured._update(immutable, send)
+
+        missing_owner = _private_connection()
+        missing_owner._configured = True
+        missing_owner._initial_session = bootstrap_session("nemotron")
+        await missing_owner._update(_session(), send)
+        return sent
+
+    events = _json_events(asyncio.run(exercise()))
+    codes = [event["error"]["code"] for event in events if "error" in event]
+    assert "invalid_event" in codes
+    assert "unknown_locale" in codes
+    assert "config_change_rejected" in codes
+    assert "internal" in codes
+
+
+# @spec ING-NIMWS-003, ING-NIMWS-004, ING-ERR-001
+def test_private_connection_append_and_unknown_event_edges() -> None:
+    async def exercise() -> list[dict[str, object]]:
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        connection = _private_connection()
+        connection._configured = True
+        await connection._append(
+            {"type": "input_audio_buffer.append", "audio": 7}, send
+        )
+        await connection._append(
+            {"type": "input_audio_buffer.append", "audio": "%%%"}, send
+        )
+        await connection._handle({"type": "unknown"}, send)
+
+        missing_audio_state = _private_connection()
+        missing_audio_state._configured = True
+        await missing_audio_state._append(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(b"\x00\x00").decode(),
+            },
+            send,
+        )
+        return sent
+
+    events = _json_events(asyncio.run(exercise()))
+    codes = [event["error"]["code"] for event in events if "error" in event]
+    assert codes.count("invalid_audio") == 2
+    assert "invalid_event" in codes
+    assert "internal" in codes
+
+
+# @spec ING-NIMWS-009, ING-FE-001
+def test_private_connection_deferred_riff_rejects_declared_mismatch() -> None:
+    async def exercise() -> list[dict[str, object]]:
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        connection = _private_connection()
+        await connection._resolve_riff(
+            nim_ws.RiffFormat("LINEAR_PCM", 8000, 2, 44, 2),
+            send,
+        )
+        return sent
+
+    events = _json_events(asyncio.run(exercise()))
+    assert events[-1]["error"]["code"] == "unsupported_format"
+    assert (
+        events[-1]["error"]["param"]
+        == "input_audio_params.sample_rate_hz,input_audio_params.num_channels"
+    )
+
+
+# @spec ING-NIMWS-003, ING-NIMWS-004, ING-LIFE-010
+def test_private_connection_terminal_failure_families() -> None:
+    class NoneComplete:
+        async def complete(self) -> None:
+            return None
+
+        async def cancel(self) -> None:
+            return None
+
+    class ErrorComplete(NoneComplete):
+        async def complete(self) -> None:
+            raise RuntimeError("complete failed")
+
+    async def exercise() -> list[dict[str, object]]:
+        sent: list[dict[str, object]] = []
+
+        async def send(message: dict[str, object]) -> None:
+            sent.append(message)
+
+        unconfigured = _private_connection()
+        await unconfigured._done(send)
+
+        truncated = _private_connection()
+        truncated._configured = True
+        truncated._owner = NoneComplete()  # type: ignore[assignment]
+        truncated._riff_remaining = 1
+        await truncated._done(send)
+
+        expired = _private_connection(
+            config=replace(_Config(), max_session_duration=0.001)
+        )
+        expired._configured = True
+        expired._owner = NoneComplete()  # type: ignore[assignment]
+        expired._configured_at = time.monotonic() - 1
+        await expired._done(send)
+
+        missing_tail = _private_connection()
+        missing_tail._configured = True
+        missing_tail._owner = NoneComplete()  # type: ignore[assignment]
+        missing_tail._configured_at = time.monotonic()
+        await missing_tail._done(send)
+
+        failed_tail = _private_connection()
+        failed_tail._configured = True
+        failed_tail._owner = ErrorComplete()  # type: ignore[assignment]
+        failed_tail._configured_at = time.monotonic()
+        await failed_tail._done(send)
+        return sent
+
+    events = _json_events(asyncio.run(exercise()))
+    codes = [event["error"]["code"] for event in events if "error" in event]
+    assert "protocol_order" in codes
+    assert "invalid_audio" in codes
+    assert "request_timeout" in codes
+    assert codes.count("internal") == 2
+
+
 # @spec ING-VEH-016, ING-VEH-019
 def test_closed_host_admission_rejects_before_owner_creation() -> None:
-    class Closed:
-        def is_open(self) -> bool:
-            return False
+    events: list[str] = []
+    admission = _HostAdmission(opened=False, events=events)
 
     async def case() -> tuple[list[dict[str, object]], _Factory]:
         sent: list[dict[str, object]] = []
@@ -423,15 +792,103 @@ def test_closed_host_admission_rejects_before_owner_creation() -> None:
             app=native,
             factory=factory,
             config=_Config(),
-            admission=Closed(),
+            admission=admission,
         )
         await app(_scope(b"intent=transcription"), receive, send)
         return sent, factory
 
     sent, factory = asyncio.run(case())
-    assert _json_events(sent)[0]["error"]["code"] == "service_unavailable"
-    assert sent[-1] == {"type": "websocket.close", "code": 1013}
+    assert sent == [{"type": "websocket.close"}]
+    assert events == ["admission:try"]
+    assert admission.leases == []
     assert factory.opens == []
+
+
+# @spec ING-VEH-019
+def test_claimed_websocket_holds_host_admission_until_cleanup() -> None:
+    events: list[str] = []
+    admission = _HostAdmission(opened=True, events=events)
+    sent: list[dict[str, object]] = []
+    factory = _Factory()
+
+    async def receive() -> dict[str, object]:
+        return {"type": "websocket.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    async def native(scope: object, receive: object, send: object) -> None:
+        raise AssertionError("claimed NIM scope must not pass through")
+
+    app = dispatch_nim_realtime(
+        app=native,
+        factory=factory,
+        config=_Config(),
+        admission=admission,
+    )
+    asyncio.run(app(_scope(b"intent=transcription"), receive, send))
+
+    assert sent[0] == {"type": "websocket.accept"}
+    assert events == ["admission:try", "admission:release"]
+    assert len(admission.leases) == 1
+    assert admission.leases[0].released
+
+
+# @spec ING-VEH-019, ING-VEH-022
+def test_websocket_accept_failure_cannot_leak_host_admission() -> None:
+    events: list[str] = []
+    admission = _HostAdmission(opened=True, events=events)
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError
+
+    async def send(message: dict[str, object]) -> None:
+        assert message == {"type": "websocket.accept"}
+        raise RuntimeError("socket failed")
+
+    async def native(scope: object, receive: object, send: object) -> None:
+        raise AssertionError("claimed NIM scope must not pass through")
+
+    app = dispatch_nim_realtime(
+        app=native,
+        factory=_Factory(),
+        config=_Config(),
+        admission=admission,
+    )
+    with pytest.raises(RuntimeError, match="socket failed"):
+        asyncio.run(app(_scope(b"intent=transcription"), receive, send))
+
+    assert events == ["admission:try", "admission:release"]
+    assert admission.leases[0].released
+
+
+# @spec ING-VEH-019, ING-NIMWS-002
+def test_passthrough_websocket_does_not_acquire_host_admission() -> None:
+    events: list[str] = []
+    admission = _HostAdmission(opened=True, events=events)
+    native_scopes: list[object] = []
+
+    async def receive() -> dict[str, object]:
+        raise AssertionError
+
+    async def send(message: dict[str, object]) -> None:
+        raise AssertionError
+
+    async def native(scope: object, receive: object, send: object) -> None:
+        del receive, send
+        native_scopes.append(scope)
+
+    app = dispatch_nim_realtime(
+        app=native,
+        factory=_Factory(),
+        config=_Config(),
+        admission=admission,
+    )
+    asyncio.run(app(_scope(b""), receive, send))
+
+    assert native_scopes == [_scope(b"")]
+    assert events == []
+    assert admission.leases == []
 
 
 # @spec ING-NIMWS-002, ING-ERR-001
@@ -726,9 +1183,7 @@ def test_initial_provenance_is_an_echo_key() -> None:
 
 
 # @spec ING-NIMWS-008
-def test_client_supplied_provenance_is_echoed_verbatim_not_filtered() -> (
-    None
-):
+def test_client_supplied_provenance_is_echoed_verbatim_not_filtered() -> None:
     """The echo-key contract, not a leak: this scope choice is deliberate.
 
     Only the deployment-owned provenance path (built exclusively by

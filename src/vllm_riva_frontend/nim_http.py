@@ -14,7 +14,12 @@ from typing import Never, Protocol, cast
 from python_multipart import MultipartParser
 from python_multipart.exceptions import MultipartParseError
 
-from vllm_riva_frontend.admission import LoadShedGate, LoadShedRejected
+from vllm_riva_frontend.admission import (
+    HostAdmission,
+    LoadShedGate,
+    LoadShedRejected,
+    try_acquire_admission,
+)
 from vllm_riva_frontend.frontend import (
     RiffFormat,
     StreamingAudioFrontend,
@@ -106,13 +111,6 @@ class AsgiSend(Protocol):
 
     async def __call__(self, message: dict[str, object]) -> None:
         """Send one ASGI response message."""
-
-
-class Admission(Protocol):
-    """The host admission state which rejects pre-ready application work."""
-
-    def is_open(self) -> bool:
-        """Return whether application inference admission is currently open."""
 
 
 class OwnerToken(Protocol):
@@ -513,7 +511,7 @@ class NimHttpTranscriptionEndpoint:
         config: HttpTranscriptionConfig,
         served_model: str,
         locales: frozenset[str],
-        admission: Admission | None = None,
+        admission: HostAdmission | None = None,
         owner_register: OwnerRegister | None = None,
         owner_factory: OwnerFactory = DirectLeaseOwner,
     ) -> None:
@@ -568,12 +566,22 @@ class NimHttpTranscriptionEndpoint:
             return _failure_response(
                 _malformed("HTTP transcription requires POST")
             )
-        if self._admission is not None and not self._admission.is_open():
+        admission_lease = try_acquire_admission(self._admission)
+        if admission_lease is None:
             return _failure_response(
                 _detail(
                     "service_unavailable", "service is not ready", status=503
                 )
             )
+        try:
+            return await self._handle_admitted(scope, receive)
+        finally:
+            admission_lease.release()
+
+    async def _handle_admitted(
+        self, scope: Mapping[str, object], receive: AsgiReceive
+    ) -> HttpResponse:
+        """Run local admission and inference under one host admission lease."""
         headers = scope.get("headers", [])
         if not isinstance(headers, list) or not all(
             isinstance(header, tuple)

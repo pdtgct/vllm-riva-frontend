@@ -16,7 +16,10 @@ import grpc
 from grpc_health.v1 import health_pb2
 from packaging.version import InvalidVersion, Version
 
-from vllm_riva_frontend.admission import LoadShedGate
+from vllm_riva_frontend.admission import (
+    AdmissionLease,
+    LoadShedGate,
+)
 from vllm_riva_frontend.config import (
     DeploymentMetadata,
     FrontendConfig,
@@ -61,8 +64,8 @@ class PluginApplication(Protocol):
 class PluginAdmission(Protocol):
     """Host-owned readiness boundary used by all inference surfaces."""
 
-    def is_open(self) -> bool:
-        """Return whether new application inference may begin."""
+    def try_acquire(self) -> AdmissionLease | None:
+        """Atomically register new work or reject after admission closes."""
 
 
 class PluginContext(Protocol):
@@ -292,8 +295,8 @@ def _validate_context(context: PluginContext) -> None:
         raise ValueError("unexpected application-plugin entry-point name")
     if not callable(getattr(context, "install_asgi_wrapper", None)):
         raise TypeError("plugin context must expose install_asgi_wrapper")
-    if not callable(getattr(context.admission, "is_open", None)):
-        raise TypeError("host admission must expose is_open")
+    if not callable(getattr(context.admission, "try_acquire", None)):
+        raise TypeError("host admission must expose try_acquire")
 
 
 def _validate_route_collisions(app: object) -> None:
@@ -418,7 +421,10 @@ class PluginLifetime:
         self._config: FrontendConfig | None = None
         self._metadata: DeploymentMetadata | None = None
         self._server: Any | None = None
+        self._server_watch: asyncio.Task[None] | None = None
         self._health: Any | None = None
+        self._ready_event = asyncio.Event()
+        self._failure: asyncio.Future[BaseException] | None = None
         self._entered = False
         self._quiesced = False
         self.ready = False
@@ -469,27 +475,41 @@ class PluginLifetime:
         )
 
     def _record_cleanup_fault(self, error: BaseException) -> None:
-        """Mark unhealthy and initiate host shutdown after a cleanup fault."""
+        """Latch the first failure for host supervision and withdraw health."""
         self._cleanup_faults.append(error)
         self.ready = False
         self.live = False
+        if self._failure is not None and not self._failure.done():
+            self._failure.set_result(error)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._escalate_cleanup_fault())
+        loop.create_task(self._withdraw_health_after_failure())
 
-    async def _escalate_cleanup_fault(self) -> None:
-        """Withdraw health and ask the host launcher to begin shutdown."""
+    async def _withdraw_health_after_failure(self) -> None:
+        """Withdraw participant health; the host supervisor owns shutdown."""
         if self._health is not None:
             with suppress(BaseException):
                 await self._set_health(
                     health_pb2.HealthCheckResponse.NOT_SERVING
                 )
-        state = getattr(self.context.app, "state", None)
-        server = getattr(state, "server", None)
-        if server is not None:
-            server.should_exit = True
+
+    async def _watch_server_termination(self) -> None:
+        """Latch an unexpected auxiliary-listener exit for the host."""
+        assert self._server is not None
+        try:
+            await self._server.wait_for_termination()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            if not self._quiesced:
+                self._record_cleanup_fault(error)
+            return
+        if not self._quiesced:
+            self._record_cleanup_fault(
+                RuntimeError("Riva gRPC listener terminated unexpectedly")
+            )
 
     def _configure_http(self) -> HttpTranscriptionConfig:
         assert self._config is not None
@@ -520,6 +540,7 @@ class PluginLifetime:
     # @spec ING-VEH-010, ING-VEH-012, ING-VEH-014, ING-GRPC-011
     async def __aenter__(self) -> Self:
         """Validate, install ASGI handling, and bind gRPC not-serving."""
+        self._failure = asyncio.get_running_loop().create_future()
         self._config, self._metadata = self._config_loader(self.context.config)
         try:
             self.release = importlib_metadata.version("vllm-riva-frontend")
@@ -532,11 +553,12 @@ class PluginLifetime:
         self.locales = _supported_locales(self.context)
         self.session_factory = _create_nemotron_session_factory(
             self.context.engine_client,
-            app_state=getattr(getattr(self.context, "app", None), "state", None),
+            app_state=getattr(
+                getattr(self.context, "app", None), "state", None
+            ),
         )
         self.load_shed = LoadShedGate(
             self._config.load_shed_max_sessions,
-            admission=self.context.admission,
             owner_register=self.owners.register,
         )
         self.adapter_config = SimpleNamespace(
@@ -596,15 +618,32 @@ class PluginLifetime:
                     await self._server.stop(0)
             raise
         self._entered = True
+        self._ready_event.set()
+        self._server_watch = asyncio.create_task(
+            self._watch_server_termination()
+        )
         return self
+
+    # @spec ING-VEH-018, ING-GRPC-011
+    async def wait_ready(self) -> None:
+        """Attest that every owned listener is bound and ready for admission."""
+        if not self._entered:
+            raise RuntimeError("plugin must enter before wait_ready")
+        await self._ready_event.wait()
+
+    # @spec ING-VEH-017, ING-VEH-018, ING-GRPC-011
+    async def wait_failed(self) -> None:
+        """Raise the first latched post-entry participant failure."""
+        if not self._entered or self._failure is None:
+            raise RuntimeError("plugin must enter before wait_failed")
+        error = await asyncio.shield(self._failure)
+        raise error
 
     # @spec ING-VEH-016, ING-GRPC-011, ING-SHIM-001
     async def mark_serving(self) -> None:
-        """Publish compatibility readiness only after host admission opens."""
+        """Publish compatibility readiness after the host transition."""
         if not self._entered or self._health is None:
             raise RuntimeError("plugin must enter before mark_serving")
-        if not self.context.admission.is_open():
-            raise RuntimeError("host admission must open before plugin health")
         await self._set_health(health_pb2.HealthCheckResponse.SERVING)
         self.ready = True
 
@@ -613,10 +652,6 @@ class PluginLifetime:
         """Become non-ready, drain every owner, then stop gRPC."""
         if self._quiesced:
             return
-        if self.context.admission.is_open():
-            raise RuntimeError(
-                "host admission must close before plugin owner drain"
-            )
         self._quiesced = True
         self.ready = False
         assert self._config is not None
@@ -640,6 +675,9 @@ class PluginLifetime:
         finally:
             if self._server is not None:
                 await self._server.stop(0)
+            if self._server_watch is not None:
+                with suppress(asyncio.CancelledError):
+                    await self._server_watch
 
     async def __aexit__(
         self, exc_type: object, exc: object, traceback: object

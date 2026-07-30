@@ -65,6 +65,18 @@ class ReleaseFailLease(RecordingLease):
         raise RuntimeError("release failure")
 
 
+class AbortFailLease(RecordingLease):
+    async def abort(self) -> None:
+        self.calls.append("abort")
+        raise RuntimeError("abort failure")
+
+
+class AbortAndReleaseFailLease(AbortFailLease):
+    async def release(self) -> None:
+        self.calls.append("release")
+        raise RuntimeError("release failure")
+
+
 class SettlingFactory:
     """Factory whose open settles only after owner cancellation."""
 
@@ -292,3 +304,73 @@ def test_cancelled_open_timeout_reports_fault_before_late_lease_arrives() -> (
     asyncio.run(exercise())
     assert len(faults) == 1
     assert lease.calls == ["abort", "release"]
+
+
+# @spec ING-LIFE-012, ING-LIFE-013
+def test_owner_rejects_invalid_order_duplicate_open_and_terminal_work() -> None:
+    with pytest.raises(ValueError, match="cleanup_timeout"):
+        DirectLeaseOwner(RecordingFactory(RecordingLease()), cleanup_timeout=0)
+
+    lease = RecordingLease()
+    owner = DirectLeaseOwner(RecordingFactory(lease), cleanup_timeout=1.0)
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="open must succeed"):
+            await owner.feed([], on_accepted=lambda _: None)
+        with pytest.raises(RuntimeError, match="open must succeed"):
+            await owner.update_locale("auto")
+        await owner.open(cadence="1120ms", locale="auto")
+        with pytest.raises(RuntimeError, match="exactly one"):
+            await owner.open(cadence="1120ms", locale="auto")
+        await owner.update_locale("en-US")
+        await owner.cancel()
+        with pytest.raises(RuntimeError, match="session terminal"):
+            await owner.feed([], on_accepted=lambda _: None)
+        with pytest.raises(RuntimeError, match="session terminal"):
+            await owner.update_locale("auto")
+        await owner.cancel()
+        assert await owner.complete() is None
+
+    asyncio.run(exercise())
+    assert lease.calls == ["locale:en-US", "abort", "release"]
+
+
+# @spec ING-LIFE-004, ING-LIFE-013, ING-LIFE-014
+@pytest.mark.parametrize(
+    ("lease_type", "message"),
+    [
+        (AbortFailLease, "abort failure"),
+        (AbortAndReleaseFailLease, "abort failure"),
+    ],
+)
+def test_abnormal_cleanup_retains_abort_as_the_primary_failure(
+    lease_type: type[RecordingLease], message: str
+) -> None:
+    lease = lease_type()
+    owner = DirectLeaseOwner(RecordingFactory(lease), cleanup_timeout=1.0)
+
+    async def exercise() -> None:
+        await owner.open(cadence="1120ms", locale="auto")
+        await owner.cancel()
+
+    with pytest.raises(RuntimeError, match=message):
+        asyncio.run(exercise())
+    assert lease.calls == ["abort", "release"]
+
+
+# @spec ING-LIFE-012, ING-LIFE-013
+def test_factory_open_failure_marks_owner_terminal() -> None:
+    class FailingFactory:
+        async def open(self, *, cadence: str, locale: str) -> RecordingLease:
+            del cadence, locale
+            raise RuntimeError("open failure")
+
+    owner = DirectLeaseOwner(FailingFactory(), cleanup_timeout=1.0)
+
+    async def exercise() -> None:
+        with pytest.raises(RuntimeError, match="open failure"):
+            await owner.open(cadence="1120ms", locale="auto")
+        assert await owner.complete() is None
+        await owner.cancel()
+
+    asyncio.run(exercise())

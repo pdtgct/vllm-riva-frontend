@@ -97,3 +97,11 @@ model-intrinsic because this frontend uses deterministic greedy RNN-T decode.
 The WebSocket adapter emits true incremental deltas and exactly one terminal
 completion. This intentionally does not reproduce observed cumulative-delta or
 interim-completion behavior from some Riva-family deployments.
+
+## Development
+
+Install the locked development environment with `uv sync --group dev`. The
+default `pytest` command runs the complete suite and enforces package line
+coverage above 90%. During a focused edit, use `pytest --no-cov PATH_OR_NODE_ID`
+so an otherwise-passing single test is not reported as a package-wide coverage
+failure; run unfiltered `pytest` before committing.

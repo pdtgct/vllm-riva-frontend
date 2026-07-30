@@ -18,9 +18,12 @@ from typing import Any
 from urllib.parse import unquote_to_bytes
 
 from vllm_riva_frontend.admission import (
+    AdmissionLease,
+    HostAdmission,
     LoadShedGate,
     LoadShedRegistration,
     LoadShedRejected,
+    try_acquire_admission,
 )
 from vllm_riva_frontend.errors import catalog
 from vllm_riva_frontend.frontend import (
@@ -237,16 +240,6 @@ def _session_rejections(
     return list(dict.fromkeys(rejected))
 
 
-def _admission_open(admission: object | None) -> bool:
-    """Read host-owned admission without defining its implementation."""
-    if admission is None:
-        return True
-    value = getattr(admission, "is_open", admission)
-    if callable(value):
-        value = value()
-    return value is True or value == "OPEN"
-
-
 def _decode_query(query: bytes) -> list[tuple[str, str]] | None:
     """Strictly percent/UTF-8 decode a raw ASGI query string."""
     pairs: list[tuple[str, str]] = []
@@ -375,6 +368,7 @@ class _Connection:
         gate: LoadShedGate,
         owner_register: OwnerRegister | None,
         owner_factory: LeaseOwnerFactory,
+        admission_lease: AdmissionLease,
     ) -> None:
         """Capture shared factory/config and initialize local buffer state."""
         self._factory = factory
@@ -382,6 +376,7 @@ class _Connection:
         self._gate = gate
         self._owner_register = owner_register
         self._owner_factory = owner_factory
+        self._admission_lease: AdmissionLease | None = admission_lease
         self._registration: LoadShedRegistration | None = None
         self._tracked_owner: object | None = None
         self._owner: DirectLeaseOwner | None = None
@@ -472,6 +467,7 @@ class _Connection:
                 ),
             )
             await send({"type": "websocket.close", "code": 1013})
+            await self._release_registration()
             return
         if registration is None:
             raise RuntimeError("realtime inference must consume one owner slot")
@@ -1165,15 +1161,22 @@ class _Connection:
         await self._release_registration()
 
     async def _release_registration(self) -> None:
-        """Release the compatibility-only load-shed registration once."""
-        if self._tracked_owner is not None:
-            release = getattr(self._tracked_owner, "release", None)
-            if callable(release):
-                await release()
-            self._tracked_owner = None
-        if self._registration is not None:
-            await self._registration.release()
-            self._registration = None
+        """Release local owners before the host admission lease."""
+        try:
+            if self._tracked_owner is not None:
+                release = getattr(self._tracked_owner, "release", None)
+                if callable(release):
+                    await release()
+                self._tracked_owner = None
+        finally:
+            try:
+                if self._registration is not None:
+                    await self._registration.release()
+                    self._registration = None
+            finally:
+                if self._admission_lease is not None:
+                    self._admission_lease.release()
+                    self._admission_lease = None
 
     async def _send_json(self, send: AsgiSend, event: dict[str, Any]) -> None:
         """Serialize one server event through the existing ASGI socket only."""
@@ -1186,7 +1189,7 @@ def dispatch_nim_realtime(
     app: AsgiApp,
     factory: object,
     config: object,
-    admission: object | None = None,
+    admission: HostAdmission | None = None,
     gate: LoadShedGate | None = None,
     owner_register: OwnerRegister | None = None,
     owner_factory: LeaseOwnerFactory | None = None,
@@ -1222,19 +1225,9 @@ def dispatch_nim_realtime(
         if decision is DispatchDecision.DENY:
             await send({"type": "websocket.close", "code": 1008})
             return
-        if not _admission_open(admission):
-            await send({"type": "websocket.accept"})
-            await send(
-                {
-                    "type": "websocket.send",
-                    "text": json.dumps(
-                        _error(
-                            "service_unavailable", "application is not ready"
-                        )
-                    ),
-                }
-            )
-            await send({"type": "websocket.close", "code": 1013})
+        admission_lease = try_acquire_admission(admission)
+        if admission_lease is None:
+            await send({"type": "websocket.close"})
             return
         connection = _Connection(
             factory,
@@ -1242,7 +1235,11 @@ def dispatch_nim_realtime(
             shared_gate,
             owner_register,
             shared_owner_factory,
+            admission_lease,
         )
-        await connection.run(receive, send)
+        try:
+            await connection.run(receive, send)
+        finally:
+            await connection._release_registration()
 
     return middleware

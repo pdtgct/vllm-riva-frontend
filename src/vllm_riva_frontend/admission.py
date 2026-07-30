@@ -32,11 +32,37 @@ class LoadShedRejected:
     authority: str = "load_shed"
 
 
+class AdmissionLease(Protocol):
+    """One idempotently releasable host-admission owner."""
+
+    def release(self) -> None:
+        """Synchronously release the host's admitted-work registration."""
+
+
 class HostAdmission(Protocol):
     """The host-owned composed-readiness authority."""
 
-    def is_open(self) -> bool:
-        """Return whether new application inference may start."""
+    def try_acquire(self) -> AdmissionLease | None:
+        """Atomically register new work or reject after admission closes."""
+
+
+class _UnmanagedAdmissionLease:
+    """No-op lease for direct tests which do not install a host."""
+
+    def release(self) -> None:
+        """Preserve the same terminal-release shape without host state."""
+
+
+_UNMANAGED_ADMISSION_LEASE = _UnmanagedAdmissionLease()
+
+
+def try_acquire_admission(
+    admission: HostAdmission | None,
+) -> AdmissionLease | None:
+    """Acquire host admission, treating an absent direct-test host as open."""
+    if admission is None:
+        return _UNMANAGED_ADMISSION_LEASE
+    return admission.try_acquire()
 
 
 class OwnerToken(Protocol):
@@ -89,20 +115,18 @@ class LoadShedRegistration:
 
 
 class LoadShedGate:
-    """Atomically gates readiness, owner tracking, and the local SLO cap."""
+    """Atomically gate owner tracking and the compatibility-local SLO cap."""
 
     def __init__(
         self,
         max_sessions: int,
         *,
-        admission: HostAdmission | None = None,
         owner_register: OwnerRegister | None = None,
     ) -> None:
         """Create a gate with one finite compatibility-owner limit."""
         if type(max_sessions) is not int or max_sessions <= 0:
             raise ValueError("max_sessions must be a positive integer")
         self._max_sessions = max_sessions
-        self._admission = admission
         self._owner_register = owner_register
         self._active = 0
         self._closed = False
@@ -123,12 +147,10 @@ class LoadShedGate:
         if kind not in INFERENCE_OWNER_KINDS:
             raise ValueError(f"unknown owner kind: {kind}")
         async with self._lock:
-            if self._closed or (
-                self._admission is not None and not self._admission.is_open()
-            ):
+            if self._closed:
                 return LoadShedRejected(
                     code="service_unavailable",
-                    authority="application_admission",
+                    authority="load_shed",
                 )
             if self._active >= self._max_sessions:
                 return LoadShedRejected()

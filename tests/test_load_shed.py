@@ -33,6 +33,14 @@ def test_counter_excludes_noninference_work() -> None:
     } <= EXCLUDED_OWNER_KINDS
 
 
+# @spec ING-ADM-006
+def test_gate_rejects_invalid_capacity_and_unknown_owner_kind() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        LoadShedGate(0)
+    with pytest.raises(ValueError, match="unknown owner kind"):
+        asyncio.run(LoadShedGate(1).register("not-an-owner"))
+
+
 # @spec ING-ADM-006, ING-LIFE-012
 def test_atomic_limit_rejects_before_owner_creation() -> None:
     gate = LoadShedGate(max_sessions=1)
@@ -61,36 +69,26 @@ def test_context_releases_once_and_excluded_work_uses_no_slot() -> None:
 
 # @spec ING-ADM-006, ING-LIFE-012, ING-VEH-017
 def test_shutdown_linearizes_against_registration_and_owner_failure() -> None:
-    class Admission:
-        open = True
-
-        def is_open(self) -> bool:
-            return self.open
-
     class FailingToken:
         async def release(self) -> None:
             raise RuntimeError("registry failure")
 
     async def exercise() -> None:
-        admission = Admission()
-
         async def register_owner(kind: str) -> FailingToken:
             assert kind == "grpc_recognize"
             return FailingToken()
 
         gate = LoadShedGate(
             1,
-            admission=admission,
             owner_register=register_owner,
         )
         registration = await gate.register("grpc_recognize")
         assert isinstance(registration, LoadShedRegistration)
-        admission.open = False
         await gate.close()
         rejected = await gate.register("nim_http_transcription")
         assert rejected == LoadShedRejected(
             code="service_unavailable",
-            authority="application_admission",
+            authority="load_shed",
         )
         with pytest.raises(RuntimeError, match="registry failure"):
             await registration.release()

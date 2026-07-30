@@ -15,9 +15,12 @@ from riva.client.proto import riva_asr_pb2_grpc as rasr_grpc
 from riva.client.proto import riva_audio_pb2 as raud
 
 from vllm_riva_frontend.admission import (
+    AdmissionLease,
+    HostAdmission,
     LoadShedGate,
     LoadShedRegistration,
     LoadShedRejected,
+    try_acquire_admission,
 )
 from vllm_riva_frontend.config import FrontendConfig, dispositioned_fields
 from vllm_riva_frontend.errors import catalog
@@ -54,14 +57,6 @@ class AudioFrontend(Protocol):
 FrontendFactory = Callable[[str, int], AudioFrontend]
 OwnerFactory = Callable[..., DirectLeaseOwner]
 RiffResolver = Callable[..., RiffFormat | FormatError | None]
-
-
-class HostAdmission(Protocol):
-    """The host-owned readiness authority for compatibility inference."""
-
-    def is_open(self) -> bool:
-        """Return whether new compatibility inference may begin."""
-        ...
 
 
 class OwnerToken(Protocol):
@@ -225,12 +220,14 @@ class RivaServicer(
             )
         return result
 
-    async def _admission_or_abort(self, context: object) -> None:
-        """Reject closed host admission before consuming compatibility work."""
-        if not self._admission.is_open():
+    async def _admission_or_abort(self, context: object) -> AdmissionLease:
+        """Acquire host ownership before consuming compatibility work."""
+        lease = try_acquire_admission(self._admission)
+        if lease is None:
             await self._abort(
                 context, "service_unavailable", "application admission closed"
             )
+        return lease
 
     async def _owner_token(self, kind: str) -> OwnerToken | None:
         """Register host ownership after shared load-shed admission succeeds."""
@@ -481,13 +478,14 @@ class RivaServicer(
         context: object,
     ) -> AsyncIterator[rasr.StreamingRecognizeResponse]:
         """Require config/open before further reads, then drive one lease."""
-        await self._admission_or_abort(context)
-        registration = await self._registration(
-            "grpc_streaming_recognize", context
-        )
+        admission_lease = await self._admission_or_abort(context)
+        registration: LoadShedRegistration | None = None
         owner_token: OwnerToken | None = None
         owner: DirectLeaseOwner | None = None
         try:
+            registration = await self._registration(
+                "grpc_streaming_recognize", context
+            )
             preconfiguration_deadline = (
                 self._clock() + self._config.preconfiguration_timeout
             )
@@ -681,19 +679,23 @@ class RivaServicer(
                 if owner_token is not None:
                     await owner_token.release()
             finally:
-                if registration is not None:
-                    await registration.release()
+                try:
+                    if registration is not None:
+                        await registration.release()
+                finally:
+                    admission_lease.release()
 
     # @spec ING-GRPC-003, ING-GRPC-008, ING-GRPC-009, ING-GRPC-010
     async def Recognize(
         self, request: rasr.RecognizeRequest, context: object
     ) -> rasr.RecognizeResponse:
         """Run bounded unary recognition through the same 1120-ms lease path."""
-        await self._admission_or_abort(context)
-        registration = await self._registration("grpc_recognize", context)
+        admission_lease = await self._admission_or_abort(context)
+        registration: LoadShedRegistration | None = None
         owner_token: OwnerToken | None = None
         owner: DirectLeaseOwner | None = None
         try:
+            registration = await self._registration("grpc_recognize", context)
             owner_token = await self._owner_token("grpc_recognize")
             await self._validate_or_abort(request.config, context)
             if getattr(request, "runtime_config", None):
@@ -824,8 +826,11 @@ class RivaServicer(
                 if owner_token is not None:
                     await owner_token.release()
             finally:
-                if registration is not None:
-                    await registration.release()
+                try:
+                    if registration is not None:
+                        await registration.release()
+                finally:
+                    admission_lease.release()
 
     # @spec ING-GRPC-004, ING-GRPC-006
     async def GetRivaSpeechRecognitionConfig(
