@@ -50,6 +50,9 @@ addopts = [
     "--cov-fail-under=90.01",
 ]
 
+[tool.coverage.report]
+precision = 2
+
 [tool.ruff]
 line-length = 80
 target-version = "py312"
