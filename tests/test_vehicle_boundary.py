@@ -72,3 +72,4 @@ def test_default_gate_enforces_more_than_ninety_percent_line_coverage() -> None:
         if item.startswith("--cov-fail-under=")
     ]
     assert thresholds and min(thresholds) > 90.0
+    assert project["tool"]["coverage"]["report"]["precision"] >= 2
