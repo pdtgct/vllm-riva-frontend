@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-riva-frontend"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Downstream Riva and Speech NIM frontend for vLLM-Omni"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -15,6 +15,7 @@ dependencies = [
     "grpcio-reflection>=1.60",
     "nvidia-riva-client==2.26.0",
     "numpy>=1.26",
+    "packaging>=23",
     "python-multipart>=0.0.9",
     "pyyaml>=6",
     "scipy>=1.14",
@@ -38,8 +39,11 @@ dev = [
     "types-pyyaml>=6",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/vllm_riva_frontend"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vllm_riva_frontend.version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -49,6 +53,9 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-fail-under=90.01",
 ]
+
+[tool.coverage.run]
+omit = ["tests/*", "vllm_riva_frontend/version.py"]
 
 [tool.coverage.report]
 precision = 2
