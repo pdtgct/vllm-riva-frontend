@@ -408,7 +408,6 @@ wheels = [
 
 [[package]]
 name = "vllm-riva-frontend"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "grpcio" },
@@ -416,6 +415,7 @@ dependencies = [
     { name = "grpcio-reflection" },
     { name = "numpy" },
     { name = "nvidia-riva-client" },
+    { name = "packaging" },
     { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "scipy" },
@@ -437,6 +437,7 @@ requires-dist = [
     { name = "grpcio-reflection", specifier = ">=1.60" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "nvidia-riva-client", specifier = "==2.26.0" },
+    { name = "packaging", specifier = ">=23" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "scipy", specifier = ">=1.14" },
