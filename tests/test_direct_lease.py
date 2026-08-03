@@ -131,6 +131,67 @@ def test_normal_owner_flushes_finishes_then_releases() -> None:
     assert lease.calls == ["flush", "finish", "release"]
 
 
+class StructuredTerminalLease(RecordingLease):
+    """Lease shaped like the 0.25 bounded-stream host line.
+
+    ``flush`` returns a structured terminal result carrying
+    ``complete_text`` plus a completion acknowledgement this frontend
+    does not consume.
+    """
+
+    class _Terminal:
+        complete_text = " final tail"
+        completion = object()
+        emit_segment_event = False
+
+    async def flush(self) -> object:
+        self.calls.append("flush")
+        return self._Terminal()
+
+
+class MalformedTerminalLease(RecordingLease):
+    """Lease violating the host contract with an unrecognizable shape."""
+
+    async def flush(self) -> object:
+        self.calls.append("flush")
+        return 41
+
+
+# @spec ING-LIFE-010
+def test_complete_normalizes_the_structured_terminal_of_the_v025_host() -> (
+    None
+):
+    lease = StructuredTerminalLease()
+    owner = DirectLeaseOwner(RecordingFactory(lease), cleanup_timeout=1.0)
+
+    async def exercise() -> str | None:
+        await owner.open(cadence="1120ms", locale="en-US")
+        return await owner.complete()
+
+    result = asyncio.run(exercise())
+    assert result == " final tail"
+    assert lease.calls == ["flush", "finish", "release"]
+
+
+# @spec ING-LIFE-010
+def test_complete_rejects_a_malformed_terminal_shape_with_abort_cleanup() -> (
+    None
+):
+    lease = MalformedTerminalLease()
+    owner = DirectLeaseOwner(RecordingFactory(lease), cleanup_timeout=1.0)
+
+    async def exercise() -> None:
+        await owner.open(cadence="1120ms", locale="en-US")
+        with pytest.raises(TypeError, match="neither a transcript string"):
+            await owner.complete()
+        # The shape violation selected the abnormal terminal; a retry
+        # must not re-enter flush/finish on the same lease.
+        assert await owner.complete() is None
+
+    asyncio.run(exercise())
+    assert lease.calls == ["flush", "abort", "release"]
+
+
 # @spec ING-LIFE-004, ING-LIFE-010, ING-LIFE-013
 def test_abnormal_owner_aborts_then_releases_without_finish() -> None:
     lease = RecordingLease()
