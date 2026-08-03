@@ -51,7 +51,13 @@ _OWNED_HTTP_METHODS = {
     "/v1/realtime/transcription_sessions": frozenset({"POST"}),
     **{path: frozenset({"GET"}) for path in OPERATIONAL_PATHS},
 }
-_SUPPORTED_HOST_MAJOR_MINOR = (0, 24)
+#: Host lines this package is qualified against, newest last.  A set of
+#: exercised lines rather than a range: each entry names a line whose plugin
+#: boundary this suite covers, so an unreleased future line fails closed
+#: instead of being assumed compatible.  The package imports no host symbol —
+#: coupling is the entry-point contract and the protocols in this module — so
+#: adding a line is a statement about qualification, not about linking.
+_SUPPORTED_HOST_MAJOR_MINOR = ((0, 24), (0, 25))
 
 
 class PluginApplication(Protocol):
@@ -168,13 +174,13 @@ def _resolve_host_version() -> str:
 
 
 def _validate_supported_version(version: str) -> None:
-    """Fail before bind unless the host is the declared 0.24 line.
+    """Fail before bind unless the host is one of the qualified lines.
 
     A build carrying a PEP 440 dev, pre-release, or local segment — an
     editable setuptools-scm '0.1.dev2155+g...' checkout, or a
     '0.24.0.dev0+cu130' nightly — is an intentional unreleased host and is
     allowed through; its base version is not a reliable line indicator.
-    Only a clean release version is held to the exact supported major.minor.
+    Only a clean release version is held to the qualified major.minor set.
     """
     try:
         parsed = Version(version)
@@ -184,10 +190,18 @@ def _validate_supported_version(version: str) -> None:
         ) from error
     if parsed.is_devrelease or parsed.is_prerelease or parsed.local is not None:
         return
-    if parsed.release[:2] != _SUPPORTED_HOST_MAJOR_MINOR:
+    if parsed.release[:2] not in _SUPPORTED_HOST_MAJOR_MINOR:
         raise ValueError(
-            f"vllm-riva-frontend supports vLLM-Omni 0.24.x; found {version}"
+            f"vllm-riva-frontend supports vLLM-Omni "
+            f"{_supported_host_lines()}; found {version}"
         )
+
+
+def _supported_host_lines() -> str:
+    """Render the qualified lines the way an operator reads them."""
+    return ", ".join(
+        f"{major}.{minor}.x" for major, minor in _SUPPORTED_HOST_MAJOR_MINOR
+    )
 
 
 # @spec ING-VEH-012, ING-VEH-014, PORT-RTC-003

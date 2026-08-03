@@ -484,10 +484,17 @@ def test_preflight_rejects_version_and_route_collision_before_bind() -> None:
     async def exercise() -> None:
         context = FakeContext()
         events: list[object] = []
-        with pytest.raises(ValueError, match="0.24"):
-            async with _lifetime(context, events, version="0.25.0"):
+        with pytest.raises(ValueError, match="0.26.0"):
+            async with _lifetime(context, events, version="0.26.0"):
                 pass
         assert events == []
+
+        # Both qualified lines reach bind rather than being refused here.
+        for qualified in ("0.24.0", "0.25.0"):
+            context = FakeContext()
+            async with _lifetime(context, events, version=qualified):
+                pass
+        events.clear()
 
         context = FakeContext()
         context.app.routes.append(
@@ -507,6 +514,16 @@ def test_context_version_and_locale_preflight_fail_closed() -> None:
         lifecycle_module._validate_supported_version("not a version")
     lifecycle_module._validate_supported_version("0.25.0.dev0")
     lifecycle_module._validate_supported_version("0.25.0+local")
+
+    # Every qualified line passes as a clean release; an unqualified one does
+    # not, so widening the set stays a deliberate act rather than a drift.
+    for major, minor in lifecycle_module._SUPPORTED_HOST_MAJOR_MINOR:
+        lifecycle_module._validate_supported_version(f"{major}.{minor}.0")
+    with pytest.raises(ValueError, match="0.26.0"):
+        lifecycle_module._validate_supported_version("0.26.0")
+    with pytest.raises(ValueError, match="0.23.0"):
+        lifecycle_module._validate_supported_version("0.23.0")
+    assert lifecycle_module._supported_host_lines() == "0.24.x, 0.25.x"
 
     context = FakeContext()
     context.plugin_name = "other"
