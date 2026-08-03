@@ -40,8 +40,14 @@ class SessionLease(Protocol):
         """Apply a validated locale to the next carrier mint."""
         ...
 
-    async def flush(self) -> str:
-        """Drain final-tail work and return the terminal transcript."""
+    async def flush(self) -> object:
+        """Drain final-tail work and return the terminal output.
+
+        The 0.24 host line returns the terminal transcript itself; the
+        0.25 bounded-stream line returns a structured terminal result
+        whose ``complete_text`` carries the transcript. The owner
+        normalizes both shapes through ``_terminal_transcript``.
+        """
         ...
 
     async def finish(self) -> None:
@@ -63,6 +69,29 @@ class SessionFactory(Protocol):
     async def open(self, *, cadence: str, locale: str) -> SessionLease:
         """Open one validated engine-local session."""
         ...
+
+
+def _terminal_transcript(terminal: object) -> str:
+    """Normalize the lease's terminal shape across qualified host lines.
+
+    Every dialect surface consumes exactly one thing from finalization:
+    the terminal transcript string. Which shape ``flush`` returns is a
+    property of the host line this package admits — a plain transcript
+    on 0.24, a structured terminal result carrying ``complete_text``
+    (plus a completion acknowledgement this frontend does not consume)
+    on the 0.25 bounded-stream line. Any other shape is a host-contract
+    violation and must fail loudly rather than serialize garbage into a
+    dialect final.
+    """
+    if isinstance(terminal, str):
+        return terminal
+    text = getattr(terminal, "complete_text", None)
+    if isinstance(text, str):
+        return text
+    raise TypeError(
+        "lease flush returned neither a transcript string nor a "
+        f"structured terminal result: {type(terminal).__name__}"
+    )
 
 
 class DirectLeaseOwner:
@@ -219,7 +248,9 @@ class DirectLeaseOwner:
                 return None
             lease = self._lease_or_raise()
             try:
-                transcript = await lease.flush()
+                # A shape violation is a flush-contract failure and takes
+                # the same abort -> release path as a failed flush.
+                transcript = _terminal_transcript(await lease.flush())
                 await lease.finish()
             except BaseException as primary_error:
                 # This terminal direction has been selected even if its
