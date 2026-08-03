@@ -50,7 +50,7 @@ def _modules() -> list[Path]:
     return sorted(_PACKAGE_ROOT.glob("*.py"))
 
 
-# @spec ING-VEH-019
+# @spec ING-VEH-025
 def test_declared_range_matches_the_host_supported_interpreters() -> None:
     """The floor is vLLM-Omni's, not an independent choice."""
     requires = _project()["project"]["requires-python"]
@@ -61,7 +61,7 @@ def test_declared_range_matches_the_host_supported_interpreters() -> None:
     )
 
 
-# @spec ING-VEH-019
+# @spec ING-VEH-025
 def test_every_module_parses_on_the_lowest_supported_version() -> None:
     """Report every module that uses post-floor syntax, not just the first."""
     feature_version = LOWEST_SUPPORTED[1]
@@ -83,7 +83,7 @@ def test_every_module_parses_on_the_lowest_supported_version() -> None:
     )
 
 
-# @spec ING-VEH-019
+# @spec ING-VEH-025
 def test_no_module_imports_a_typing_name_above_the_floor() -> None:
     """An import executes even when the annotation using it does not."""
     offenders: list[str] = []
@@ -107,7 +107,7 @@ def test_no_module_imports_a_typing_name_above_the_floor() -> None:
     )
 
 
-# @spec ING-VEH-019
+# @spec ING-VEH-025
 def test_tooling_floors_name_the_lowest_supported_version() -> None:
     """Linter and type checker must judge at the floor, not the ceiling."""
     project = _project()
@@ -119,7 +119,7 @@ def test_tooling_floors_name_the_lowest_supported_version() -> None:
     assert project["tool"]["mypy"]["python_version"] == floor
 
 
-# @spec ING-VEH-019
+# @spec ING-VEH-025
 def test_toml_reader_is_version_gated_rather_than_unguarded() -> None:
     """A stdlib module newer than the floor needs a declared fallback."""
     dev_dependencies = _project()["dependency-groups"]["dev"]
