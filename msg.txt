@@ -1,0 +1,23 @@
+fix: qualify the vLLM-Omni 0.25 host line
+
+A cohosted GPU round on the v0.25 lane stopped at participant entry:
+the preflight refused the host with "supports vLLM-Omni 0.24.x; found
+0.25.0". The engine had already initialized, so nothing about the
+refusal was a compatibility finding — the guard was simply still
+declaring one line.
+
+This package imports no host symbol. Coupling is the entry-point
+contract plus the protocols in lifecycle.py, so admitting a line is a
+statement about what has been qualified, not about what links. The
+constant becomes an ordered set of qualified lines and the message
+renders them, which keeps the guard fail-closed: 0.23 and 0.26 are
+still refused, and dev/pre/local builds still pass as intentional
+unreleased hosts.
+
+The old test used 0.25.0 as its rejected example, which would have
+quietly become a no-op assertion. It now rejects an unqualified line
+instead, and both qualified lines are proven to reach bind.
+
+Co-authored-by: Claude
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016vBNWkPjg5HgJoK2rKfuYY
