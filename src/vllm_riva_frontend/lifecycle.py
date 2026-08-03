@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import Any, Protocol, Self, cast
+from typing import Any, Protocol, cast
 
 import grpc
 from grpc_health.v1 import health_pb2
@@ -538,7 +538,7 @@ class PluginLifetime:
         )
 
     # @spec ING-VEH-010, ING-VEH-012, ING-VEH-014, ING-GRPC-011
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> PluginLifetime:
         """Validate, install ASGI handling, and bind gRPC not-serving."""
         self._failure = asyncio.get_running_loop().create_future()
         self._config, self._metadata = self._config_loader(self.context.config)

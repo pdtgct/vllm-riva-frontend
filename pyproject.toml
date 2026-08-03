@@ -7,7 +7,7 @@ name = "vllm-riva-frontend"
 dynamic = ["version"]
 description = "Downstream Riva and Speech NIM frontend for vLLM-Omni"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 dependencies = [
     "grpcio>=1.60",
@@ -37,6 +37,7 @@ dev = [
     "pytest-cov>=7",
     "ruff>=0.15",
     "types-pyyaml>=6",
+    "tomli>=2; python_version < '3.11'",
 ]
 
 [tool.setuptools.packages.find]
@@ -62,7 +63,7 @@ precision = 2
 
 [tool.ruff]
 line-length = 80
-target-version = "py312"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "D", "UP", "B", "SIM"]
@@ -75,7 +76,7 @@ convention = "google"
 "tests/**" = ["D1"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.10"
 strict = true
 packages = ["vllm_riva_frontend"]
 

@@ -1,7 +1,12 @@
 """Static no-second-stack invariants for the downstream plugin package."""
 
-import tomllib
+import sys
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised only on the lowest supported version
+    import tomli as tomllib
 
 
 # @spec ING-VEH-005, ING-VEH-006, ING-VEH-007, ING-VEH-008, ING-VEH-014
