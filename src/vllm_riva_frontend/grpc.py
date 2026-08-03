@@ -5,7 +5,7 @@ import inspect
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from typing import Never, Protocol, TypeVar, cast
+from typing import NoReturn, Protocol, TypeVar, cast
 
 import grpc
 from grpc_health.v1 import health, health_pb2_grpc
@@ -193,7 +193,7 @@ class RivaServicer(
         self._owner_register = owner_register
         self._clock = clock
 
-    async def _abort(self, context: object, code: str, fields: str) -> Never:
+    async def _abort(self, context: object, code: str, fields: str) -> NoReturn:
         """Project a code-first gRPC status and then stop the RPC."""
         projection = catalog()[code]
         abort = getattr(context, "abort", None)
@@ -283,7 +283,7 @@ class RivaServicer(
             await self._abort(context, timeout_code, timeout_fields)
         try:
             return await asyncio.wait_for(operation(), timeout=timeout)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await self._abort(context, timeout_code, timeout_fields)
         raise AssertionError("context.abort must terminate the RPC")
 

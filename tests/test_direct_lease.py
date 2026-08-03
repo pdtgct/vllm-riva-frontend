@@ -294,10 +294,10 @@ def test_cancelled_open_timeout_reports_fault_before_late_lease_arrives() -> (
         )
         await factory.started.wait()
         opening.cancel()
-        with pytest.raises(TimeoutError):
+        with pytest.raises(asyncio.TimeoutError):
             await opening
         assert len(faults) == 1
-        assert isinstance(faults[0], TimeoutError)
+        assert isinstance(faults[0], asyncio.TimeoutError)
         factory.settle.set()
         await asyncio.sleep(0.02)
 

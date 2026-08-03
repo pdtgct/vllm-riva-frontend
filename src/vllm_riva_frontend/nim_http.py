@@ -9,7 +9,7 @@ import re
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Never, Protocol, cast
+from typing import NoReturn, Protocol, TypeAlias, cast
 
 from python_multipart import MultipartParser
 from python_multipart.exceptions import MultipartParseError
@@ -120,8 +120,8 @@ class OwnerToken(Protocol):
         """Release the lifecycle owner after terminal lease cleanup."""
 
 
-type OwnerRegister = Callable[[], Awaitable[OwnerToken]]
-type OwnerFactory = Callable[..., DirectLeaseOwner]
+OwnerRegister: TypeAlias = Callable[[], Awaitable[OwnerToken]]
+OwnerFactory: TypeAlias = Callable[..., DirectLeaseOwner]
 
 
 @dataclass(frozen=True)
@@ -358,7 +358,7 @@ async def parse_transcription_multipart(
     ended = False
     envelope_bytes = 0
 
-    def fail(failure: HttpFailure) -> Never:
+    def fail(failure: HttpFailure) -> NoReturn:
         raise _FailureRaised(failure)
 
     def on_part_begin() -> None:
@@ -554,7 +554,7 @@ class NimHttpTranscriptionEndpoint:
             return await asyncio.wait_for(
                 self._handle(scope, receive), self._config.request_timeout
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             return _failure_response(
                 _detail("request_timeout", "HTTP request timed out", status=504)
             )
@@ -652,7 +652,7 @@ class NimHttpTranscriptionEndpoint:
                 transcript = await asyncio.wait_for(
                     owner.complete(), self._config.finalization_timeout
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 await owner.cancel()
                 return _failure_response(
                     _detail(

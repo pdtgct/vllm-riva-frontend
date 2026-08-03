@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 INFERENCE_OWNER_KINDS = frozenset(
     {
@@ -72,7 +72,7 @@ class OwnerToken(Protocol):
         """Release the task registration after terminal cleanup."""
 
 
-type OwnerRegister = Callable[[str], Awaitable[OwnerToken]]
+OwnerRegister: TypeAlias = Callable[[str], Awaitable[OwnerToken]]
 
 
 class LoadShedRegistration:

@@ -1,0 +1,47 @@
+# Gates the declared interpreter range (ING-VEH-019).
+#
+# The floor job is the load-bearing one: the plugin is imported into the
+# host's interpreter, so a package that only works on the newest supported
+# Python is undeployable where it is actually meant to run. Static checks
+# cannot stand in for it — the breakages that reached this repository were
+# `asyncio.TimeoutError` not being the builtin `TimeoutError` below 3.11,
+# and `BaseException.add_note` not existing there. Both are import-clean,
+# syntax-clean, and only observable when the suite runs on the floor.
+#
+# Dependencies are resolved per interpreter rather than shared, because a
+# floor run against ceiling-resolved dependencies is not floor evidence.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor; 3.12 is the current host lane for the
+        # supported v0.24 line. 3.11 and 3.13 are inside the declared range
+        # but unexecuted here — declared-but-unverified, per ING-VEH-019.
+        python-version: ["3.10", "3.12"]
+    name: python ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Resolve dependencies for this interpreter
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python-version }} ruff check .
+
+      - name: Types
+        run: uv run --python ${{ matrix.python-version }} mypy
+
+      - name: Tests
+        run: uv run --python ${{ matrix.python-version }} pytest -q

@@ -10,9 +10,14 @@ facts/errors.
 from dataclasses import dataclass
 
 import numpy as np
+import numpy.typing as npt
 from scipy.signal import firwin, lfilter
 
-FloatSamples = np.ndarray
+#: Normalized mono audio: every producer here emits float32 (see
+#: ``mulaw_table``, ``alaw_table``, and the decode paths). Spelling the
+#: parameters out keeps the alias checkable under numpy releases that do
+#: not supply defaults for ``ndarray``'s type parameters.
+FloatSamples = npt.NDArray[np.float32]
 
 ACCEPT_MATRIX = frozenset(
     {

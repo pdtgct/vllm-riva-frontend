@@ -8,6 +8,25 @@ PieceAccepted = Callable[[int], None]
 CleanupFaultReporter = Callable[[BaseException], None]
 
 
+def add_note(error: BaseException, note: str) -> None:
+    """Retain one secondary diagnostic on an in-flight primary error.
+
+    ``BaseException.add_note`` arrived in Python 3.11. Below it, write the
+    same ``__notes__`` list the method maintains, so the diagnostic is
+    retained and inspectable on every supported interpreter; only
+    traceback *rendering* of notes is version-dependent.
+    """
+    native = getattr(error, "add_note", None)
+    if native is not None:
+        native(note)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        notes = []
+        error.__notes__ = notes  # type: ignore[attr-defined]
+    notes.append(note)
+
+
 class SessionLease(Protocol):
     """Transport-neutral operations owned by RFC-1."""
 
@@ -90,7 +109,7 @@ class DirectLeaseOwner:
         abort_error: BaseException | None = None
         try:
             await self._bounded_cleanup(lease.abort())
-        except TimeoutError:
+        except asyncio.TimeoutError:
             # The abort may still be executing under the shield.  A release now
             # would overlap terminal lease calls, so the caller escalates.
             raise
@@ -100,8 +119,9 @@ class DirectLeaseOwner:
             await self._bounded_cleanup(lease.release())
         except BaseException:
             if abort_error is not None:
-                abort_error.add_note(
-                    "release also failed during abnormal cleanup"
+                add_note(
+                    abort_error,
+                    "release also failed during abnormal cleanup",
                 )
                 raise abort_error from None
             raise
@@ -154,7 +174,7 @@ class DirectLeaseOwner:
                     self._lease = await asyncio.wait_for(
                         asyncio.shield(open_task), self._cleanup_timeout
                     )
-                except TimeoutError as error:
+                except asyncio.TimeoutError as error:
                     self._track_late_open(open_task)
                     self._report_cleanup_fault(error)
                     raise
@@ -209,8 +229,9 @@ class DirectLeaseOwner:
                 try:
                     await self._release_after_abort(lease)
                 except BaseException as cleanup_error:
-                    primary_error.add_note(
-                        f"abnormal cleanup failed: {cleanup_error!r}"
+                    add_note(
+                        primary_error,
+                        f"abnormal cleanup failed: {cleanup_error!r}",
                     )
                 raise
             # A successful finish commits the normal engine terminal.  A later
