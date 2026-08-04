@@ -16,6 +16,56 @@ from vllm_riva_frontend.frontend import RESAMPLER_ID
 #: / ``_validate_provenance_value``, which does the same for *values*.
 FORBIDDEN_PROVENANCE_KEY = "selectedModelProfileId"
 
+#: The application-plugin entry-point key this package registers under
+#: (``--application-plugin-config riva_frontend=...``), named in every
+#: configuration-loading error so a multi-plugin host log is unambiguous
+#: about which plugin's configuration failed.
+_PLUGIN_KEY = "riva_frontend"
+
+#: The qualified zero-config deployment profile (D5): every
+#: ``FrontendConfig`` field plus the three ``DeploymentMetadata`` source
+#: fields, resolved to the values this project already deploys with at
+#: ``deploy/riva_frontend/home.values.yaml``.  ``load_plugin_config`` uses
+#: this profile to fill any field the caller does not explicitly supply,
+#: including when no configuration is supplied at all -- an explicit value
+#: is still validated and can still be rejected (D5 does not relax
+#: validation, only what may be omitted).
+_DEFAULT_PROFILE: dict[str, object] = {
+    "grpc_bind": "0.0.0.0:50051",
+    "grpc_receive_max_bytes": 33619968,
+    "grpc_config_envelope_max_bytes": 65536,
+    "unary_max_encoded_audio_bytes": 33554432,
+    "unary_max_decoded_duration_seconds": 600.0,
+    "max_riff_header_bytes": 1048576,
+    "load_shed_max_sessions": 64,
+    "pre_submit_max_samples": 65536,
+    "preconfiguration_timeout": 30.0,
+    "session_idle_timeout": 60.0,
+    "session_finalization_timeout": 180.0,
+    "session_cleanup_timeout": 30.0,
+    "plugin_shutdown_grace": 240.0,
+    "ws_receive_max_bytes": 16777216,
+    "ws_event_envelope_max_bytes": 8388608,
+    "http_multipart_envelope_max_bytes": 33816576,
+    "http_content_type_max_bytes": 4096,
+    "http_request_header_max_bytes": 65536,
+    "http_multipart_boundary_max_bytes": 200,
+    "http_multipart_max_parts": 5,
+    "http_multipart_max_header_bytes": 8192,
+    "http_text_field_max_bytes": 4096,
+    "http_request_timeout": 900.0,
+    "grpc_keepalive_seconds": None,
+    "max_session_duration": 600.0,
+    "resampler_identifier": RESAMPLER_ID,
+    # Provenance is a per-deployment FACT, not policy: a zero-config
+    # deployment must never advertise another deployment's image or pin
+    # through /v1/metadata. These two default to an honest marker; the
+    # deployment values file supplies the real identity.
+    "deployment_image": "unspecified",
+    "pin": "unspecified",
+    "precision_policy": "fp32-bringup-v1",
+}
+
 #: A bare hex token, either case, spanning the whole value -- the shape a
 #: NIM profile hash takes.  Deliberately does not match a "sha256:<hex>"
 #: image digest, which is colon-prefixed rather than a full-string match.
@@ -257,26 +307,43 @@ def dispositioned_fields(
 
 
 def _read_config_value(value: str) -> dict[str, Any]:
-    """Decode one inline JSON object or a path to one UTF-8 JSON object."""
+    """Decode one inline JSON object or a path to one UTF-8 JSON object.
+
+    A value is inline JSON, never a path, the moment its (whitespace-
+    trimmed) text starts with ``{`` -- malformed inline JSON then fails
+    with its own error naming this plugin's entry-point key, rather than
+    silently being reinterpreted as a (almost certainly nonexistent) path.
+    """
     candidate = value.strip()
     if candidate.startswith("{"):
-        encoded = candidate
+        try:
+            decoded = json.loads(candidate)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"{_PLUGIN_KEY} application-plugin inline config is not "
+                f"valid JSON: {error}"
+            ) from error
     else:
         path = Path(candidate).expanduser()
         try:
             encoded = path.read_text(encoding="utf-8")
         except OSError as error:
             raise ValueError(
-                f"application-plugin config path is not readable: {path}"
+                f"{_PLUGIN_KEY} application-plugin config path is not "
+                f"readable: {path}"
             ) from error
-    try:
-        decoded = json.loads(encoded)
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            "application-plugin config must be valid JSON"
-        ) from error
+        try:
+            decoded = json.loads(encoded)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"{_PLUGIN_KEY} application-plugin config file is not "
+                f"valid JSON: {error}"
+            ) from error
     if not isinstance(decoded, dict):
-        raise ValueError("application-plugin config must be one JSON object")
+        raise ValueError(
+            f"{_PLUGIN_KEY} application-plugin config must be one JSON "
+            "object"
+        )
     return decoded
 
 
@@ -284,32 +351,29 @@ def _read_config_value(value: str) -> dict[str, Any]:
 def load_plugin_config(
     value: str | None,
 ) -> tuple[FrontendConfig, DeploymentMetadata]:
-    """Load and strictly validate the selected plugin's opaque JSON value."""
-    if value is None or not value.strip():
-        raise ValueError("riva_frontend configuration is required")
-    decoded = _read_config_value(value)
+    """Load and strictly validate the selected plugin's opaque JSON value.
+
+    Absent configuration (``None``, or blank) is D5's zero-config launch:
+    every field resolves to the qualified ``_DEFAULT_PROFILE`` and this
+    never raises for that reason alone.  A field the caller does supply --
+    whether alongside other fields, or as the whole configuration -- is
+    still validated exactly as an explicit value always has been; a
+    default never substitutes for, or silently repairs, a rejected
+    explicit value.
+    """
+    decoded = (
+        _read_config_value(value) if value is not None and value.strip() else {}
+    )
     frontend_names = {field.name for field in fields(FrontendConfig)}
-    omission_defaults: dict[str, object] = {
-        "grpc_keepalive_seconds": None,
-        "resampler_identifier": RESAMPLER_ID,
-        "session_idle_timeout": 60.0,
-    }
     metadata_names = {
         "deployment_image",
         "pin",
         "precision_policy",
     }
     unknown = set(decoded) - frontend_names - metadata_names
-    missing = (frontend_names - set(omission_defaults) | metadata_names) - set(
-        decoded
-    )
     if unknown:
         raise ValueError(
             f"unknown configuration fields: {', '.join(sorted(unknown))}"
-        )
-    if missing:
-        raise ValueError(
-            f"missing configuration fields: {', '.join(sorted(missing))}"
         )
     explicit_null = sorted(
         name for name, field_value in decoded.items() if field_value is None
@@ -318,13 +382,13 @@ def load_plugin_config(
         raise ValueError(
             "configuration fields must not be null: " + ", ".join(explicit_null)
         )
-    resolved = {**omission_defaults, **decoded}
+    resolved = {**_DEFAULT_PROFILE, **decoded}
     frontend = FrontendConfig(
         **{name: resolved[name] for name in frontend_names}
     )
     validate_frontend_config(frontend)
     metadata_values = {
-        name: decoded[name]
+        name: resolved[name]
         for name in ("deployment_image", "pin", "precision_policy")
     }
     for name, metadata_value in metadata_values.items():

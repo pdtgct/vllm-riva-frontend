@@ -148,9 +148,7 @@ def test_plugin_config_loads_identically_inline_and_from_path(tmp_path) -> None:
 
 
 # @spec ING-VEH-009, ING-VEH-012
-def test_plugin_config_is_required_strict_and_finite() -> None:
-    with pytest.raises(ValueError, match="configuration is required"):
-        load_plugin_config(None)
+def test_plugin_config_rejects_unknown_and_invalid_explicit_fields() -> None:
     with pytest.raises(ValueError, match="unknown configuration fields"):
         load_plugin_config(
             json.dumps(
@@ -177,9 +175,14 @@ def test_plugin_config_is_required_strict_and_finite() -> None:
 
 
 # @spec ENV-MOD-003, ING-VEH-012
-def test_only_declared_defaults_may_be_omitted_and_null_is_never_omission() -> (
-    None
-):
+def test_every_field_may_be_omitted_but_null_is_never_omission() -> None:
+    """D5: any field may be omitted (defaults fill it); null never can be.
+
+    A default silently filling an *omitted* key is the zero-config
+    contract; a default silently repairing an *explicit* null would not
+    be -- ``load_plugin_config`` must keep rejecting the latter even for
+    fields that now carry a declared default.
+    """
     raw = {
         **vars(_valid_config()),
         "deployment_image": "image",
@@ -190,26 +193,114 @@ def test_only_declared_defaults_may_be_omitted_and_null_is_never_omission() -> (
         "grpc_keepalive_seconds",
         "resampler_identifier",
         "session_idle_timeout",
+        "max_session_duration",
+        "deployment_image",
     ):
         omitted = dict(raw)
         del omitted[optional]
-        frontend, _ = load_plugin_config(json.dumps(omitted))
+        frontend, metadata = load_plugin_config(json.dumps(omitted))
         if optional == "grpc_keepalive_seconds":
             assert frontend.grpc_keepalive_seconds is None
         elif optional == "resampler_identifier":
             assert frontend.resampler_identifier == "scipy-poly-v1"
-        else:
+        elif optional == "session_idle_timeout":
             assert frontend.session_idle_timeout == 60.0
+        elif optional == "max_session_duration":
+            assert frontend.max_session_duration == 600.0
+        else:
+            assert metadata.image == (
+                "unspecified"
+            )
 
-    no_duration = dict(raw)
-    del no_duration["max_session_duration"]
-    with pytest.raises(ValueError, match="max_session_duration"):
-        load_plugin_config(json.dumps(no_duration))
+    for name in ("grpc_keepalive_seconds", "deployment_image", "pin"):
+        explicit_null = dict(raw)
+        explicit_null[name] = None
+        with pytest.raises(ValueError, match="must not be null"):
+            load_plugin_config(json.dumps(explicit_null))
 
-    explicit_null = dict(raw)
-    explicit_null["grpc_keepalive_seconds"] = None
-    with pytest.raises(ValueError, match="must not be null"):
-        load_plugin_config(json.dumps(explicit_null))
+
+# @spec ENV-MOD-003, ING-VEH-009, ING-VEH-012
+def test_zero_config_resolves_the_full_qualified_default_profile() -> None:
+    """(a) No configuration at all still constructs the deployed profile."""
+    frontend, metadata = load_plugin_config(None)
+    assert frontend.grpc_bind == "0.0.0.0:50051"
+    assert frontend.grpc_keepalive_seconds is None
+    assert frontend.resampler_identifier == "scipy-poly-v1"
+    assert frontend.session_idle_timeout == 60.0
+    assert frontend.max_session_duration == 600.0
+    assert metadata == DeploymentMetadata(
+        image="unspecified",
+        pin=(
+            "unspecified"
+        ),
+        precision_policy="fp32-bringup-v1",
+    )
+    assert validate_frontend_config(frontend) is None
+
+    # A blank (whitespace-only) value is treated the same as no value.
+    blank_frontend, blank_metadata = load_plugin_config("   ")
+    assert blank_frontend == frontend
+    assert blank_metadata == metadata
+
+
+# @spec ENV-MOD-003, ING-VEH-009, ING-VEH-012
+def test_inline_json_overrides_exactly_the_given_keys() -> None:
+    """(b) A partial inline override changes only the given keys."""
+    frontend, metadata = load_plugin_config(
+        json.dumps(
+            {"grpc_bind": "127.0.0.1:60051", "load_shed_max_sessions": 8}
+        )
+    )
+    assert frontend.grpc_bind == "127.0.0.1:60051"
+    assert frontend.load_shed_max_sessions == 8
+    # Everything else still resolves to the default profile.
+    assert frontend.session_idle_timeout == 60.0
+    assert frontend.plugin_shutdown_grace == 240.0
+    assert frontend.max_session_duration == 600.0
+    assert metadata.pin == (
+        "unspecified"
+    )
+
+
+# @spec ING-VEH-009, ING-VEH-012
+def test_malformed_inline_json_names_the_plugin_key_and_does_not_fall_back(
+    tmp_path,
+) -> None:
+    """(c) A malformed inline value fails as inline JSON, not as a path."""
+    # The candidate is not readable as a path either, so a fall-back
+    # would raise a *different* ("... path is not readable") error; the
+    # inline-specific error proves no fall-back happened.
+    with pytest.raises(
+        ValueError,
+        match=r"riva_frontend application-plugin inline config is not "
+        r"valid JSON",
+    ):
+        load_plugin_config("{not valid json")
+
+    # The same distinction holds for a genuinely malformed config file.
+    bad_path = tmp_path / "riva-frontend.json"
+    bad_path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match=r"riva_frontend application-plugin config file is not "
+        r"valid JSON",
+    ):
+        load_plugin_config(str(bad_path))
+
+
+# @spec ING-VEH-009, ING-VEH-012
+def test_path_shaped_value_still_loads_from_file(tmp_path) -> None:
+    """(d) A path-shaped value (not starting with '{') still reads a file."""
+    frontend, metadata = load_plugin_config(
+        json.dumps({"load_shed_max_sessions": 5})
+    )
+    path = tmp_path / "riva-frontend.json"
+    path.write_text(
+        json.dumps({"load_shed_max_sessions": 5}), encoding="utf-8"
+    )
+    from_path_frontend, from_path_metadata = load_plugin_config(str(path))
+    assert from_path_frontend == frontend
+    assert from_path_metadata == metadata
 
 
 # @spec ENV-MOD-003, ING-VEH-017

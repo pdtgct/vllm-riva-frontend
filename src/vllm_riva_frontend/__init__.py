@@ -9,7 +9,12 @@ __all__ = ["PluginContext", "PluginLifetime", "plugin"]
 class _Plugin:
     """Typed callable entry point with explicit configuration cardinality."""
 
-    config_optional = False
+    #: D5: the host reads this static attribute to decide whether a
+    #: missing ``--application-plugin-config riva_frontend=...`` is an
+    #: install-time error.  Absent configuration resolves the qualified
+    #: zero-config default profile (see ``config.load_plugin_config``),
+    #: so it is never required.
+    config_optional = True
 
     def __call__(self, context: PluginContext) -> PluginLifetime:
         """Return the explicitly selected plugin's host-bound lifetime."""

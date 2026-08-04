@@ -283,7 +283,7 @@ def test_distribution_import_and_entry_point_identity_are_exact() -> None:
     assert '"vllm' not in runtime_dependencies
     assert '"fastapi' not in runtime_dependencies.lower()
     assert not inspect.iscoroutinefunction(plugin)
-    assert plugin.config_optional is False
+    assert plugin.config_optional is True
     assert set(PluginContext.__annotations__) == {
         "plugin_name",
         "config",
