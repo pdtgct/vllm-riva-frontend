@@ -281,7 +281,8 @@ def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
         ]
 
     responses = asyncio.run(exercise())
-    assert factory.opened == [("1120ms", "en-US")]
+    # @spec ING-GRPC-002: streaming opens on the shared 560ms streaming arm.
+    assert factory.opened == [("560ms", "en-US")]
     assert [item.results[0].is_final for item in responses] == [False, True]
     assert [
         item.results[0].alternatives[0].transcript for item in responses
@@ -816,7 +817,8 @@ def test_deferred_riff_feeds_only_after_resolution() -> None:
         ]
 
     responses = asyncio.run(exercise())
-    assert factory.opened == [("1120ms", "auto")]
+    # @spec ING-GRPC-002: streaming opens on the shared 560ms streaming arm.
+    assert factory.opened == [("560ms", "auto")]
     assert calls == 2
     assert factory.lease.calls == ["feed", "flush", "finish", "release"]
     assert responses[0].results[0].is_final
