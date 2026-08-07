@@ -523,8 +523,12 @@ class RivaServicer(
                 cleanup_timeout=self._config.session_cleanup_timeout,
             )
             await self._await_until(
+                # ING-GRPC-002: streaming surfaces share the 560ms cadence
+                # (the NIM Realtime WebSocket convention), so a clip decodes
+                # on the same lookahead arm over gRPC and /v1/realtime.
+                # Unary Recognize keeps its deliberate 1120ms (ING-GRPC-003).
                 lambda: owner.open(
-                    cadence="1120ms", locale=recognition.language_code or "auto"
+                    cadence="560ms", locale=recognition.language_code or "auto"
                 ),
                 deadline=preconfiguration_deadline,
                 context=context,
