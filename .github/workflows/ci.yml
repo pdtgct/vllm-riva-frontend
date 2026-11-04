@@ -3,10 +3,9 @@
 # The floor job is the load-bearing one: the plugin is imported into the
 # host's interpreter, so a package that only works on the newest supported
 # Python is undeployable where it is actually meant to run. Static checks
-# cannot stand in for it — the breakages that reached this repository were
-# `asyncio.TimeoutError` not being the builtin `TimeoutError` below 3.11,
-# and `BaseException.add_note` not existing there. Both are import-clean,
-# syntax-clean, and only observable when the suite runs on the floor.
+# cannot stand in for it. The floor is Python 3.11, matching vLLM core.
+# A package that only imports on a newer interpreter is undeployable on
+# the host that will actually load it.
 #
 # Dependencies are resolved per interpreter rather than shared, because a
 # floor run against ceiling-resolved dependencies is not floor evidence.
@@ -23,10 +22,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 is the declared floor; 3.12 is the current host lane for the
-        # supported v0.24 line. 3.11 and 3.13 are inside the declared range
-        # but unexecuted here — declared-but-unverified, per ING-VEH-019.
-        python-version: ["3.10", "3.12"]
+        # 3.11 is vLLM core's floor. 3.12 is the other executed lane.
+        # 3.13 and 3.14 are inside requires-python but not this matrix.
+        python-version: ["3.11", "3.12"]
     name: python ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
@@ -40,14 +38,9 @@ jobs:
       - name: Lint
         run: uv run --python ${{ matrix.python-version }} ruff check .
 
-      # Floor lane only, and not an arbitrary choice: mypy's language level
-      # is pinned to the floor in pyproject, so asking it to judge 3.10
-      # semantics against dependency stubs resolved for a later interpreter
-      # is incoherent — numpy's own stubs use `type` statements that mypy
-      # rejects under `python_version = "3.10"`. The verdict we want is the
-      # floor's, and it needs floor-resolved stubs to be meaningful.
+      # Floor lane only: mypy's language level is pinned to the floor.
       - name: Types
-        if: matrix.python-version == '3.10'
+        if: matrix.python-version == '3.11'
         run: uv run --python ${{ matrix.python-version }} mypy
 
       - name: Tests

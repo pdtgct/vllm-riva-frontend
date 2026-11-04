@@ -176,9 +176,10 @@ class RivaServicer(
         owner_factory: OwnerFactory = DirectLeaseOwner,
         load_shed: LoadShedGate | None = None,
         riff_resolver: RiffResolver = sniff_riff,
-        admission: HostAdmission,
+        admission: HostAdmission | None,
         owner_register: OwnerRegister | None = None,
         clock: Callable[[], float] = time.monotonic,
+        is_draining: Callable[[], bool] | None = None,
     ) -> None:
         """Bind immutable settings and the host's one engine-local factory."""
         self._factory = factory
@@ -192,6 +193,7 @@ class RivaServicer(
         self._admission = admission
         self._owner_register = owner_register
         self._clock = clock
+        self._is_draining = is_draining or (lambda: False)
 
     async def _abort(self, context: object, code: str, fields: str) -> NoReturn:
         """Project a code-first gRPC status and then stop the RPC."""
@@ -222,6 +224,10 @@ class RivaServicer(
 
     async def _admission_or_abort(self, context: object) -> AdmissionLease:
         """Acquire host ownership before consuming compatibility work."""
+        if self._is_draining():
+            await self._abort(
+                context, "service_unavailable", "endpoint draining"
+            )
         lease = try_acquire_admission(self._admission)
         if lease is None:
             await self._abort(
@@ -283,7 +289,7 @@ class RivaServicer(
             await self._abort(context, timeout_code, timeout_fields)
         try:
             return await asyncio.wait_for(operation(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._abort(context, timeout_code, timeout_fields)
         raise AssertionError("context.abort must terminate the RPC")
 
@@ -523,12 +529,13 @@ class RivaServicer(
                 cleanup_timeout=self._config.session_cleanup_timeout,
             )
             await self._await_until(
-                # ING-GRPC-002: streaming surfaces share the 560ms cadence
-                # (the NIM Realtime WebSocket convention), so a clip decodes
-                # on the same lookahead arm over gRPC and /v1/realtime.
-                # Unary Recognize keeps its deliberate 1120ms (ING-GRPC-003).
+                # ING-GRPC-002: streaming surfaces share configured
+                # streaming_cadence (the qualified profile uses the NIM
+                # Realtime arm). Unary Recognize keeps 1120ms
+                # (ING-GRPC-003) and is separately gated.
                 lambda: owner.open(
-                    cadence="560ms", locale=recognition.language_code or "auto"
+                    cadence=self._config.streaming_cadence,
+                    locale=recognition.language_code or "auto",
                 ),
                 deadline=preconfiguration_deadline,
                 context=context,
@@ -693,7 +700,15 @@ class RivaServicer(
     async def Recognize(
         self, request: rasr.RecognizeRequest, context: object
     ) -> rasr.RecognizeResponse:
-        """Run bounded unary recognition through the same 1120-ms lease path."""
+        """Run bounded unary recognition through the same 1120-ms lease path.
+
+        Offline Recognize is gated off unless ``serve_offline`` is set, so
+        this RPC does not stand in for core's ``/v1/audio/transcriptions``.
+        """
+        if not self._config.serve_offline:
+            await self._abort(
+                context, "unsupported_capability", "offline Recognize"
+            )
         admission_lease = await self._admission_or_abort(context)
         registration: LoadShedRegistration | None = None
         owner_token: OwnerToken | None = None
@@ -846,7 +861,9 @@ class RivaServicer(
         entry = response.model_config.add()
         entry.model_name = self._model_name
         entry.parameters["streaming"] = "true"
-        entry.parameters["offline"] = "true"
+        entry.parameters["offline"] = (
+            "true" if self._config.serve_offline else "false"
+        )
         entry.parameters["supported_sample_rates"] = "8000,16000"
         entry.parameters["supported_encodings"] = "LINEAR_PCM,MULAW,ALAW"
         entry.parameters["language_code"] = ",".join(sorted(self._locales))
@@ -884,8 +901,9 @@ def build_servicer(
     frontend_factory: FrontendFactory = _default_frontend,
     owner_factory: OwnerFactory = DirectLeaseOwner,
     load_shed: LoadShedGate | None = None,
-    admission: HostAdmission,
+    admission: HostAdmission | None = None,
     owner_register: OwnerRegister | None = None,
+    is_draining: Callable[[], bool] | None = None,
 ) -> RivaServicer:
     """Build an unbound Riva servicer for the lifecycle owner to start."""
     return RivaServicer(
@@ -898,4 +916,5 @@ def build_servicer(
         load_shed=load_shed,
         admission=admission,
         owner_register=owner_register,
+        is_draining=is_draining,
     )

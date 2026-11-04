@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, Protocol, TypeAlias, cast
 from urllib.parse import unquote_to_bytes
 
 from vllm_riva_frontend.admission import (
@@ -34,6 +34,13 @@ from vllm_riva_frontend.frontend import (
     validate_format,
 )
 from vllm_riva_frontend.lease import DirectLeaseOwner, SessionFactory
+
+
+class _CadenceConfig(Protocol):
+    """Config surface that publishes the streaming lookahead label."""
+
+    streaming_cadence: str
+
 
 AsgiApp: TypeAlias = Callable[[object, object, object], Awaitable[None]]
 AsgiReceive: TypeAlias = Callable[[], Awaitable[dict[str, object]]]
@@ -431,7 +438,7 @@ class _Connection:
                         return await asyncio.wait_for(
                             asyncio.shield(task), remaining
                         )
-                    except asyncio.TimeoutError as error:
+                    except TimeoutError as error:
                         raise _LifecycleTimeout(code) from error
                 accepted_wait = asyncio.create_task(accepted_event.wait())
                 done, _ = await asyncio.wait(
@@ -591,7 +598,7 @@ class _Connection:
             with contextlib.suppress(BaseException):
                 await self._abort()
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._fail(
                 send,
                 timeout_code,
@@ -809,10 +816,15 @@ class _Connection:
             if remaining <= 0:
                 raise TimeoutError
             await asyncio.wait_for(
-                self._owner.open(cadence="560ms", locale=locale),
+                self._owner.open(
+                    cadence=cast(
+                        _CadenceConfig, self._config
+                    ).streaming_cadence,
+                    locale=locale,
+                ),
                 remaining,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._fail(
                 send,
                 "configuration_timeout",
@@ -977,7 +989,7 @@ class _Connection:
                 close=1008,
             )
             return
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._fail(
                 send,
                 "finalization_timeout",
@@ -1057,7 +1069,7 @@ class _Connection:
                 self._owner.complete(),
                 finalization_deadline - time.monotonic(),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             await self._fail(
                 send,
                 "finalization_timeout",

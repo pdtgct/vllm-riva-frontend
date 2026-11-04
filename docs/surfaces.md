@@ -1,9 +1,13 @@
 # Compatibility surfaces
 
-This plugin mounts three compatibility surfaces alongside vLLM-Omni's
-native `/v1/realtime` API. All three share the same engine, the same
-session factory, and the same admission/load-shed accounting; none of them
-starts a second inference engine.
+This plugin mounts compatibility surfaces on one vLLM core server. They
+share the engine and the session factory supplied by the model plugin
+(`vllm_riva.session_factories`). Streaming gRPC and the NIM Realtime
+WebSocket open sessions with the configured `streaming_cadence` (default
+`560ms` in the qualified profile). Unary gRPC `Recognize` and
+`POST /v1/audio/transcriptions` run only when `serve_offline` is true, so
+the default does not shadow core's transcription route. None of these
+surfaces starts a second inference engine.
 
 ## Identity rule
 
@@ -27,7 +31,9 @@ omit it and select by locale instead — but if present it must match exactly.
   [`nvidia-riva/python-clients`](https://github.com/nvidia-riva/python-clients)
   and any other client generated from those protos.
 - **Methods**: `StreamingRecognize`, `Recognize`, and
-  `GetRivaSpeechRecognitionConfig`. `GetRivaSpeechRecognitionConfig`
+  `GetRivaSpeechRecognitionConfig`. `Recognize` is served only when
+  `serve_offline` is true; otherwise it returns `UNIMPLEMENTED` so core
+  keeps `/v1/audio/transcriptions`. `GetRivaSpeechRecognitionConfig`
   reports the served model, streaming/offline support, the two supported
   sample rates (`8000`, `16000`), the three supported encodings
   (`LINEAR_PCM`, `MULAW`, `ALAW`), and the model's supported locales.
@@ -52,9 +58,9 @@ omit it and select by locale instead — but if present it must match exactly.
 ## Riva Realtime WebSocket
 
 - **Endpoint**: `/v1/realtime?intent=transcription` on the host's own HTTP
-  port (the same port passed to `vllm-omni serve --port`), claimed
+  port (the same port passed to `vllm serve --port`), claimed
   exactly by that path and query string; every other WebSocket scope,
-  including plain `/v1/realtime`, passes through unchanged to vLLM-Omni's
+  including plain `/v1/realtime`, passes through unchanged to core's
   native realtime route. Session bootstrap (returning an echoable session
   object with defaults) is available at
   `POST /v1/realtime/transcription_sessions` on the same port.

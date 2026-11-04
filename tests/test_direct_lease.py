@@ -158,9 +158,7 @@ class MalformedTerminalLease(RecordingLease):
 
 
 # @spec ING-LIFE-010
-def test_complete_normalizes_the_structured_terminal_of_the_v025_host() -> (
-    None
-):
+def test_complete_normalizes_the_structured_terminal_of_the_v025_host() -> None:
     lease = StructuredTerminalLease()
     owner = DirectLeaseOwner(RecordingFactory(lease), cleanup_timeout=1.0)
 

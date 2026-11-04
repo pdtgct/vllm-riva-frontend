@@ -43,6 +43,8 @@ http_text_field_max_bytes: 4096
 http_request_timeout: 900.0
 max_session_duration: 600.0
 resampler_identifier: scipy-poly-v1
+streaming_cadence: 560ms
+serve_offline: false
 
 pin: vllm-omni=eccf94f334241ea2b9c35732bf1a2de4e26ca032;vllm=ee0da84ab9e04ac7610e28580af62c365e898389
 precision_policy: fp32-bringup-v1

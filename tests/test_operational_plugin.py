@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_riva_frontend import PluginContext, plugin
+from vllm_riva_frontend import PluginContext, RivaFrontendPlugin, plugin
 from vllm_riva_frontend import lifecycle as lifecycle_module
 from vllm_riva_frontend.config import (
     FORBIDDEN_PROVENANCE_KEY,
@@ -237,7 +237,7 @@ def _lifetime(
     context: FakeContext,
     events: list[object],
     *,
-    version: str = "0.24.0",
+    version: str = "0.33.0",
     session_factory_builder=None,
 ) -> PluginLifetime:
     frontend = _frontend_config()
@@ -256,7 +256,7 @@ def _lifetime(
             return context.session_factory
 
         session_factory_builder = default_factory_builder
-    lifecycle_module._create_nemotron_session_factory = (  # type: ignore[attr-defined]
+    lifecycle_module.load_session_factory = (  # type: ignore[attr-defined]
         session_factory_builder
     )
     return PluginLifetime(
@@ -273,7 +273,9 @@ def test_distribution_import_and_entry_point_identity_are_exact() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
     assert 'name = "vllm-riva-frontend"' in text
-    assert 'riva_frontend = "vllm_riva_frontend:plugin"' in text
+    assert '[project.entry-points."vllm.endpoint_plugins"]' in text
+    assert 'riva_frontend = "vllm_riva_frontend:RivaFrontendPlugin"' in text
+    assert "vllm_omni.application_plugins" not in text
     assert "nvidia-riva-client==2.26.0" in text
     assert "grpcio-health-checking>=1.60" in text
     assert "grpcio-reflection>=1.60" in text
@@ -282,15 +284,17 @@ def test_distribution_import_and_entry_point_identity_are_exact() -> None:
     )[0]
     assert '"vllm' not in runtime_dependencies
     assert '"fastapi' not in runtime_dependencies.lower()
-    assert not inspect.iscoroutinefunction(plugin)
-    assert plugin.config_optional is True
+    assert plugin is RivaFrontendPlugin
+    assert inspect.isclass(plugin)
+    assert plugin.name == "riva_frontend"
+    assert plugin.owns_non_http_listener is True
+    assert plugin.required_tasks is None
     assert set(PluginContext.__annotations__) == {
         "plugin_name",
         "config",
         "app",
         "engine_client",
         "admission",
-        "install_asgi_wrapper",
     }
     assert {
         name
@@ -305,7 +309,7 @@ def test_distribution_import_and_entry_point_identity_are_exact() -> None:
 # @spec ING-VEH-003, ING-VEH-009, ING-VEH-016
 def test_sync_entry_returns_context_bound_async_lifetime() -> None:
     context = FakeContext()
-    lifetime = plugin(context)
+    lifetime = PluginLifetime(context)
     assert isinstance(lifetime, PluginLifetime)
     assert lifetime.context is context
 
@@ -484,13 +488,13 @@ def test_preflight_rejects_version_and_route_collision_before_bind() -> None:
     async def exercise() -> None:
         context = FakeContext()
         events: list[object] = []
-        with pytest.raises(ValueError, match="0.26.0"):
-            async with _lifetime(context, events, version="0.26.0"):
+        with pytest.raises(ValueError, match="0.32.0"):
+            async with _lifetime(context, events, version="0.32.0"):
                 pass
         assert events == []
 
-        # Both qualified lines reach bind rather than being refused here.
-        for qualified in ("0.24.0", "0.25.0"):
+        # The qualified core tip reaches bind rather than being refused.
+        for qualified in ("0.33.0", "0.33.0rc3"):
             context = FakeContext()
             async with _lifetime(context, events, version=qualified):
                 pass
@@ -498,7 +502,10 @@ def test_preflight_rejects_version_and_route_collision_before_bind() -> None:
 
         context = FakeContext()
         context.app.routes.append(
-            SimpleNamespace(path="/v1/audio/transcriptions", methods={"POST"})
+            SimpleNamespace(
+                path="/v1/realtime/transcription_sessions",
+                methods={"POST"},
+            )
         )
         with pytest.raises(ValueError, match="route collision"):
             async with _lifetime(context, events):
@@ -512,18 +519,18 @@ def test_preflight_rejects_version_and_route_collision_before_bind() -> None:
 def test_context_version_and_locale_preflight_fail_closed() -> None:
     with pytest.raises(ValueError, match="invalid installed"):
         lifecycle_module._validate_supported_version("not a version")
-    lifecycle_module._validate_supported_version("0.25.0.dev0")
-    lifecycle_module._validate_supported_version("0.25.0+local")
+    lifecycle_module._validate_supported_version("0.33.0rc3")
+    lifecycle_module._validate_supported_version("0.33.0")
+    lifecycle_module._validate_supported_version("0.34.0.dev1")
+    lifecycle_module._validate_supported_version("0.33.0+local")
 
-    # Every qualified line passes as a clean release; an unqualified one does
-    # not, so widening the set stays a deliberate act rather than a drift.
-    for major, minor in lifecycle_module._SUPPORTED_HOST_MAJOR_MINOR:
-        lifecycle_module._validate_supported_version(f"{major}.{minor}.0")
-    with pytest.raises(ValueError, match="0.26.0"):
-        lifecycle_module._validate_supported_version("0.26.0")
-    with pytest.raises(ValueError, match="0.23.0"):
-        lifecycle_module._validate_supported_version("0.23.0")
-    assert lifecycle_module._supported_host_lines() == "0.24.x, 0.25.x"
+    with pytest.raises(ValueError, match="0.32.0"):
+        lifecycle_module._validate_supported_version("0.32.0")
+    with pytest.raises(ValueError, match="0.34.0"):
+        lifecycle_module._validate_supported_version("0.34.0")
+    with pytest.raises(ValueError, match="0.25.0.dev0"):
+        lifecycle_module._validate_supported_version("0.25.0.dev0")
+    assert lifecycle_module._supported_host_lines() == "0.33.x"
 
     context = FakeContext()
     context.plugin_name = "other"
@@ -531,9 +538,8 @@ def test_context_version_and_locale_preflight_fail_closed() -> None:
         lifecycle_module._validate_context(context)
 
     context = FakeContext()
-    context.install_asgi_wrapper = None  # type: ignore[assignment]
-    with pytest.raises(TypeError, match="install_asgi_wrapper"):
-        lifecycle_module._validate_context(context)
+    context.admission = None  # type: ignore[assignment]
+    lifecycle_module._validate_context(context)
 
     for prompts in ({}, {"en-US": "prompt"}, {"auto": "prompt", "": "bad"}):
         context = FakeContext()
@@ -838,7 +844,9 @@ def test_installed_inner_wrapper_owns_only_approved_http_routes() -> None:
                 receive,
                 send,
             )
-            assert sent[0]["status"] == 400
+            # Offline HTTP is gated off, so the request reaches the host
+            # instead of shadowing core's transcription route.
+            assert sent[0]["status"] == 418
 
             sent.clear()
             await middleware(
@@ -871,129 +879,14 @@ def test_default_auto_locale_must_be_published_by_the_checkpoint() -> None:
     asyncio.run(exercise())
 
 
-# ---------------------------------------------------------------------------
-# Observation inheritance through the model factory (host PORT-OBS-003 /
-# this plugin's ENV-MOD-004 posture): reuse the HOST's installed
-# observer; never construct or register anything; degrade to the pinned
-# public constructor when the seam or the observer is absent.
-#
-# Captured at import time: the _lifetime harness above replaces the
-# module attribute in place (deliberately, without restore), so tests
-# running after any harness-using test would otherwise reach a
-# leftover fake instead of the real seam.
-# ---------------------------------------------------------------------------
-
-_REAL_CREATE_FACTORY = lifecycle_module._create_nemotron_session_factory
-
-
-def _host_modules(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    observer: object,
-    with_install_module: bool = True,
-) -> tuple[list[object], object]:
-    """Stub the two host modules the factory seam consults."""
-    import sys
-    import types
-
-    internal_calls: list[object] = []
-
-    async def _open(*, cadence: str, locale: str) -> object:
-        return object()
-
-    class _InternalFactory:
-        def __init__(self, *, engine: object, observer: object = None) -> None:
-            internal_calls.append((engine, observer))
-            self.open = _open
-
-    def _public(engine_client: object) -> object:
-        return SimpleNamespace(open=_open, public=True)
-
-    session_mod = types.ModuleType("vllm_omni.entrypoints.nemotron_session")
-    session_mod.NemotronSessionFactory = _InternalFactory  # type: ignore[attr-defined]
-    session_mod.create_nemotron_session_factory = _public  # type: ignore[attr-defined]
-    monkeypatch.setitem(
-        sys.modules, "vllm_omni.entrypoints.nemotron_session", session_mod
-    )
-
-    if with_install_module:
-        install_mod = types.ModuleType("vllm_omni.metrics.streaming_install")
-
-        def _resolve(app_state: object) -> object:
-            return getattr(app_state, "installed_observer", None)
-
-        install_mod.resolve_installed_observer = _resolve  # type: ignore[attr-defined]
-        monkeypatch.setitem(
-            sys.modules, "vllm_omni.metrics.streaming_install", install_mod
-        )
-    else:
-        monkeypatch.delitem(
-            sys.modules, "vllm_omni.metrics.streaming_install", raising=False
-        )
-
-    app_state = SimpleNamespace(installed_observer=observer)
-    return internal_calls, app_state
-
-
-def test_factory_inherits_the_hosts_installed_observer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The factory inherits the observer installed in host app state.
-
-    It builds the observed internal factory with THAT observer — the
-    sanctioned model-aware-participant wiring; nothing is constructed
-    or registered plugin-side.
-    """
-    sentinel = object()
-    internal_calls, app_state = _host_modules(monkeypatch, observer=sentinel)
-    engine = object()
-
-    factory = _REAL_CREATE_FACTORY(engine, app_state=app_state)
-
-    assert internal_calls == [(engine, sentinel)]
-    assert callable(factory.open)
-
-
-def test_factory_uses_the_public_constructor_when_no_observer_installed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    internal_calls, app_state = _host_modules(monkeypatch, observer=None)
-    factory = _REAL_CREATE_FACTORY(object(), app_state=app_state)
-    assert internal_calls == []
-    assert getattr(factory, "public", False) is True
-
-
-def test_factory_degrades_cleanly_on_a_host_without_the_observation_seam(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An older host uses the pinned public constructor path.
-
-    With no streaming_install module, sessions remain unobserved without
-    failing.
-    """
-    internal_calls, app_state = _host_modules(
-        monkeypatch, observer=object(), with_install_module=False
-    )
-    factory = _REAL_CREATE_FACTORY(object(), app_state=app_state)
-    assert internal_calls == []
-    assert getattr(factory, "public", False) is True
-
-
-def test_factory_without_app_state_stays_on_the_public_path() -> None:
-    """The keyword-only default preserves pre-observability behavior.
-
-    Existing callers and older harnesses keep their public construction path.
-    """
-    import sys
-
-    assert "vllm_omni.entrypoints.nemotron_session" not in sys.modules or True  # noqa: SIM222
-
-
 # @spec ING-VEH-010, ING-VEH-012
 def test_host_version_fallback_requires_a_string_module_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    seen: list[str] = []
+
     def missing_distribution(name: str) -> str:
+        seen.append(name)
         raise lifecycle_module.importlib_metadata.PackageNotFoundError(name)
 
     monkeypatch.setattr(
@@ -1004,9 +897,10 @@ def test_host_version_fallback_requires_a_string_module_version(
     monkeypatch.setattr(
         lifecycle_module.importlib,
         "import_module",
-        lambda name: SimpleNamespace(__version__="0.24.0"),
+        lambda name: SimpleNamespace(__version__="0.33.0"),
     )
-    assert lifecycle_module._resolve_host_version() == "0.24.0"
+    assert lifecycle_module._resolve_host_version() == "0.33.0"
+    assert seen == ["vllm"]
 
     monkeypatch.setattr(
         lifecycle_module.importlib,
@@ -1015,26 +909,3 @@ def test_host_version_fallback_requires_a_string_module_version(
     )
     with pytest.raises(RuntimeError, match="cannot resolve"):
         lifecycle_module._resolve_host_version()
-
-
-# @spec ING-VEH-010, ING-VEH-012, ING-VEH-014
-def test_model_factory_seam_rejects_missing_or_malformed_factories(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import sys
-
-    _, app_state = _host_modules(monkeypatch, observer=object())
-    module = sys.modules["vllm_omni.entrypoints.nemotron_session"]
-
-    module.NemotronSessionFactory = lambda **kwargs: object()  # type: ignore[attr-defined]
-    with pytest.raises(TypeError, match="must expose async open"):
-        _REAL_CREATE_FACTORY(object(), app_state=app_state)
-
-    app_state = SimpleNamespace(installed_observer=None)
-    module.create_nemotron_session_factory = None  # type: ignore[attr-defined]
-    with pytest.raises(TypeError, match="does not expose"):
-        _REAL_CREATE_FACTORY(object(), app_state=app_state)
-
-    module.create_nemotron_session_factory = lambda engine: object()  # type: ignore[attr-defined]
-    with pytest.raises(TypeError, match="must expose async open"):
-        _REAL_CREATE_FACTORY(object(), app_state=app_state)

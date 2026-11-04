@@ -1,4 +1,4 @@
-"""Application-plugin installation, readiness, and owner drainage."""
+"""Endpoint-plugin installation, readiness, and owner drainage."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 import grpc
 from grpc_health.v1 import health_pb2
@@ -25,6 +25,7 @@ from vllm_riva_frontend.config import (
     FrontendConfig,
     build_deployment_provenance,
     load_plugin_config,
+    resolve_config_value,
 )
 from vllm_riva_frontend.grpc import (
     RIVA_SERVICE_NAME,
@@ -38,26 +39,32 @@ from vllm_riva_frontend.nim_http import (
     NimHttpTranscriptionEndpoint,
 )
 from vllm_riva_frontend.nim_ws import (
+    DispatchDecision,
     bootstrap_session,
+    dispatch_decision,
     dispatch_nim_realtime,
 )
 from vllm_riva_frontend.operational import (
     OPERATIONAL_PATHS,
     operational_response,
 )
+from vllm_riva_frontend.session_factory import (
+    load_session_factory,
+    require_served_cadence,
+)
 
 _OWNED_HTTP_METHODS = {
-    "/v1/audio/transcriptions": frozenset({"POST"}),
     "/v1/realtime/transcription_sessions": frozenset({"POST"}),
     **{path: frozenset({"GET"}) for path in OPERATIONAL_PATHS},
 }
-#: Host lines this package is qualified against, newest last.  A set of
-#: exercised lines rather than a range: each entry names a line whose plugin
-#: boundary this suite covers, so an unreleased future line fails closed
-#: instead of being assumed compatible.  The package imports no host symbol —
-#: coupling is the entry-point contract and the protocols in this module — so
-#: adding a line is a statement about qualification, not about linking.
-_SUPPORTED_HOST_MAJOR_MINOR = ((0, 24), (0, 25))
+#: vLLM core tip that carries endpoint-plugin lifecycle (start / ready /
+#: drain / stop and ``owns_non_http_listener``). 0.33.0rc1 is the first
+#: release on that line; 0.34 dev checkouts are the unreleased tip
+#: (setuptools-scm guess-next-dev). Released 0.34+ is outside this range.
+_VLLM_MIN = Version("0.33.0rc1")
+_VLLM_RELEASE_MINOR = (0, 33)
+_VLLM_DEV_MINORS = frozenset({(0, 33), (0, 34)})
+_SUPPORTED_VLLM_RANGE = "0.33.x"
 
 
 class PluginApplication(Protocol):
@@ -75,14 +82,20 @@ class PluginAdmission(Protocol):
 
 
 class PluginContext(Protocol):
-    """Structural view of the generic vLLM-Omni plugin context."""
+    """Structural view of the host facts this plugin reads.
+
+    Core passes these through ``init_state`` rather than an
+    application-plugin context. ``admission`` is optional: core signals
+    shutdown with ``state.draining`` instead of a separate admission
+    object. HTTP installation is ``attach_router``, not
+    ``install_asgi_wrapper``.
+    """
 
     plugin_name: str
     app: PluginApplication
     engine_client: object
     config: str | None
-    admission: PluginAdmission
-    install_asgi_wrapper: Callable[[Callable[[Any], Any]], None]
+    admission: PluginAdmission | None
 
 
 class OwnerToken:
@@ -160,107 +173,51 @@ class CompatibilityOwnerRegistry:
 
 
 def _resolve_host_version() -> str:
-    """Resolve the installed vLLM-Omni version without depending on it."""
+    """Resolve the installed vLLM version without importing it at load."""
     try:
-        return importlib_metadata.version("vllm-omni")
+        return importlib_metadata.version("vllm")
     except importlib_metadata.PackageNotFoundError:
-        module = importlib.import_module("vllm_omni")
+        module = importlib.import_module("vllm")
         version = getattr(module, "__version__", None)
         if not isinstance(version, str):
             raise RuntimeError(
-                "cannot resolve installed vLLM-Omni version"
+                "cannot resolve installed vLLM version"
             ) from None
         return version
 
 
-def _validate_supported_version(version: str) -> None:
-    """Fail before bind unless the host is one of the qualified lines.
+def _version_supported(parsed: Version) -> bool:
+    """Return whether ``parsed`` is on the qualified core tip."""
+    minor = parsed.release[:2]
+    if parsed.is_devrelease or parsed.local is not None:
+        return minor in _VLLM_DEV_MINORS
+    return minor == _VLLM_RELEASE_MINOR and parsed >= _VLLM_MIN
 
-    A build carrying a PEP 440 dev, pre-release, or local segment — an
-    editable setuptools-scm '0.1.dev2155+g...' checkout, or a
-    '0.24.0.dev0+cu130' nightly — is an intentional unreleased host and is
-    allowed through; its base version is not a reliable line indicator.
-    Only a clean release version is held to the qualified major.minor set.
+
+def _validate_supported_version(version: str) -> None:
+    """Fail before bind unless the host is the qualified vLLM core tip.
+
+    Accepted: 0.33 prereleases from 0.33.0rc1 and 0.33 releases, plus
+    dev or local builds whose release minor is 0.33 or 0.34 (an
+    unreleased checkout of that tip). Released 0.32 and 0.34 are not.
     """
     try:
         parsed = Version(version)
     except InvalidVersion as error:
         raise ValueError(
-            f"invalid installed vLLM-Omni version: {version}"
+            f"invalid installed vLLM version: {version}"
         ) from error
-    if parsed.is_devrelease or parsed.is_prerelease or parsed.local is not None:
-        return
-    if parsed.release[:2] not in _SUPPORTED_HOST_MAJOR_MINOR:
+    if not _version_supported(parsed):
         raise ValueError(
-            f"vllm-riva-frontend supports vLLM-Omni "
-            f"{_supported_host_lines()}; found {version}"
+            "vllm-riva-frontend supports vLLM "
+            f"{_SUPPORTED_VLLM_RANGE} (core tip, from 0.33.0rc1, "
+            f"including 0.33/0.34 dev checkouts); found {version}"
         )
 
 
 def _supported_host_lines() -> str:
-    """Render the qualified lines the way an operator reads them."""
-    return ", ".join(
-        f"{major}.{minor}.x" for major, minor in _SUPPORTED_HOST_MAJOR_MINOR
-    )
-
-
-# @spec ING-VEH-012, ING-VEH-014, PORT-RTC-003
-def _create_nemotron_session_factory(
-    engine_client: object,
-    *,
-    app_state: object = None,
-) -> SessionFactory:
-    """Acquire the model-specific session factory from the selected host.
-
-    Observation inheritance (host PORT-OBS-003): when the host has a
-    streaming observer installed in its serving app state, this plugin
-    is the "model-aware downstream participant" the host's factory
-    docstring names — it wires observation by constructing the internal
-    ``NemotronSessionFactory(engine=..., observer=...)`` with the HOST'S
-    installed observer, resolved via the host's own
-    ``resolve_installed_observer`` seam. The plugin never constructs,
-    registers, or duplicates any metric family itself (ENV-MOD-004);
-    it only reuses the one observer the host installed. On a host
-    without the observation seam, or with no observer installed, the
-    pinned public constructor is used unchanged and sessions are simply
-    unobserved — exactly the pre-observability behavior.
-    """
-    module = importlib.import_module("vllm_omni.entrypoints.nemotron_session")
-
-    observer: object = None
-    if app_state is not None:
-        try:
-            install_module = importlib.import_module(
-                "vllm_omni.metrics.streaming_install"
-            )
-        except ModuleNotFoundError:
-            install_module = None
-        if install_module is not None:
-            resolve = getattr(
-                install_module, "resolve_installed_observer", None
-            )
-            if callable(resolve):
-                observer = resolve(app_state)
-
-    if observer is not None:
-        internal = getattr(module, "NemotronSessionFactory", None)
-        if callable(internal):
-            factory = internal(engine=engine_client, observer=observer)
-            if not callable(getattr(factory, "open", None)):
-                raise TypeError(
-                    "Nemotron session factory must expose async open"
-                )
-            return cast(SessionFactory, factory)
-
-    constructor = getattr(module, "create_nemotron_session_factory", None)
-    if not callable(constructor):
-        raise TypeError(
-            "vLLM-Omni does not expose create_nemotron_session_factory"
-        )
-    factory = constructor(engine_client)
-    if not callable(getattr(factory, "open", None)):
-        raise TypeError("Nemotron session factory must expose async open")
-    return cast(SessionFactory, factory)
+    """Render the qualified vLLM range the way an operator reads it."""
+    return _SUPPORTED_VLLM_RANGE
 
 
 # @spec ING-VEH-013
@@ -306,10 +263,11 @@ def _supported_locales(context: PluginContext) -> frozenset[str]:
 def _validate_context(context: PluginContext) -> None:
     """Validate the generic host seam and values before any listener bind."""
     if context.plugin_name != "riva_frontend":
-        raise ValueError("unexpected application-plugin entry-point name")
-    if not callable(getattr(context, "install_asgi_wrapper", None)):
-        raise TypeError("plugin context must expose install_asgi_wrapper")
-    if not callable(getattr(context.admission, "try_acquire", None)):
+        raise ValueError("unexpected endpoint-plugin entry-point name")
+    admission = context.admission
+    if admission is not None and not callable(
+        getattr(admission, "try_acquire", None)
+    ):
         raise TypeError("host admission must expose try_acquire")
 
 
@@ -322,7 +280,7 @@ def _validate_route_collisions(app: object) -> None:
         if path not in _OWNED_HTTP_METHODS or methods is None:
             continue
         if _OWNED_HTTP_METHODS[path].intersection(methods):
-            raise ValueError(f"application-plugin route collision: {path}")
+            raise ValueError(f"endpoint-plugin route collision: {path}")
 
 
 async def _send_json(
@@ -380,6 +338,21 @@ class RivaFrontendMiddleware:
             path = scope.get("path")
             method = scope.get("method")
             if path == "/v1/audio/transcriptions" and method == "POST":
+                if not self._lifetime.serve_offline:
+                    await self._app(scope, receive, send)  # type: ignore[operator]
+                    return
+                if self._lifetime.draining:
+                    await _send_json(
+                        send,
+                        status=503,
+                        body={
+                            "error": {
+                                "code": "service_unavailable",
+                                "message": "endpoint draining",
+                            }
+                        },
+                    )
+                    return
                 await self._lifetime.http_endpoint(
                     scope,
                     receive,
@@ -409,6 +382,11 @@ class RivaFrontendMiddleware:
                 status, body = response
                 await _send_json(send, status=status, body=body)
                 return
+        if scope.get("type") == "websocket" and self._lifetime.draining:
+            decision = dispatch_decision(scope)
+            if decision is not DispatchDecision.PASS:
+                await send({"type": "websocket.close", "code": 1001})
+                return
         await self._ws(scope, receive, send)
 
 
@@ -425,6 +403,7 @@ class PluginLifetime:
         version_resolver: Callable[[], str] = _resolve_host_version,
         server_factory: Callable[..., Any] = grpc.aio.server,
         service_registrar: Callable[..., Any] = register_aio_services,
+        session_loader: Callable[..., SessionFactory] | None = None,
     ) -> None:
         """Capture host context and injectable startup seams."""
         self.context = context
@@ -432,6 +411,11 @@ class PluginLifetime:
         self._version_resolver = version_resolver
         self._server_factory = server_factory
         self._service_registrar = service_registrar
+        self._session_loader = session_loader or load_session_factory
+        host_state = getattr(context, "host_state", None)
+        if host_state is None:
+            host_state = getattr(getattr(context, "app", None), "state", None)
+        self._host_state = host_state
         self._config: FrontendConfig | None = None
         self._metadata: DeploymentMetadata | None = None
         self._server: Any | None = None
@@ -441,6 +425,7 @@ class PluginLifetime:
         self._failure: asyncio.Future[BaseException] | None = None
         self._entered = False
         self._quiesced = False
+        self._stopped = False
         self.ready = False
         self.live = True
         self.release = "0.0.0"
@@ -462,6 +447,20 @@ class PluginLifetime:
             self._metadata,
             resampler_identifier=self._config.resampler_identifier,
         )
+
+    @property
+    def serve_offline(self) -> bool:
+        """Return whether this lifetime owns offline transcription paths."""
+        if self._config is None:
+            return False
+        return self._config.serve_offline
+
+    @property
+    def draining(self) -> bool:
+        """Return whether new inference work must be refused."""
+        if self._quiesced:
+            return True
+        return bool(getattr(self._host_state, "draining", False))
 
     @property
     def shutdown_grace(self) -> float:
@@ -495,6 +494,9 @@ class PluginLifetime:
         self.live = False
         if self._failure is not None and not self._failure.done():
             self._failure.set_result(error)
+        request_shutdown = getattr(self._host_state, "request_shutdown", None)
+        if callable(request_shutdown):
+            request_shutdown()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -551,9 +553,19 @@ class PluginLifetime:
             cleanup_timeout=self._config.session_cleanup_timeout,
         )
 
+    def _install_http(self) -> None:
+        """Install ASGI handling when the caller still offers that seam.
+
+        The core path installs middleware from ``attach_router``. Tests and
+        any host that still passes ``install_asgi_wrapper`` keep that call.
+        """
+        install = getattr(self.context, "install_asgi_wrapper", None)
+        if callable(install):
+            install(lambda app: RivaFrontendMiddleware(app, lifetime=self))
+
     # @spec ING-VEH-010, ING-VEH-012, ING-VEH-014, ING-GRPC-011
-    async def __aenter__(self) -> PluginLifetime:
-        """Validate, install ASGI handling, and bind gRPC not-serving."""
+    async def prepare(self) -> None:
+        """Validate configuration and the session factory before any bind."""
         self._failure = asyncio.get_running_loop().create_future()
         self._config, self._metadata = self._config_loader(self.context.config)
         try:
@@ -565,11 +577,13 @@ class PluginLifetime:
         _validate_route_collisions(self.context.app)
         self.model_name = _served_model(self.context)
         self.locales = _supported_locales(self.context)
-        self.session_factory = _create_nemotron_session_factory(
+        assert self._config is not None
+        self.session_factory = self._session_loader(
             self.context.engine_client,
-            app_state=getattr(
-                getattr(self.context, "app", None), "state", None
-            ),
+            name=self._config.session_factory,
+        )
+        require_served_cadence(
+            self.session_factory, self._config.streaming_cadence
         )
         self.load_shed = LoadShedGate(
             self._config.load_shed_max_sessions,
@@ -590,9 +604,11 @@ class PluginLifetime:
             admission=self.context.admission,
             owner_factory=self._make_owner,
         )
-        self.context.install_asgi_wrapper(
-            lambda app: RivaFrontendMiddleware(app, lifetime=self)
-        )
+        self._install_http()
+
+    async def start_listener(self) -> None:
+        """Bind the gRPC listener and publish not-serving until mark_serving."""
+        assert self._config is not None
         options: list[tuple[str, int]] = [
             (
                 "grpc.max_receive_message_length",
@@ -615,6 +631,7 @@ class PluginLifetime:
             load_shed=self.load_shed,
             admission=self.context.admission,
             owner_factory=self._make_owner,
+            is_draining=self.draining_now,
         )
         try:
             self._health = self._service_registrar(
@@ -627,15 +644,23 @@ class PluginLifetime:
                 )
             await self._server.start()
         except BaseException:
-            if self._server is not None:
-                with suppress(BaseException):
-                    await self._server.stop(0)
+            await self.stop()
             raise
         self._entered = True
         self._ready_event.set()
         self._server_watch = asyncio.create_task(
             self._watch_server_termination()
         )
+
+    def draining_now(self) -> bool:
+        """Return the draining predicate the gRPC servicer polls."""
+        return self.draining
+
+    # @spec ING-VEH-010, ING-VEH-012, ING-VEH-014, ING-GRPC-011
+    async def __aenter__(self) -> PluginLifetime:
+        """Validate, install ASGI handling, and bind gRPC not-serving."""
+        await self.prepare()
+        await self.start_listener()
         return self
 
     # @spec ING-VEH-018, ING-GRPC-011
@@ -662,36 +687,64 @@ class PluginLifetime:
         self.ready = True
 
     # @spec ING-VEH-017, ING-GRPC-011, ING-SHIM-001
-    async def quiesce_and_drain(self) -> None:
-        """Become non-ready, drain every owner, then stop gRPC."""
+    async def quiesce_and_drain(self, *, grace: float | None = None) -> None:
+        """Become non-ready, drain every owner, then stop gRPC.
+
+        ``grace`` is the host's remaining shutdown budget. Core passes
+        that as ``drain(state, timeout)``. When omitted, the configured
+        ``plugin_shutdown_grace`` is the budget. Cancellation is not
+        swallowed: a cancelled drain stops the listener and reraises.
+        """
         if self._quiesced:
             return
         self._quiesced = True
         self.ready = False
         assert self._config is not None
+        budget = self._config.plugin_shutdown_grace if grace is None else grace
         try:
             if self._health is not None:
                 await self._set_health(
                     health_pb2.HealthCheckResponse.NOT_SERVING
                 )
             await self.load_shed.close()
-            await self.owners.drain(
-                grace=self._config.plugin_shutdown_grace,
-                cleanup_timeout=self._config.session_cleanup_timeout,
-            )
+            if budget > 0:
+                await self.owners.drain(
+                    grace=budget,
+                    cleanup_timeout=self._config.session_cleanup_timeout,
+                )
             if self._cleanup_faults:
                 raise RuntimeError(
                     "terminal cleanup fault requires provider teardown"
                 ) from self._cleanup_faults[0]
+        except asyncio.CancelledError:
+            self.live = False
+            raise
         except BaseException:
             self.live = False
             raise
         finally:
-            if self._server is not None:
-                await self._server.stop(0)
-            if self._server_watch is not None:
-                with suppress(asyncio.CancelledError):
-                    await self._server_watch
+            await self.stop()
+
+    async def stop(self) -> None:
+        """Stop the gRPC listener without waiting for in-flight owners.
+
+        Idempotent. Drain waits for owners; this only closes the port
+        and the termination watch, and returns promptly.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        server = self._server
+        watch = self._server_watch
+        self._server = None
+        self._server_watch = None
+        if server is not None:
+            with suppress(BaseException):
+                await server.stop(0)
+        if watch is not None:
+            watch.cancel()
+            with suppress(BaseException):
+                await watch
 
     async def __aexit__(
         self, exc_type: object, exc: object, traceback: object
@@ -700,3 +753,150 @@ class PluginLifetime:
         del exc_type, exc, traceback
         if self._entered and not self._quiesced:
             await self.quiesce_and_drain()
+
+
+class _EndpointContext:
+    """Host facts gathered from ``init_state`` for one plugin lifetime."""
+
+    def __init__(
+        self,
+        *,
+        engine_client: object,
+        app: object,
+        config: str | None,
+        admission: object | None,
+        host_state: object,
+    ) -> None:
+        """Record the core server objects the lifetime reads."""
+        self.plugin_name = "riva_frontend"
+        self.engine_client = engine_client
+        self.app = app
+        self.config = config
+        self.admission = admission
+        self.host_state = host_state
+
+
+class _DelegatingMiddleware:
+    """Forward ASGI calls to the lifetime once ``prepare`` has finished."""
+
+    def __init__(self, app: object, *, plugin: RivaFrontendPlugin) -> None:
+        """Retain the wrapped app and the plugin that owns the lifetime."""
+        self._app = app
+        self._plugin = plugin
+        self._bound: RivaFrontendMiddleware | None = None
+        self._bound_lifetime: PluginLifetime | None = None
+
+    async def __call__(
+        self,
+        scope: dict[str, object],
+        receive: Callable[[], Any],
+        send: Callable[[dict[str, object]], Any],
+    ) -> None:
+        """Dispatch owned routes, or pass through before the lifetime exists."""
+        lifetime = self._plugin.lifetime
+        if lifetime is None or lifetime._config is None:
+            await self._app(scope, receive, send)  # type: ignore[operator]
+            return
+        if self._bound is None or self._bound_lifetime is not lifetime:
+            self._bound = RivaFrontendMiddleware(self._app, lifetime=lifetime)
+            self._bound_lifetime = lifetime
+        await self._bound(scope, receive, send)
+
+
+class RivaFrontendPlugin:
+    """``vllm.endpoint_plugins`` factory for the Riva/NIM frontend.
+
+    The entry point is this class. vLLM calls it with no arguments, then
+    ``attach_router``, ``init_state``, ``start``, ``ready``, ``drain``,
+    and ``stop``. ``owns_non_http_listener`` is set because the plugin
+    binds its own gRPC port (default ``0.0.0.0:50051``).
+    """
+
+    name = "riva_frontend"
+    required_tasks: tuple[str, ...] | None = None
+    owns_non_http_listener = True
+
+    def __init__(
+        self,
+        *,
+        version_resolver: Callable[[], str] | None = None,
+        server_factory: Callable[..., Any] | None = None,
+        service_registrar: Callable[..., Any] | None = None,
+        session_loader: Callable[..., SessionFactory] | None = None,
+    ) -> None:
+        """Create one plugin. Optional seams exist so tests need no GPU."""
+        self._app: object | None = None
+        self.lifetime: PluginLifetime | None = None
+        self._version_resolver = version_resolver
+        self._server_factory = server_factory
+        self._service_registrar = service_registrar
+        self._session_loader = session_loader
+
+    def attach_router(self, app: object) -> None:
+        """Install middleware that claims only this plugin's HTTP paths."""
+        add_middleware = getattr(app, "add_middleware", None)
+        if not callable(add_middleware):
+            raise TypeError("endpoint app must expose add_middleware")
+        self._app = app
+        add_middleware(_DelegatingMiddleware, plugin=self)
+
+    async def init_state(
+        self, engine_client: object, state: object, args: object
+    ) -> None:
+        """Resolve config and the session factory. Do not bind yet."""
+        if self._app is None:
+            raise RuntimeError("attach_router must run before init_state")
+        admission = getattr(state, "admission", None)
+        context = _EndpointContext(
+            engine_client=engine_client,
+            app=self._app,
+            config=resolve_config_value(args),
+            admission=admission,
+            host_state=state,
+        )
+        kwargs: dict[str, Any] = {}
+        if self._version_resolver is not None:
+            kwargs["version_resolver"] = self._version_resolver
+        if self._server_factory is not None:
+            kwargs["server_factory"] = self._server_factory
+        if self._service_registrar is not None:
+            kwargs["service_registrar"] = self._service_registrar
+        if self._session_loader is not None:
+            kwargs["session_loader"] = self._session_loader
+        lifetime = PluginLifetime(context, **kwargs)  # type: ignore[arg-type]
+        await lifetime.prepare()
+        self.lifetime = lifetime
+
+    async def start(self, state: object) -> None:
+        """Bind gRPC and publish serving. Clean up if startup fails."""
+        del state
+        if self.lifetime is None:
+            raise RuntimeError("endpoint plugin must init_state before start")
+        try:
+            await self.lifetime.start_listener()
+            await self.lifetime.mark_serving()
+        except BaseException:
+            await self.lifetime.stop()
+            raise
+
+    def ready(self, state: object) -> bool:
+        """Report readiness for ``/health``. False while draining."""
+        del state
+        lifetime = self.lifetime
+        if lifetime is None:
+            return False
+        return lifetime.ready and not lifetime.draining
+
+    async def drain(self, state: object, timeout: float) -> None:
+        """Refuse new work and drain owners within the host's budget."""
+        del state
+        if self.lifetime is None:
+            return
+        await self.lifetime.quiesce_and_drain(grace=timeout)
+
+    async def stop(self, state: object) -> None:
+        """Close the gRPC listener without waiting for owners."""
+        del state
+        if self.lifetime is None:
+            return
+        await self.lifetime.stop()

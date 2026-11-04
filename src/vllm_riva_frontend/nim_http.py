@@ -554,7 +554,7 @@ class NimHttpTranscriptionEndpoint:
             return await asyncio.wait_for(
                 self._handle(scope, receive), self._config.request_timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return _failure_response(
                 _detail("request_timeout", "HTTP request timed out", status=504)
             )
@@ -652,7 +652,7 @@ class NimHttpTranscriptionEndpoint:
                 transcript = await asyncio.wait_for(
                     owner.complete(), self._config.finalization_timeout
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await owner.cancel()
                 return _failure_response(
                     _detail(

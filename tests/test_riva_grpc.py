@@ -50,6 +50,7 @@ def _config() -> FrontendConfig:
         grpc_keepalive_seconds=None,
         max_session_duration=None,
         resampler_identifier="scipy-poly-v1",
+        serve_offline=True,
     )
 
 
@@ -281,7 +282,8 @@ def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
         ]
 
     responses = asyncio.run(exercise())
-    # @spec ING-GRPC-002: streaming opens on the shared 560ms streaming arm.
+    # Streaming opens on the configured cadence. The qualified profile
+    # default is 560ms; this helper uses that default.
     assert factory.opened == [("560ms", "en-US")]
     assert [item.results[0].is_final for item in responses] == [False, True]
     assert [
@@ -294,6 +296,40 @@ def test_streaming_uses_real_config_first_proto_and_one_direct_lease() -> None:
     assert events == ["admission:try", "admission:release"]
     assert len(admission.leases) == 1
     assert admission.leases[0].released
+
+
+def test_streaming_open_uses_configured_cadence_not_a_literal() -> None:
+    factory = FakeFactory()
+    recognition = rasr.StreamingRecognitionConfig(
+        config=_recognition(), interim_results=True
+    )
+    requests = [
+        rasr.StreamingRecognizeRequest(streaming_config=recognition),
+        rasr.StreamingRecognizeRequest(audio_content=b"\x00\x00"),
+    ]
+
+    async def exercise() -> None:
+        async for _ in _servicer(
+            factory, config=replace(_config(), streaming_cadence="160ms")
+        ).StreamingRecognize(_requests(requests), FakeContext()):
+            pass
+
+    asyncio.run(exercise())
+    assert factory.opened == [("160ms", "en-US")]
+
+
+def test_offline_recognize_stays_unimplemented_unless_enabled() -> None:
+    factory = FakeFactory()
+    request = rasr.RecognizeRequest(config=_recognition(), audio=b"\x00\x00")
+    with pytest.raises(RpcAbort) as error:
+        asyncio.run(
+            _servicer(
+                factory, config=replace(_config(), serve_offline=False)
+            ).Recognize(request, FakeContext())
+        )
+    assert error.value.code is grpc.StatusCode.UNIMPLEMENTED
+    assert "offline Recognize" in error.value.details
+    assert factory.opened == []
 
 
 # @spec ING-GRPC-002, ING-CORE-005

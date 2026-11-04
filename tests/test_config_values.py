@@ -44,6 +44,7 @@ def _valid_config() -> FrontendConfig:
         grpc_keepalive_seconds=20.0,
         max_session_duration=600.0,
         resampler_identifier="scipy-poly-v1",
+        session_factory="nemotron_asr",
     )
 
 
@@ -52,7 +53,7 @@ def test_all_timeout_and_resource_values_are_positive_finite() -> None:
     assert all(
         is_positive_finite(value)
         for value in vars(_valid_config()).values()
-        if isinstance(value, (int, float))
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
     )
     assert not is_positive_finite(0)
     assert not is_positive_finite(float("inf"))
@@ -97,6 +98,18 @@ def test_grpc_bind_lifetime_values_and_resampler_pin_validate() -> None:
     with pytest.raises(ValueError, match="max_session_duration"):
         validate_frontend_config(
             replace(_valid_config(), max_session_duration=0.0)
+        )
+    with pytest.raises(ValueError, match="streaming_cadence"):
+        validate_frontend_config(
+            replace(_valid_config(), streaming_cadence="560")
+        )
+    with pytest.raises(ValueError, match="serve_offline"):
+        validate_frontend_config(
+            replace(_valid_config(), serve_offline="yes")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="session_factory"):
+        validate_frontend_config(
+            replace(_valid_config(), session_factory="  padded")
         )
 
 
@@ -195,6 +208,7 @@ def test_every_field_may_be_omitted_but_null_is_never_omission() -> None:
         "session_idle_timeout",
         "max_session_duration",
         "deployment_image",
+        "session_factory",
     ):
         omitted = dict(raw)
         del omitted[optional]
@@ -207,12 +221,17 @@ def test_every_field_may_be_omitted_but_null_is_never_omission() -> None:
             assert frontend.session_idle_timeout == 60.0
         elif optional == "max_session_duration":
             assert frontend.max_session_duration == 600.0
+        elif optional == "session_factory":
+            assert frontend.session_factory is None
         else:
-            assert metadata.image == (
-                "unspecified"
-            )
+            assert metadata.image == ("unspecified")
 
-    for name in ("grpc_keepalive_seconds", "deployment_image", "pin"):
+    for name in (
+        "grpc_keepalive_seconds",
+        "deployment_image",
+        "pin",
+        "session_factory",
+    ):
         explicit_null = dict(raw)
         explicit_null[name] = None
         with pytest.raises(ValueError, match="must not be null"):
@@ -224,15 +243,16 @@ def test_zero_config_resolves_the_full_qualified_default_profile() -> None:
     """(a) No configuration at all still constructs the deployed profile."""
     frontend, metadata = load_plugin_config(None)
     assert frontend.grpc_bind == "0.0.0.0:50051"
+    assert frontend.streaming_cadence == "560ms"
+    assert frontend.serve_offline is False
+    assert frontend.session_factory is None
     assert frontend.grpc_keepalive_seconds is None
     assert frontend.resampler_identifier == "scipy-poly-v1"
     assert frontend.session_idle_timeout == 60.0
     assert frontend.max_session_duration == 600.0
     assert metadata == DeploymentMetadata(
         image="unspecified",
-        pin=(
-            "unspecified"
-        ),
+        pin=("unspecified"),
         precision_policy="fp32-bringup-v1",
     )
     assert validate_frontend_config(frontend) is None
@@ -257,9 +277,7 @@ def test_inline_json_overrides_exactly_the_given_keys() -> None:
     assert frontend.session_idle_timeout == 60.0
     assert frontend.plugin_shutdown_grace == 240.0
     assert frontend.max_session_duration == 600.0
-    assert metadata.pin == (
-        "unspecified"
-    )
+    assert metadata.pin == ("unspecified")
 
 
 # @spec ING-VEH-009, ING-VEH-012
@@ -272,7 +290,7 @@ def test_malformed_inline_json_names_the_plugin_key_and_does_not_fall_back(
     # inline-specific error proves no fall-back happened.
     with pytest.raises(
         ValueError,
-        match=r"riva_frontend application-plugin inline config is not "
+        match=r"riva_frontend endpoint-plugin inline config is not "
         r"valid JSON",
     ):
         load_plugin_config("{not valid json")
@@ -282,7 +300,7 @@ def test_malformed_inline_json_names_the_plugin_key_and_does_not_fall_back(
     bad_path.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(
         ValueError,
-        match=r"riva_frontend application-plugin config file is not "
+        match=r"riva_frontend endpoint-plugin config file is not "
         r"valid JSON",
     ):
         load_plugin_config(str(bad_path))
@@ -295,9 +313,7 @@ def test_path_shaped_value_still_loads_from_file(tmp_path) -> None:
         json.dumps({"load_shed_max_sessions": 5})
     )
     path = tmp_path / "riva-frontend.json"
-    path.write_text(
-        json.dumps({"load_shed_max_sessions": 5}), encoding="utf-8"
-    )
+    path.write_text(json.dumps({"load_shed_max_sessions": 5}), encoding="utf-8")
     from_path_frontend, from_path_metadata = load_plugin_config(str(path))
     assert from_path_frontend == frontend
     assert from_path_metadata == metadata

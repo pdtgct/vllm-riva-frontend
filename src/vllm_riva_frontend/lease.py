@@ -23,7 +23,7 @@ def add_note(error: BaseException, note: str) -> None:
     notes = getattr(error, "__notes__", None)
     if notes is None:
         notes = []
-        error.__notes__ = notes  # type: ignore[attr-defined]
+        error.__notes__ = notes
     notes.append(note)
 
 
@@ -138,7 +138,7 @@ class DirectLeaseOwner:
         abort_error: BaseException | None = None
         try:
             await self._bounded_cleanup(lease.abort())
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # The abort may still be executing under the shield.  A release now
             # would overlap terminal lease calls, so the caller escalates.
             raise
@@ -203,7 +203,7 @@ class DirectLeaseOwner:
                     self._lease = await asyncio.wait_for(
                         asyncio.shield(open_task), self._cleanup_timeout
                     )
-                except asyncio.TimeoutError as error:
+                except TimeoutError as error:
                     self._track_late_open(open_task)
                     self._report_cleanup_fault(error)
                     raise

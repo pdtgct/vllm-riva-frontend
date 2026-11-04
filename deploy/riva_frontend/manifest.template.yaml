@@ -31,13 +31,10 @@ spec:
           image: ${IMAGE}
           imagePullPolicy: ${IMAGE_PULL_POLICY}
           command:
-            - /opt/venv-port/bin/vllm-omni
+            - /opt/venv-port/bin/vllm
           args:
             - serve
             - ${MODEL}
-            - --omni
-            - --stage-configs-path
-            - ${STAGE_CONFIG_PATH}
             - --served-model-name
             - ${SERVED_MODEL_NAME}
             - --host
@@ -46,14 +43,11 @@ spec:
             - "${HTTP_PORT}"
             - --api-server-count
             - "1"
-            - --application-plugin
-            - riva_frontend
-            - --application-plugin-config
-            - riva_frontend=/etc/vllm_riva_frontend/riva_frontend.json
-            - --ws-max-size
-            - "${WS_RECEIVE_MAX_BYTES}"
-            - --h11-max-incomplete-event-size
-            - "${HTTP_REQUEST_HEADER_MAX_BYTES}"
+            - --additional-config
+            - '{"riva_frontend":"/etc/vllm_riva_frontend/riva_frontend.json"}'
+          env:
+            - name: VLLM_PLUGINS
+              value: nemotron_asr,riva_frontend
           ports:
             - name: http
               containerPort: ${HTTP_PORT}

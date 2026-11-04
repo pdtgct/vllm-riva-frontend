@@ -148,6 +148,7 @@ class _Config:
     session_idle_timeout: float = 1.0
     max_session_duration: float | None = None
     provenance: dict[str, object] | None = None
+    streaming_cadence: str = "560ms"
 
 
 @dataclass(frozen=True)
@@ -317,6 +318,17 @@ def test_raw_asgi_update_append_done_emits_suffix_and_completes() -> None:
     assert factory.opens == [("560ms", "auto")]
     assert factory.lease.calls == ["feed:1", "flush", "finish", "release"]
     assert sent[-1] == {"type": "websocket.close", "code": 1000}
+
+
+def test_realtime_open_uses_configured_streaming_cadence() -> None:
+    sent, factory = asyncio.run(
+        _drive(
+            [_event(_session())],
+            config=_ModelConfig(streaming_cadence="160ms"),
+        )
+    )
+    assert _json_events(sent)[1]["type"] == "transcription_session.updated"
+    assert factory.opens == [("160ms", "auto")]
 
 
 # @spec ING-SHIM-001, ING-NIMWS-004

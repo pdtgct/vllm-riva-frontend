@@ -2,29 +2,34 @@
 
 ## Supplying configuration
 
-Configuration is optional. Omitting `--application-plugin-config` entirely
-resolves every field below to its default value — the "qualified profile"
-this project deploys with. You only need to pass configuration to override
-specific fields.
+Configuration is optional. With no value at all, every field below resolves
+to its default — the qualified profile this project deploys with. You only
+pass configuration to override specific fields.
 
-When you do supply configuration, pass it to vLLM-Omni's
-`--application-plugin-config` flag under this plugin's entry-point key,
-`riva_frontend`, as either inline JSON or a path to a JSON file:
+vLLM core has no `--application-plugin-config`. This plugin reads
+configuration from two channels. `--additional-config` wins when both are
+set.
 
 ```bash
-# Inline JSON
-vllm-omni serve <model> --application-plugin riva_frontend \
-  --application-plugin-config riva_frontend='{"grpc_bind": ":50052"}'
+# Environment: inline JSON or a path. Available even before server args exist.
+export VLLM_RIVA_FRONTEND_CONFIG='{"grpc_bind": "0.0.0.0:50052"}'
+export VLLM_RIVA_FRONTEND_CONFIG=/path/to/riva_frontend.json
 
-# Path to a JSON file
-vllm-omni serve <model> --application-plugin riva_frontend \
-  --application-plugin-config riva_frontend=/path/to/riva_frontend.json
+# Server Namespace: vLLM's --additional-config, under the riva_frontend key.
+# The value is a JSON object, inline JSON, or a filesystem path.
+vllm serve <model> --api-server-count 1 \
+  --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50052"}}'
+
+vllm serve <model> --api-server-count 1 \
+  --additional-config '{"riva_frontend": "/path/to/riva_frontend.json"}'
 ```
 
-A value is treated as inline JSON, rather than a path, the moment its
-(whitespace-trimmed) text starts with `{`. That means malformed inline JSON
-always fails as malformed JSON — it is never silently reinterpreted as a
-(almost certainly nonexistent) file path.
+Also set `VLLM_PLUGINS` to the model plugin's entry-point name and
+`riva_frontend`. See the README.
+
+A string value is treated as inline JSON, rather than a path, the moment its
+(whitespace-trimmed) text starts with `{`. Malformed inline JSON fails as
+malformed JSON — it is never silently reinterpreted as a file path.
 
 ## Validation rules
 
@@ -48,10 +53,10 @@ always fails as malformed JSON — it is never silently reinterpreted as a
 
 ## Field reference
 
-All 29 fields below can be set through `--application-plugin-config
-riva_frontend=...`. The first 26 govern the plugin's own listeners,
-transports, and session lifetime; the last 3 (`deployment_image`, `pin`,
-`precision_policy`) are deployment-owned provenance facts (see below).
+All 32 fields below can be set through either config channel. The first 29
+govern the plugin's own listeners, transports, and session lifetime; the
+last 3 (`deployment_image`, `pin`, `precision_policy`) are deployment-owned
+provenance facts (see below).
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -68,11 +73,11 @@ transports, and session lifetime; the last 3 (`deployment_image`, `pin`,
 | `session_finalization_timeout` | `180.0` | Seconds allowed for a session's terminal flush/finish to complete before a finalization timeout. |
 | `session_cleanup_timeout` | `30.0` | Seconds allowed for abnormal-path lease abort-and-release cleanup before it is reported as a cleanup fault. |
 | `plugin_shutdown_grace` | `240.0` | Seconds the plugin waits for in-flight owners to drain gracefully during shutdown; must cover `session_finalization_timeout + session_cleanup_timeout`. |
-| `ws_receive_max_bytes` | `16777216` | Maximum bytes accepted per WebSocket receive; must cover `ws_event_envelope_max_bytes`. Corresponds to vLLM-Omni's own `--ws-max-size` host flag (whose own default, 16 MiB, already matches). |
+| `ws_receive_max_bytes` | `16777216` | Maximum bytes accepted per WebSocket receive; must cover `ws_event_envelope_max_bytes`. The plugin enforces this bound itself. |
 | `ws_event_envelope_max_bytes` | `8388608` | Maximum size, in bytes, of one Realtime WebSocket JSON event. |
 | `http_multipart_envelope_max_bytes` | `33816576` | Maximum total bytes of one multipart HTTP transcription request body; must exceed `unary_max_encoded_audio_bytes` to leave room for multipart framing. |
 | `http_content_type_max_bytes` | `4096` | Maximum bytes of the HTTP `Content-Type` header value. |
-| `http_request_header_max_bytes` | `65536` | Maximum bytes reserved for HTTP request headers; must be at least `http_content_type_max_bytes`. Deployments that raise or lower this should keep vLLM-Omni's own `--h11-max-incomplete-event-size` host flag consistent with it. |
+| `http_request_header_max_bytes` | `65536` | Maximum bytes reserved for HTTP request headers; must be at least `http_content_type_max_bytes`. The plugin enforces this bound on the requests it owns. |
 | `http_multipart_boundary_max_bytes` | `200` | Maximum bytes of the multipart boundary token. |
 | `http_multipart_max_parts` | `5` | Maximum number of multipart form parts accepted per request. |
 | `http_multipart_max_header_bytes` | `8192` | Maximum bytes of headers within one multipart part. |
@@ -81,8 +86,11 @@ transports, and session lifetime; the last 3 (`deployment_image`, `pin`,
 | `grpc_keepalive_seconds` | `null` (omitted) | gRPC keepalive ping interval, in seconds. Omitted disables keepalive; if set, must be finite and positive. |
 | `max_session_duration` | `600.0` | Maximum total seconds a session may stay open, from configuration to finalization, regardless of activity. |
 | `resampler_identifier` | `"scipy-poly-v1"` | Identifier of the pinned 8 kHz resampler; must equal the package's built-in identifier — this is a fixed fact, not a real choice. |
+| `streaming_cadence` | `"560ms"` | Lookahead label passed to `session.open` for streaming gRPC and `/v1/realtime?intent=transcription`. Not a hardcoded call site. If the session factory publishes `served_cadences`, this value must be in that set. |
+| `serve_offline` | `false` | When false, unary gRPC `Recognize` returns UNIMPLEMENTED and `POST /v1/audio/transcriptions` is left to core. When true, this plugin owns both offline paths (and therefore shadows core's transcription route). |
+| `session_factory` | omitted | Entry-point name under `vllm_riva.session_factories`. Omit it when exactly one factory is installed. |
 | `deployment_image` | `"unspecified"` | Deployment-owned container image identity published in `/v1/metadata` provenance. |
-| `pin` | `"unspecified"` | Deployment-owned vLLM/vLLM-Omni version pin published in `/v1/metadata` provenance. |
+| `pin` | `"unspecified"` | Deployment-owned vLLM version pin published in `/v1/metadata` provenance. |
 | `precision_policy` | `"fp32-bringup-v1"` | Deployment-owned precision-policy identifier published in `/v1/metadata` provenance. |
 
 ## Provenance defaults are deliberate

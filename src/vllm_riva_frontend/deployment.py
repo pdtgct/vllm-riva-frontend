@@ -34,7 +34,8 @@ _DEPLOYMENT_FIELDS = frozenset(
     }
 )
 _REQUIRED_FIELDS = (_PLUGIN_FIELDS | _METADATA_FIELDS | _DEPLOYMENT_FIELDS) - {
-    "grpc_keepalive_seconds"
+    "grpc_keepalive_seconds",
+    "session_factory",
 }
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 _FORBIDDEN_SECURITY_STEMS = (

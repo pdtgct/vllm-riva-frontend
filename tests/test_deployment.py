@@ -39,17 +39,18 @@ def test_production_module_renders_one_cohosted_server() -> None:
     container = documents[1]["spec"]["template"]["spec"]["containers"][0]
     args = container["args"]
     assert container["image"] == values["image"]
-    assert container["command"] == ["/opt/venv-port/bin/vllm-omni"]
-    assert args.count("--application-plugin") == 1
-    assert args[args.index("--application-plugin") + 1] == "riva_frontend"
+    assert container["command"] == ["/opt/venv-port/bin/vllm"]
+    assert "--application-plugin" not in args
+    assert "--omni" not in args
     assert args[args.index("--api-server-count") + 1] == "1"
     assert (
         args[args.index("--served-model-name") + 1]
         == values["served_model_name"]
     )
-    assert "--omni" in args
-    assert "--ws-max-size" in args
-    assert "--h11-max-incomplete-event-size" in args
+    additional = args[args.index("--additional-config") + 1]
+    assert additional.startswith('{"riva_frontend":')
+    env = {item["name"]: item["value"] for item in container["env"]}
+    assert env["VLLM_PLUGINS"] == "nemotron_asr,riva_frontend"
     assert "remote_provider" not in rendered
     assert "/v1/audio/translations" not in rendered
 

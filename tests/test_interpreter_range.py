@@ -14,17 +14,13 @@ below parses every module independently and reports all of them.
 from __future__ import annotations
 
 import ast
-import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # pragma: no cover - exercised only on the lowest supported version
-    import tomli as tomllib
-
 #: Lowest interpreter the distribution supports, as (major, minor).
-LOWEST_SUPPORTED = (3, 10)
+#: vLLM core's floor is 3.11.
+LOWEST_SUPPORTED = (3, 11)
 
 _PROJECT_ROOT = Path(__file__).parents[1]
 _PACKAGE_ROOT = _PROJECT_ROOT / "src" / "vllm_riva_frontend"
@@ -52,11 +48,11 @@ def _modules() -> list[Path]:
 
 # @spec ING-VEH-025
 def test_declared_range_matches_the_host_supported_interpreters() -> None:
-    """The floor is vLLM-Omni's, not an independent choice."""
+    """The floor is vLLM core's, not an independent choice."""
     requires = _project()["project"]["requires-python"]
 
-    assert requires == ">=3.10,<3.14", (
-        "the declared range must mirror vLLM-Omni's requires-python; "
+    assert requires == ">=3.11,<3.15", (
+        "the declared range must mirror vLLM core's requires-python; "
         f"found {requires!r}"
     )
 
@@ -120,14 +116,8 @@ def test_tooling_floors_name_the_lowest_supported_version() -> None:
 
 
 # @spec ING-VEH-025
-def test_toml_reader_is_version_gated_rather_than_unguarded() -> None:
-    """A stdlib module newer than the floor needs a declared fallback."""
+def test_floor_can_read_toml_from_the_stdlib() -> None:
+    """3.11 has tomllib, so the dev group does not carry a tomli fallback."""
     dev_dependencies = _project()["dependency-groups"]["dev"]
-
-    assert any(
-        item.startswith("tomli") and "python_version < " in item
-        for item in dev_dependencies
-    ), (
-        "tests read TOML, but tomllib is unavailable at the floor; declare a "
-        "markered tomli fallback in the dev group"
-    )
+    assert LOWEST_SUPPORTED >= (3, 11)
+    assert not any(item.startswith("tomli") for item in dev_dependencies)

@@ -2,7 +2,9 @@
 
 import json
 import math
+import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -16,11 +18,16 @@ from vllm_riva_frontend.frontend import RESAMPLER_ID
 #: / ``_validate_provenance_value``, which does the same for *values*.
 FORBIDDEN_PROVENANCE_KEY = "selectedModelProfileId"
 
-#: The application-plugin entry-point key this package registers under
-#: (``--application-plugin-config riva_frontend=...``), named in every
+#: The endpoint-plugin entry-point name this package registers under
+#: (``vllm.endpoint_plugins`` / ``VLLM_PLUGINS``), named in every
 #: configuration-loading error so a multi-plugin host log is unambiguous
-#: about which plugin's configuration failed.
+#: about which plugin's configuration failed. Core has no
+#: ``--application-plugin-config``; the value arrives from
+#: ``VLLM_RIVA_FRONTEND_CONFIG`` or ``--additional-config``'s
+#: ``riva_frontend`` key (see ``resolve_config_value``).
 _PLUGIN_KEY = "riva_frontend"
+_CONFIG_ENV = "VLLM_RIVA_FRONTEND_CONFIG"
+_CADENCE = re.compile(r"^[1-9][0-9]*ms$")
 
 #: The qualified zero-config deployment profile (D5): every
 #: ``FrontendConfig`` field plus the three ``DeploymentMetadata`` source
@@ -57,6 +64,16 @@ _DEFAULT_PROFILE: dict[str, object] = {
     "grpc_keepalive_seconds": None,
     "max_session_duration": 600.0,
     "resampler_identifier": RESAMPLER_ID,
+    # Streaming lookahead is configuration, not a call-site literal.
+    # 560ms is the qualified profile's streaming arm (the same arm NIM
+    # Realtime uses). Unary/offline stays on its own 1120ms arm.
+    "streaming_cadence": "560ms",
+    # Offline Recognize and POST /v1/audio/transcriptions shadow core's
+    # transcription route when enabled. The default leaves those paths
+    # to core.
+    "serve_offline": False,
+    # None selects the only installed vllm_riva.session_factories entry.
+    "session_factory": None,
     # Provenance is a per-deployment FACT, not policy: a zero-config
     # deployment must never advertise another deployment's image or pin
     # through /v1/metadata. These two default to an honest marker; the
@@ -103,6 +120,9 @@ class FrontendConfig:
     grpc_keepalive_seconds: float | None
     max_session_duration: float | None
     resampler_identifier: str
+    streaming_cadence: str = "560ms"
+    serve_offline: bool = False
+    session_factory: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +243,9 @@ def validate_frontend_config(config: FrontendConfig) -> None:
             "grpc_keepalive_seconds",
             "max_session_duration",
             "resampler_identifier",
+            "streaming_cadence",
+            "serve_offline",
+            "session_factory",
         }:
             continue
         if not is_positive_finite(value):
@@ -245,6 +268,24 @@ def validate_frontend_config(config: FrontendConfig) -> None:
     if config.resampler_identifier != RESAMPLER_ID:
         raise ValueError(
             "resampler_identifier must equal the pinned RESAMPLER_ID"
+        )
+    if not isinstance(config.streaming_cadence, str) or (
+        _CADENCE.fullmatch(config.streaming_cadence) is None
+    ):
+        raise ValueError(
+            "streaming_cadence must be a positive millisecond label "
+            "such as 560ms"
+        )
+    if not isinstance(config.serve_offline, bool):
+        raise ValueError("serve_offline must be a boolean")
+    factory_name = config.session_factory
+    if factory_name is not None and (
+        not isinstance(factory_name, str)
+        or not factory_name.strip()
+        or factory_name != factory_name.strip()
+    ):
+        raise ValueError(
+            "session_factory must be omitted or a non-empty entry-point name"
         )
 
     if config.grpc_receive_max_bytes != (
@@ -320,7 +361,7 @@ def _read_config_value(value: str) -> dict[str, Any]:
             decoded = json.loads(candidate)
         except json.JSONDecodeError as error:
             raise ValueError(
-                f"{_PLUGIN_KEY} application-plugin inline config is not "
+                f"{_PLUGIN_KEY} endpoint-plugin inline config is not "
                 f"valid JSON: {error}"
             ) from error
     else:
@@ -329,20 +370,19 @@ def _read_config_value(value: str) -> dict[str, Any]:
             encoded = path.read_text(encoding="utf-8")
         except OSError as error:
             raise ValueError(
-                f"{_PLUGIN_KEY} application-plugin config path is not "
+                f"{_PLUGIN_KEY} endpoint-plugin config path is not "
                 f"readable: {path}"
             ) from error
         try:
             decoded = json.loads(encoded)
         except json.JSONDecodeError as error:
             raise ValueError(
-                f"{_PLUGIN_KEY} application-plugin config file is not "
+                f"{_PLUGIN_KEY} endpoint-plugin config file is not "
                 f"valid JSON: {error}"
             ) from error
     if not isinstance(decoded, dict):
         raise ValueError(
-            f"{_PLUGIN_KEY} application-plugin config must be one JSON "
-            "object"
+            f"{_PLUGIN_KEY} endpoint-plugin config must be one JSON object"
         )
     return decoded
 
@@ -409,3 +449,51 @@ def load_plugin_config(
         precision_policy=metadata_values["precision_policy"],
     )
     return frontend, metadata
+
+
+def resolve_config_value(
+    args: object | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve the plugin config string from the server, then the environment.
+
+    Core has no ``--application-plugin-config``. Precedence:
+
+    1. ``args.additional_config["riva_frontend"]`` — a JSON object, inline
+       JSON text, or a filesystem path. This is vLLM's ``--additional-config``
+       Namespace field.
+    2. ``VLLM_RIVA_FRONTEND_CONFIG`` — the same string forms (inline JSON or
+       a path). Available before server args exist.
+
+    A missing or blank value returns ``None``, which
+    ``load_plugin_config`` treats as the qualified default profile.
+    ``--additional-config`` wins when both channels are set.
+    """
+    from_args = _config_from_namespace(args)
+    if from_args is not None:
+        return from_args
+    env = os.environ if environ is None else environ
+    raw = env.get(_CONFIG_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def _config_from_namespace(args: object | None) -> str | None:
+    """Read the ``riva_frontend`` key from a server Namespace, if present."""
+    if args is None:
+        return None
+    additional = getattr(args, "additional_config", None)
+    if not isinstance(additional, dict) or _PLUGIN_KEY not in additional:
+        return None
+    value = additional[_PLUGIN_KEY]
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, dict):
+        return json.dumps(value)
+    raise ValueError(
+        f"{_PLUGIN_KEY} additional-config value must be a JSON object "
+        "or a string (inline JSON or a file path)"
+    )
