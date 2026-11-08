@@ -55,7 +55,8 @@ model, so both the route and the state attribute are the capability signal:
   attached none), and no `offline` entry is listed.
 - When the service is present but files are disabled by the tiny-deployment rule (below), the
   frontend's route stays registered, because `attach_router` already replaced core's; it refuses
-  every request with `unsupported_capability`, projected as HTTP 501, before reading a body, and
+  every request with `unsupported_capability`, projected as HTTP 501, as its first step (before the
+  ingress cap and before reading a body, creating no owner), and
   `Recognize` answers `UNIMPLEMENTED`.
 - Without the frontend loaded, core's route is unguarded; that configuration is unsupported for
   this model.
@@ -136,6 +137,9 @@ with 400 `invalid_config_field` naming it, and a test fails when core adds or re
 
 The route runs in this order, each step before the next:
 
+0. **Files-enabled check**: while files are disabled and the service is present, the route
+   answers 501 `unsupported_capability` at once, before the ingress cap and before any read, and
+   creates no owner.
 1. **Ingress cap** (vehicle leaf): atomically admit the owner. A draining plugin answers 503
    `service_unavailable`; a full cap answers 503 `busy` (`authority: load_shed`). Both create no
    owner or permit.
@@ -244,22 +248,23 @@ treated as ending the engine request.
 **Structured ownership.** The route does not rely on core's `with_cancellation` either: it spawns a
 handler task and a disconnect-listener task and cancels the pending one without awaiting it. The
 route's owner task owns the core call (a child task) and the disconnect watcher (a second child).
-The owner never cancels the core call: core decodes audio on an executor thread, and cancelling the
+The owner never cancels the core call (only `stop` does, below): core decodes audio on an executor thread, and cancelling the
 await would release the frontend's accounting while that thread still holds the audio, and a call
 cancelled during decoding never reaches the engine anyway. Instead, on a disconnect, cancellation,
-shutdown or timeout the owner aborts the engine request ID, and repeats the abort every
+shutdown or timeout while the core call is executing (until it returns, and for a returned event
+stream until the generator is exhausted) the owner aborts the engine request ID, and repeats the abort every
 250 ms until the core call returns on its own (a decode in progress finishes, the request
 reaches the engine, and the repeated abort ends it); it then cancels the disconnect watcher and,
-for a returned event stream, closes the generator. The whole settlement is bounded by
+for a returned event stream, closes the generator. The owner waits for settlement for at most
 `session_cleanup_timeout` (during drain, by the smaller of that and the time left to the drain
-deadline). Aborting an ID the engine does not know is harmless. The same contract applies to
+deadline); the bound limits the wait, not the settlement, which can outlast it (below). Aborting an ID the engine does not know is harmless. The same contract applies to
 `Recognize`, whose engine request ID is fixed by its synthetic request. The owner keeps its permit and its
 file-owner slot until the children have settled: accounting is never released while work it covers
 still runs. A child that has not settled when the bound expires stays under the owner, which
 remains registered and keeps its permit and slot, and `stop` cancels it; the stuck permit is
-visible rather than hidden. A disconnect before the permit is taken discards only multipart memory.
+visible rather than hidden. A disconnect before the permit is taken discards only multipart memory, with no abort.
 A disconnect after the service completed normally and during the response send suppresses the
-response only.
+response only, with no abort.
 
 **Load accounting.** The route does its own server-load accounting instead of calling core's
 `load_aware_call`: when `enable_server_load_tracking` is set, the owner increments
@@ -279,7 +284,10 @@ before headers; stream termination after, errors leaf). The permit is released a
 request is aborted, the children have settled and the send has finished or failed.
 
 The route bounds each response send: a reader that stalls longer than `response_send_timeout`
-(default 60 s) is cancelled, the engine request is aborted, and the permit is released after settlement.
+(default 60 s) is cancelled. While core's service call is still executing, including an event
+stream whose generator is not exhausted, the engine request is aborted; after the service completed
+normally, delivery is suppressed and nothing is aborted. In both cases the permit is released after
+settlement.
 
 Core's own errors pass through unchanged.
 
@@ -311,8 +319,8 @@ accepts is not rejected by core's decoder.
 `Recognize` and the route alike; its default is `max(300 s, 2 * unary_max_decoded_duration_seconds)`
 (1200 s at the defaults), generous so legitimate long files are not cut. The terminal deadline for
 `Recognize` is the earlier of that bound and the RPC's absolute deadline. Expiry of the bound is
-`request_timeout`; cancellation or deadline expiry cancels the core request and releases the
-permit before the RPC returns, and emits no response. Engine death while a file runs is core's to
+`request_timeout`; cancellation or deadline expiry aborts the engine request, settles under the
+rules above and releases the permit before the RPC returns, and emits no response. Engine death while a file runs is core's to
 handle through its own engine watchdog; the frontend does not escalate for it (vehicle leaf).
 
 **Server-load accounting.** `Recognize` has no HTTP request, so it is outside the server-load
@@ -336,31 +344,45 @@ are outside this prohibition.
 
 ## Memory per owner
 
-A file owner holds these simultaneous copies, all bounded by configuration:
+A file owner holds these simultaneous copies, all bounded by configuration. These are the counted
+allocations; core's decode memory is not counted.
 
 - **Route:** the parsed file part (up to the file bound), the in-memory upload object built from it
   (the part buffer is handed over, not copied), the `bytes` object core's upload helper joins from
-  it, and core's own decoded array (core's limits). The encoded body is not retained beyond the
-  part. Frontend-held: at most 3 x the file bound (about 96 MiB at the defaults).
+  it, and core's own decoded array (core's limits, not counted). The encoded body is not retained
+  beyond the part. Frontend-held: at most `3 x http_multipart_envelope_max_bytes` (about 97 MiB at
+  the defaults).
 - **`Recognize`:** the encoded request (up to `unary_max_encoded_audio_bytes`), the decoded
   `float32` samples (at most 600 s x 16 kHz x 4 bytes, 38 MB), the resampler's per-slice state and
-  temporary arrays (decode runs in slices, below 1 MB each), and the WAV (19 MB at 600 s). At most
-  about 100 MiB.
+  temporary arrays (decode runs in slices, below 1 MB each; a 4 MiB allowance), and the WAV (19 MB
+  at 600 s). At most `unary_max_encoded_audio_bytes + 6 x 16000 x unary_max_decoded_duration_seconds
+  + 44` bytes plus the 4 MiB allowance (about 91 MiB at the defaults).
 
-The per-owner budget is therefore 128 MiB, and the default total is `max_file_owners` times that:
-6 owners (4 permits plus 2 waiters) is 768 MiB. Core's own decode memory is bounded by core's limits
-and is not part of this budget.
+The per-owner bound is the larger of the two formulas, so it grows with the configured upload and
+duration limits. At the default configuration both paths stay under 128 MiB, which is the
+acceptance limit: a test sends one maximal request on each path with core's service replaced by a
+stub that reads the bytes and returns a transcript, and measures the increase of `tracemalloc`'s
+traced peak over the baseline taken before the request (numpy buffers are traced). The default
+total is `max_file_owners` times the bound: 3 to 6 owners (the derived gate of 1 to 4 permits plus
+2 waiters), at most 768 MiB. Core's own decode memory is bounded by core's limits and is not part
+of this budget.
 
 ## Equivalence
 
 A complete file's transcript equals the transcript of a factory session fed the same audio at the
-server's default cadence (the factory accepts any served cadence, so the comparison opens its
-session at that cadence), not the output of the frontend's 560 ms streaming surface, which is a
-different lookahead arm unless the server default is also 560 ms. Under matched conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
+cadence core's file path uses, the manifest's `num_lookahead_tokens` (ING-EP-054); the factory
+accepts any served cadence, so the comparison opens its session at that cadence. It is not the
+output of the frontend's 560 ms streaming surface, which is a different lookahead arm unless the
+file path's cadence is also 560 ms. Under matched conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
 applied to the stream side too (audio leaf); the same cadence, locale, precision and endpointing
 setting (the model plugin's file design states the model's side). The frontend's contribution is
 that the decoded samples it hands to core are exactly the samples the stream side would hand to
-`feed`, and that the locale core sees is the locale a stream would open with.
+`feed`, and that the locale core sees is the locale a stream would open with. The end-to-end
+comparison is an integration test under the model plugin's conditions: the file's request ends
+with EOS, the comparison session is flushed successfully with a fixed locale, and endpointing is
+disabled on both. Core returns success for a file without checking for an abnormal finish reason
+(Deferred 1), so neither this test nor the gate establishes that a failed file is reported as a
+failure.
 
 ## Decisions & Alternatives
 
@@ -381,7 +403,7 @@ that the decoded samples it hands to core are exactly the samples the stream sid
 | Ignored fields | Explicit non-default `n`, `length_penalty`, `include_stop_str_in_output` refused | Accept silently | Unsupported features are refused, never ignored |
 | Request fields | Explicit allowlist; explicit non-default sampling refused; inherited values not inspected | Pass unknown fields to core; refuse inherited values | Extra fields would reach the model unvalidated; inherited values are operator configuration |
 | File owners | Counted in `max_file_owners` inside the ingress cap | A shared cap | A backlog of waiting files must not refuse streams |
-| Equivalence reference | A factory session at the server's default cadence | The 560 ms streaming surface | The file runs at the server default and the factory serves any served cadence, so the comparison is exact |
+| Equivalence reference | A factory session at the cadence core's file path uses (the manifest's `num_lookahead_tokens`, ING-EP-054) | The 560 ms streaming surface | The file runs at that cadence and the factory serves any served cadence, so the comparison is exact |
 | Over-budget file | `request_too_large` for `Recognize`, no startup relation to `max_model_len` | `INVALID_ARGUMENT`; a startup check | The file is too large for the configured model length; the frontend cannot compute the model's budget |
 | `Recognize` accounting | Outside the server-load counter | Count it too | The counter reports HTTP load; the synthetic request exists only to fix the engine request ID |
 | Gate placement | In the frontend, before `generate` | Core's queue | A queued file counts against the active-request limit and refuses streams |

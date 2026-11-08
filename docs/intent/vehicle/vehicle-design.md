@@ -240,7 +240,10 @@ max_file_owners` at least), so a file backlog never refuses a stream with `busy`
 
 - A file owner holds at most 128 MiB (files leaf, Memory per owner: the parsed part, the upload
   object, core's joined bytes for the route; the encoded request, decoded samples and WAV for
-  `Recognize`). The default file total is `max_file_owners` times that: 6 owners, 768 MiB.
+  `Recognize`) at the default configuration; the bound is derived from configuration (files leaf).
+  The default file total is `max_file_owners` times that: 3 to 6 owners, because the derived gate
+  is between 1 and 4, reaching 4 only when the smaller of slots and active limit is at least 16;
+  at most 768 MiB.
 - A stream owner holds one received message plus a decode slice. Decoding is incremental: the audio
   frontend decodes a message in slices whose decoded output is at most `pre_submit_max_samples`
   samples, so the decoded form never exceeds the pre-submit bound (about 1 MB with resampler
@@ -251,10 +254,12 @@ max_file_owners` at least), so a file backlog never refuses a stream with `busy`
   headroom is not a maximum: with no file owners the cap admits all 64 streams, so the stream-only
   worst case (every stream sending a maximal message at once) is about 2 GiB at the defaults;
   typical messages are kilobytes, and operators who need a smaller worst case lower the receive
-  caps. The file figure excludes core's own decode memory and assumes the default caps.
+  caps. The file figure excludes core's own decode memory and assumes the default caps; larger
+upload or duration limits raise it as the files leaf's formula gives.
 
 The default `max_file_owners` is `max_concurrent_files + 2`, and the default `max_concurrent_files`
-is capped at 4.
+is capped at 4. While complete files are disabled or core's transcription service is absent, both
+are 0: no file gate is built, and `Recognize` and the file route refuse without creating an owner.
 
 **Engine refusals.** When `open` raises a `SessionRefused` with reason `capacity` or `active_limit`,
 the surface consumes no audio and answers `busy` carrying `authority: provider`. Riva invents no
@@ -276,8 +281,9 @@ the listener is locally reachable before `start` returns. Then `start` creates t
 step; health becomes `SERVING` when admission opens, so no owner is admitted before `start`
 completes.
 
-If `start` fails after the bind, it closes the listener (`stop(0)`), calls
-`factory.teardown_all()` and re-raises. Startup rollback
+If `start` fails after the bind, it cancels the fault collector and the listener monitor if it
+created them (so the rollback's listener exit is not reported as a fault), closes the listener
+(`stop(0)`), calls `factory.teardown_all()` and re-raises. Startup rollback
 after a later plugin fails is core's `stop` call on this plugin, so `stop` is correct for a plugin
 that started.
 
@@ -308,8 +314,9 @@ owner runs the legal, serialized finalization sequence for each stream.
    a lease already flushed takes `release` only) and ends the stream with gRPC `UNAVAILABLE`
    (`service_unavailable`) or WebSocket close 1012. File requests still running at the settle point
    are cancelled (errors leaf: `service_unavailable`, 503 before headers, stream termination after)
-   and take their cancellation path; their settlement is bounded by `min(session_cleanup_timeout,
-   time to D)`.
+   and take their cancellation path; the wait for their settlement is bounded by
+   `min(session_cleanup_timeout, time to D)`, and children still unsettled stay under their owner,
+   with its permit and accounting, until settlement or `stop`.
 4. Stop the gRPC server with the time remaining to `D` as the grace period.
 5. Call `factory.drain(D)`, wait on its cleanup tasks until `D`, and log the faults it returns.
 
@@ -350,7 +357,7 @@ Two supervision tasks run while the plugin serves.
   them only through `drain`, so without the collector a fault during normal service would stay
   invisible until shutdown.
 - **Listener monitor.** It waits for the gRPC server's termination. An exit that is not caused by
-  `drain` or `stop` is a fault.
+  `drain`, `stop` or `start`'s own rollback is a fault.
 
 Escalation has exactly three triggers: any call that fails with reason `engine_dead`, a cleanup
 fault returned by the collector, and an unexpected listener exit. On any trigger the plugin records
@@ -386,13 +393,13 @@ The set is deliberately the set of options with an operator-visible effect; prot
 | `grpc_bind` | `0.0.0.0:50051` | `host:port`; port 1 to 65535 |
 | `grpc_receive_max_bytes` | 33,619,968 | gRPC message cap; equals `unary_max_encoded_audio_bytes + grpc_config_envelope_max_bytes` |
 | `grpc_config_envelope_max_bytes` | 65,536 | allowance for the non-audio part of a request |
-| `grpc_keepalive_seconds` | off | keepalive ping interval; omit to disable |
+| `grpc_keepalive_seconds` | off | keepalive ping interval, applied as the server option `grpc.keepalive_time_ms` (the value times 1000); omit to disable |
 | `unary_max_encoded_audio_bytes` | 33,554,432 | encoded audio cap for `Recognize` |
 | `unary_max_decoded_duration_seconds` | 600 | decoded duration cap for `Recognize`; at most core's decode-duration limit |
 | `max_riff_header_bytes` | 1,048,576 | RIFF header scan bound; at most `unary_max_encoded_audio_bytes` |
 | `load_shed_max_sessions` | 64 | ingress cap; above `max_file_owners` |
-| `max_file_owners` | derived | file-owner sub-cap; default `max_concurrent_files + 2`; at least `max_concurrent_files`, below `load_shed_max_sessions` |
-| `max_concurrent_files` | derived | file-gate size; default `min(4, max(1, floor(min(slots, active limit) / 4)))`; below both slots and active limit; when unset and `min(slots, active limit) < 2`, complete files are disabled with a warning; when set and failing the check, startup fails |
+| `max_file_owners` | derived | file-owner sub-cap; default `max_concurrent_files + 2`, 0 while files are disabled or not served; at least `max_concurrent_files`, below `load_shed_max_sessions` |
+| `max_concurrent_files` | derived | file-gate size; default `min(4, max(1, floor(min(slots, active limit) / 4)))`, 0 while files are disabled or not served; while files are enabled, below both slots and active limit; when unset and `min(slots, active limit) < 2`, complete files are disabled with a warning; when set and failing the check, startup fails |
 | `file_gate_wait_timeout` | 30 s | bound on a gate wait |
 | `pre_submit_max_samples` | 65,536 | samples handed to `feed` and not yet accepted, per stream |
 | `preconfiguration_timeout` | 30 s | first message plus `open` |

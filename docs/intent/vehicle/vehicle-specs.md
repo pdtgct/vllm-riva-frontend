@@ -1,0 +1,98 @@
+# Vehicle specs
+
+Design: [vehicle-design.md](vehicle-design.md). Prefix `ING`, facets EP, VEH, ADM.
+
+## Package and declaration (EP)
+
+- [ ] **ING-EP-001**: The distribution shall expose the frontend as one entry point named `riva_frontend` in the `vllm.endpoint_plugins` group, resolving to a zero-argument factory that returns `RivaFrontendPlugin`, and no Riva- or NIM-shaped code, dependency or route shall be merged into vLLM.
+- [ ] **ING-EP-002**: The distribution shall be named `vllm-riva-frontend` with import package `vllm_riva_frontend`, shall list among its runtime dependencies the pinned `nvidia-riva-client` stubs, `grpcio` with its health and reflection packages, `numpy`, `scipy` and `python-multipart`, and shall declare no dependency on vLLM or on the model plugin.
+- [ ] **ING-EP-006**: `RivaFrontendPlugin` shall have `name` equal to `riva_frontend`, `required_tasks` equal to `("realtime",)` and `owns_non_http_listener` equal to `True`.
+- [ ] **ING-EP-004**: When `riva_frontend` is loaded, one `vllm serve` API-server process shall serve core's `/v1/realtime` route, the frontend's WebSocket dispatcher, file route, Realtime bootstrap and operational routes on the HTTP listener, and the Riva servicer on one separate gRPC listener, over exactly one engine client and one session factory.
+- [ ] **ING-EP-020**: The frontend shall create no engine of its own and shall reach the engine only through the engine client core provides (the provider, loopback, render-loop and batching prohibitions are ING-CORE-018, ING-CORE-010 and ING-VEH-005).
+- [ ] **ING-EP-021**: The frontend shall add no vLLM version lower bound to its packaging and shall decide in `init_state` by capability (the session factory constructor raising on a missing engine call, and the `realtime` task) whether a vLLM build is usable.
+- [ ] **ING-VEH-002**: The gRPC vehicle shall register its servicer over the engine through the standard `add_RivaSpeechRecognitionServicer_to_server` call on an asyncio-native server and shall not commit one dedicated OS thread per concurrent streaming session for that session's duration.
+- [ ] **ING-VEH-005**: The frontend shall run no batching mechanism of its own; cross-session batching shall be provided entirely by the engine's own scheduler.
+- [ ] **ING-VEH-007**: Every downstream compatibility streaming adapter shall pass its validated cadence and locale only to `SessionFactory.open` and carry no per-session override through a process-shared serving object; Riva shall expose no mid-session configuration update, and after the Realtime adapter's first successful update and open only locale shall be mutable, applied through serialized `SessionLease.update_locale` before its truthful acknowledgement.
+- [ ] **ING-VEH-008**: Engine rendering and streaming-generation integration shall remain inside the model plugin's session and use the engine's process model configuration (SESS-PACK-*, SESS-ENG-*), and the frontend shall not render prompts or pass transport-owned configuration to the engine.
+- [ ] **ING-VEH-027**: Because the frontend is imported into the host's interpreter, the distribution shall declare the interpreter range derived from vLLM's `requires-python` (a narrower declaration is a defect) and remain installable and importable across it; every distributed module shall compile and import on the lowest supported version using no syntax or runtime name introduced later, except behind a version-gated import or a declared compatibility package; and that floor shall be proven by a gate that compiles and imports every module on that version, reports every offending module rather than halting at the first, and fails closed with an exit status no pipeline masks.
+- [ ] **ING-EP-022**: The linter target version and the type checker's language level shall name the lowest supported interpreter version, and a version in the declared range that no gate executes shall be recorded as declared-but-unverified rather than reported as supported.
+
+## Startup checks (EP, VEH)
+
+- [ ] **ING-EP-003**: When `init_state` runs, it shall fail startup unless the configuration is valid (ING-EP-018), the capacity checks hold (ING-EP-030 and ING-EP-029), and exactly one session factory accepts the served model (ING-CORE-012).
+- [ ] **ING-EP-023**: When `init_state` runs, it shall execute its checks in this order: configuration, served identity, engine stream deadlines, capacity, complete-file service, build of everything except the factory including the route-table check, and the session factory last.
+- [ ] **ING-EP-024**: When `init_state` fails after the session factory has been constructed, it shall call `factory.teardown_all()` before the error propagates, so that a failed `init_state` leaves no engine-facing task.
+- [ ] **ING-EP-025**: The `init_state` method shall bind no listener and start no task.
+- [ ] **ING-VEH-026**: During `init_state`, `riva_frontend` shall call `state.openai_serving_models.model_name()` exactly once and use its non-empty string result as the plugin lifetime's immutable served-model identity for every configuration, metadata and model-selector field of the Riva gRPC and Riva Realtime WebSocket surfaces and the operational routes; the frontend shall not read engine `ModelConfig`, `state.args` or a serve-argument namespace for identity, shall not parse CLI aliases, and a missing registry, a missing or non-callable accessor, a raised lookup, or a non-string or empty result shall fail `init_state` before the listener starts or any lease opens.
+- [ ] **ING-EP-026**: The Riva gRPC and Riva Realtime WebSocket surfaces shall accept only the primary served-model identity as a model selector, and the canonical checkpoint identifier and every secondary alias shall not be accepted as additional selectors there.
+- [ ] **ING-EP-027**: If `--shutdown-timeout` is 0, then `init_state` shall log a warning that no `drain` will run and that shutdown is `stop` alone.
+- [ ] **ING-EP-028**: When `init_state` finds data parallel size greater than 1, it shall fail startup.
+- [ ] **ING-EP-029**: If the state-page count (`cache_config.num_gpu_blocks`) is `None` or 0, or the active-request limit cannot be read, then `init_state` shall fail startup.
+- [ ] **ING-EP-030**: The `init_state` method shall take the state-slot count as `vllm_config.cache_config.num_gpu_blocks - 1` and the active-request limit as `vllm_config.scheduler_config.max_num_active_seqs`, or `max_num_seqs` when that is unset.
+- [ ] **ING-EP-031**: After building its routes and middleware, `init_state` shall fail startup unless core's final route table still routes each path the frontend added or replaced to the frontend's own handler.
+
+## Engine deadlines (EP)
+
+- [ ] **ING-EP-013**: When `init_state` runs, it shall read `never_fed_timeout`, `parked_idle_timeout` and `draining_timeout` from `vllm_config.additional_config["stream_admission"]`, use 15 s, 60 s and 40 s respectively for an absent section or key, and fail startup for a present value that is not a finite positive number.
+- [ ] **ING-EP-014**: When `init_state` runs, it shall fail startup unless `first_audio_timeout` is below `never_fed_timeout`, `session_idle_timeout` and `lease_call_timeout` are each below `parked_idle_timeout`, and `session_finalization_timeout` is below `draining_timeout`.
+- [ ] **ING-EP-032**: The frontend's defaults for `first_audio_timeout`, `session_idle_timeout`, `lease_call_timeout` and `session_finalization_timeout` shall be 10 s, 45 s, 45 s and 30 s, so that the default deployment passes ING-EP-014.
+- [ ] **ING-EP-034**: A test shall pin the frontend's copy of the three default stream deadlines against the core build.
+
+## Listener (EP)
+
+- [ ] **ING-EP-005**: When `start` runs, it shall create one `grpc.aio.server()` with the Riva servicer, the standard gRPC health service and server reflection registered, bind the configured address (refusing a port of 0) so that it is locally reachable before `start` returns, and keep gRPC health `NOT_SERVING` until admission opens.
+- [ ] **ING-EP-035**: When `start` has started the fault collector and the listener monitor, it shall open admission as its last step and set gRPC health to `SERVING`, so that no owner is admitted before `start` completes.
+- [ ] **ING-EP-008**: If `start` fails after the bind, then the plugin shall cancel the fault collector and the listener monitor if it created them, stop the server with no grace, call `factory.teardown_all()` and re-raise.
+- [ ] **ING-EP-009**: The `ready(state)` method shall read attributes only and return true only while the gRPC listener is serving, the plugin is not draining or torn down, and no cleanup fault is recorded.
+- [ ] **ING-EP-007**: When core calls `attach_router`, the plugin shall add the bootstrap and operational routes, the file route (ING-FILE-003) and the WebSocket dispatcher as middleware, and the dispatcher shall run inside core's middleware so that `--api-key` authentication applies to claimed scopes.
+
+## Shutdown (EP)
+
+- [ ] **ING-EP-010**: When `drain(state, timeout)` runs, the plugin shall compute the deadline `D` as `now + timeout - engine_reserve` with `engine_reserve` equal to `max(5 s, 10% of timeout)`, shall set gRPC health to `NOT_SERVING` and close admission, and shall bound every wait and lease call inside `drain` by the time remaining to `D`.
+- [ ] **ING-EP-036**: During `drain`, the plugin shall let owners finish normally until the settle point `D - min(5 s, (D - now) / 4)`.
+- [ ] **ING-EP-037**: At the settle point the plugin shall raise the shutdown trigger carrying `D` for every remaining stream owner, and shall own only that trigger and `D` (ING-LIFE-023 defines the owner's sequence).
+- [ ] **ING-EP-038**: At the settle point the plugin shall end every remaining file request through its cancellation path (ING-FILE-028 to ING-FILE-030), whose wait for settlement is bounded by the smaller of `session_cleanup_timeout` and the time remaining to `D`; unsettled children stay under their owner until `stop` (ING-FILE-031).
+- [ ] **ING-EP-039**: After the settle point the plugin shall stop the gRPC server with the time remaining to `D` as the grace period, then call `factory.drain(D)`, wait on its cleanup tasks until `D` and log the faults it returns.
+- [ ] **ING-EP-040**: If `timeout` is not larger than `engine_reserve`, then `drain` shall skip the graceful phase, explicitly cancel every owner so that each takes its abnormal path, and then stop the gRPC server and call `factory.drain` with the time remaining.
+- [ ] **ING-EP-041**: When `drain` is cancelled, it shall cancel the owners without awaiting their cleanup and re-raise, and shall honour cancellation at every await.
+- [ ] **ING-EP-011**: When `stop(state)` runs, it shall mark the plugin torn down, call `factory.teardown_all()`, cancel the owners, the fault collector and the listener monitor, stop the gRPC server with no grace, wait once for the cancelled tasks with a 1 s bound, and return whether or not they finished.
+- [ ] **ING-EP-042**: The `stop` method shall await no engine work and make no direct engine call.
+- [ ] **ING-EP-043**: While the plugin is torn down, each stream owner shall skip `abort` and `release` and call its lease's synchronous `teardown()`, and a file owner shall follow ING-FILE-031.
+
+## Owners and faults (EP)
+
+- [ ] **ING-EP-012**: The plugin shall register one owner task per admitted gRPC stream, Realtime WebSocket session, `Recognize` call and file-route request, shall start no task outside the registry apart from the fault collector and the listener monitor, and shall leave every engine-facing task of a session to the factory.
+- [ ] **ING-EP-015**: While serving, a frontend task shall call `factory.drain` with an immediate deadline every second, serialized with the shutdown `drain` call, and record the cleanup faults it returns.
+- [ ] **ING-EP-016**: A frontend task shall watch the gRPC server's termination and treat an exit not caused by `drain`, `stop` or `start`'s own rollback (ING-EP-008) as a fault.
+- [ ] **ING-EP-017**: When any stream-path call fails with reason `engine_dead`, the fault collector records a fault, or the listener exits unexpectedly, the plugin shall record the fault so that `ready` is false and call `state.request_shutdown()`.
+- [ ] **ING-EP-044**: When a session's cleanup bound expires, the plugin shall not treat that expiry as an escalation trigger.
+- [ ] **ING-EP-045**: The plugin shall not escalate for engine death on the file path, which core's own engine watchdog handles.
+
+## Configuration (EP)
+
+- [ ] **ING-EP-018**: When `init_state` reads `additional_config["riva_frontend"]`, it shall fail startup for an unknown key, an explicit `null`, a non-finite or non-positive number, or an integer option given a non-integer, shall name the key `riva_frontend` and the offending option in the error, and shall report all failures together.
+- [ ] **ING-EP-046**: The plugin shall define no `plugin_shutdown_grace` option and shall take its shutdown budget from core's `--shutdown-timeout`.
+- [ ] **ING-EP-055**: When `grpc_keepalive_seconds` is set, `start` shall create the gRPC server with the keepalive ping interval set to that value (`grpc.keepalive_time_ms` equal to the value times 1000), and when it is unset shall set no keepalive option.
+- [ ] **ING-EP-047**: The plugin shall default the gRPC and listener options to `grpc_bind` `0.0.0.0:50051`, `grpc_receive_max_bytes` 33,619,968, `grpc_config_envelope_max_bytes` 65,536, `unary_max_encoded_audio_bytes` 33,554,432, `unary_max_decoded_duration_seconds` 600, `max_riff_header_bytes` 1,048,576 and `pre_submit_max_samples` 65,536, with `grpc_keepalive_seconds` and `max_session_duration` off unless set.
+- [ ] **ING-EP-048**: The plugin shall default the timeouts to `preconfiguration_timeout` 30 s, `session_cleanup_timeout` 30 s, `file_gate_wait_timeout` 30 s, `http_body_read_timeout` 120 s and `response_send_timeout` 60 s, and `file_execution_timeout` to `max(300 s, 2 * unary_max_decoded_duration_seconds)`.
+- [ ] **ING-EP-049**: The plugin shall default the WebSocket and HTTP limits to `ws_receive_max_bytes` 16,777,216, `ws_event_envelope_max_bytes` 8,388,608, `http_multipart_envelope_max_bytes` 33,816,576, `http_content_type_max_bytes` 4,096, `http_multipart_boundary_max_bytes` 200, `http_multipart_max_parts` 32, `http_multipart_max_header_bytes` 8,192 and `http_text_field_max_bytes` 4,096.
+- [ ] **ING-EP-050**: When `init_state` validates configuration, it shall fail startup unless the gRPC receive relation of ING-GRPC-030 and the WebSocket receive relation of ING-NIMWS-012 hold, `max_riff_header_bytes` is at most `unary_max_encoded_audio_bytes`, and `grpc_bind` is `host:port` with the port in 1 to 65535.
+- [ ] **ING-EP-051**: The plugin shall read its `session_factory` option as the entry-point name that selects one factory when several accept, defaulting to unset.
+- [ ] **ING-EP-052**: When `init_state` validates `deployment_image`, `pin`, `precision_policy` and `resampler_identifier`, it shall fail startup for a value with leading or trailing whitespace or containing `://`, and for a bare hexadecimal token of 8 to 64 characters in any of them except `pin`.
+- [ ] **ING-EP-053**: The plugin shall default `deployment_image` and `pin` to the literal `unspecified`, `precision_policy` to `fp32-bringup-v1` and `resampler_identifier` to `scipy-poly-v1`, and shall fail startup if `resampler_identifier` differs from the built-in identifier.
+
+## Deployment (EP)
+
+- [ ] **ING-EP-019**: A check shall parse the repository's documented deployment manifest and fail unless it sets `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming`, passes the frontend's options (and `stream_admission` when its defaults are changed) through `--additional-config`, and sets a `--shutdown-timeout` above the engine's `draining_timeout`.
+- [ ] **ING-EP-054**: A check shall parse the repository's documented deployment manifest and fail unless its `supported_num_lookahead_tokens` contains 6 and its `--max-model-len` covers the longest file `unary_max_decoded_duration_seconds` admits at the manifest's file cadence (at least 76,114 for a 600 s file at 560 ms).
+
+## Ingress cap, admission and memory (ADM)
+
+- [ ] **ING-ADM-007**: The frontend shall keep one finite positive ingress cap (`load_shed_max_sessions`, default 64) counting active owners across `StreamingRecognize`, `Recognize`, the Realtime WebSocket and the file route, excluding core's `/v1/realtime`, `GetRivaSpeechRecognitionConfig`, the bootstrap POST and the operational routes; before reading the first message or request body, parsing multipart, or calling `open`, a handler shall atomically check that the plugin is serving and the count is below the cap and register its owner when both hold.
+- [ ] **ING-ADM-011**: When the plugin is draining or not serving, a handler shall answer `service_unavailable`, and when the ingress cap is full it shall answer retryable `busy` with `authority: load_shed`, in both cases creating no owner, lease or file permit.
+- [ ] **ING-ADM-012**: While the ingress count is below the cap, the counter shall not emit `admitted`, claim residency, reserve engine capacity or queue, and sessions already open shall continue unchanged.
+- [ ] **ING-ADM-013**: An accepted owner shall stay registered through terminal cleanup.
+- [ ] **ING-ADM-008**: When `open` raises `SessionRefused` with reason `capacity` or `active_limit` (SESS-OPEN-004), the surface shall consume no audio and answer `busy` carrying `authority: provider`, Riva shall invent no success acknowledgement, and the Realtime configuration acknowledgement shall not be relabelled as admission.
+- [ ] **ING-ADM-009**: The frontend shall bound every read and wait of an admitted owner (the first message by `preconfiguration_timeout`, a file request's body read by `http_body_read_timeout`, a file-gate wait by `file_gate_wait_timeout`), and a client disconnect shall release the owner's registry entry, ingress-cap count, permit, multipart memory and lease.
+- [ ] **ING-ADM-010**: File owners (gate waiters, body readers and executing files of `Recognize` and the file route) shall count against the sub-cap `max_file_owners`, which shall be at least `max_concurrent_files` and below `load_shed_max_sessions`, and a file request arriving at a full sub-cap shall answer `busy` with `authority: load_shed`.
+- [ ] **ING-ADM-014**: While complete files are enabled, the default `max_file_owners` shall be `max_concurrent_files + 2` and the default `max_concurrent_files` shall be `min(4, max(1, floor(min(slots, active limit) / 4)))`; while complete files are disabled or core's transcription service is absent, both values shall be 0, no file gate shall be built, and `Recognize` and the file route shall create no owner.

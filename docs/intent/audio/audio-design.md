@@ -65,10 +65,23 @@ files leaves) and have no residual.
 
 ## Resampling
 
-8 kHz input is resampled to 16 kHz by a pinned polyphase resampler (an exact integer ratio of 2,
-fixed Kaiser-window FIR parameters, state carried across pieces, finite lookahead drained once on
-flush), identified by the named value `scipy-poly-v1`. The output does not depend on how the input was
-split into pieces. The identifier is published in the deployment provenance for any result produced
+8 kHz audio that the frontend decodes itself (the streaming surfaces and `Recognize`; core decodes
+the file route's audio) is resampled to 16 kHz by a pinned polyphase resampler identified by the
+named value `scipy-poly-v1`. Its parameters are fixed:
+
+- upsampling ratio 2 (up 2, down 1);
+- one low-pass FIR of 41 taps (half-length 20), designed with a Kaiser window of beta 5.0 and a
+  cutoff at 4 kHz (the 8 kHz input's Nyquist frequency, half the 16 kHz output's), scaled by the
+  ratio 2;
+- the filter's 20-sample output delay discarded once at the start, and its 20-sample lookahead
+  drained once on flush;
+- filter state carried across pieces.
+
+These are the parameters `scipy.signal.resample_poly` uses for `up=2, down=1` with its default
+window, and they are the reference: for any split of an input into pieces, the concatenated output
+equals `resample_poly(x, up=2, down=1)` of the whole input within an absolute tolerance of 1e-6 (the
+existing frontend test pins this). The output does not depend on how the input was split into
+pieces. The identifier is published in the deployment provenance for any result produced
 from resampled input (operations leaf), and `resampler_identifier` in configuration must equal the
 built-in identifier: it is a fact of the build, not a choice. Parity and golden comparisons stay at
 16 kHz native; 8 kHz comparisons are normalized comparisons, not exact matches.

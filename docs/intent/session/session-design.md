@@ -119,7 +119,12 @@ message first is `protocol_order`: gRPC `FAILED_PRECONDITION`; Realtime `error`,
 
 The handler reads exactly that message, validates it fully (either a concrete accepted audio cell,
 or the dialect's explicit deferred-RIFF declaration; the streaming leaf lists the checks), calls
-`open`, and only then advances the gRPC request iterator or receives another WebSocket message.
+`open`, and only then advances the gRPC request iterator or receives another WebSocket message,
+with one exception: after a rejected initial configuration the Realtime handler stays
+unconfigured and receives further `transcription_session.update` events until one validates and
+`open` succeeds, all within the original `preconfiguration_timeout`, which a retry does not
+reset. No audio is admitted before `open` succeeds; any other event in that interval is the
+wrong-first-message case.
 Pipelined audio before `open` remains under transport flow control and enters no frontend buffer.
 In deferred-RIFF mode the handler holds at most `max_riff_header_bytes` after `open` and calls no
 `feed` until the concrete cell resolves.
@@ -171,10 +176,11 @@ all surfaces:
    final; its projection is in the errors leaf.
 
 If `flush` fails, or cancellation, a deadline, a disconnect, an idle timeout or an abort during
-shutdown wins before normal completion, the owner calls `abort`, then `release`, and never `finish`.
-`finish` and `abort` are mutually exclusive, and `release` never precedes the selected terminal
-cleanup. A lease that has already been flushed is never aborted (the model forbids it): its cleanup
-goes to `release`.
+shutdown wins before normal completion, the owner uses only the calls the lease's state allows: an
+open or failed lease takes `abort`, then `release`, and never `finish`; a lease that has already
+been flushed is never aborted (the flushed state allows only `finish`, `release` and `teardown`),
+and its cleanup goes to `release`. `finish` and `abort` are mutually exclusive, and `release` never
+precedes the selected terminal cleanup.
 
 ### Shutdown finalization
 
@@ -252,7 +258,8 @@ serialized by the owner.
 | Selected outcome | Calls |
 | --- | --- |
 | Normal | `flush` (success), `finish`, `release`; wire final after both |
-| Any other cause with a lease | `abort`, then `release` |
+| Any other cause, lease `open` or `failed` | `abort`, then `release` |
+| Any other cause, lease `flushed` | `release` only: a flushed lease does not accept `abort` |
 | Cause selected while `open` is pending | cancel `open`; no lease call (the factory owns the cancelled `open`) |
 | `finish` fails or is cancelled after a successful `flush` | `release` only: the stream already ended normally at `flush`, and a flushed lease does not accept `abort` |
 | `stop` (torn-down plugin) | the lease's synchronous `teardown()` only |
@@ -263,8 +270,11 @@ stream into an abort.
 
 Terminal cleanup runs under one finite positive `session_cleanup_timeout`, shared by its calls; while
 the plugin is draining, the bound is instead the time remaining to the drain deadline. The owner
-always reaches `release`: if `abort` consumed the budget, `release` still runs and is cancelled at
-once, which hands the session to the factory (`SESS-REL-003`). When the cleanup bound expires, the
+always reaches `release`: if `abort` consumed the budget, the owner cancels `abort`, calls
+`release` and cancels it once it has begun, which hands the session to the factory
+(`SESS-REL-003`). The seam conformance suite verifies that a factory's lease accepts `release`
+after a cancelled `abort` and that the cancelled `release` leaves the session with the factory's
+cleanup. When the cleanup bound expires, the
 owner stops waiting and the factory's cleanup owns the session. This is not an escalation (vehicle
 leaf). A cleanup failure whose reason is `engine_dead` is an escalation; any other cleanup failure
 is recorded and never replaces the primary result.
@@ -368,8 +378,8 @@ its sessions, including the cleanup of a session whose owner is gone.
    segment completions. A stream's one final at the end is the behaviour until both are designed
    together with the frontend; then multi-utterance reuse of a session is revisited.
 2. A cleanup that expires while its `abort` is cancelled mid-flight leaves the factory to retire the
-   session through the cancelled `release`; if the model plugin adds a state where `release` is not
-   accepted after a cancelled `abort`, this leaf's cleanup order is re-checked against it.
+   session through the cancelled `release`. This cleanup order relies on the model plugin's
+   SESS-ABORT-002: a cancelled `abort` leaves the lease `aborted`, where `release` is allowed.
 
 ## References
 

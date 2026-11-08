@@ -276,9 +276,10 @@ does not join the honoured OpenAI enum.
 The first update's sections are dispositioned field for field like the gRPC table:
 `recognition_config`, `speaker_diarization`, `word_boosting`, `endpointing_config`,
 `custom_configuration`. `input_audio_transcription.model` is empty or the served identity;
-`input_audio_transcription.language` follows the locale rule. The default object round-trips
-without rejection: a section becomes non-default only through its enable toggle, non-zero windows or
-non-emptiness. A non-empty `input_audio_transcription.prompt` and `modalities` other than
+`input_audio_transcription.language` follows the locale rule. While the factory's `default_locale`
+is set, the default object round-trips without rejection; when it is `None`, the default object's
+language is empty and the client must name a locale. A section becomes non-default only through
+its enable toggle, non-zero windows or non-emptiness. A non-empty `input_audio_transcription.prompt` and `modalities` other than
 `["text"]` are rejected as capability or configuration errors. `id`, `object`, `client_secret` and
 `provenance` are echo keys, not configuration. Unknown keys answer `invalid_config_field` naming the
 dialect-native field. Rejections name the dialect's own field names.
@@ -293,7 +294,7 @@ complete corrected update can succeed. The first `transcription_session.updated`
 When end-of-utterance is enabled, utterance segmentation implements the public protocol's
 documented window and threshold semantics (`start_history` and `start_threshold`, `stop_history` and
 `stop_threshold`, `stop_history_eou` and `stop_threshold_eou` of `EndpointingConfig`) over the
-per-unit blank and non-blank mask that the model plugin reports (`SESS-EP-002`, not yet specified).
+per-unit blank and non-blank mask that the model plugin reports (a report the model plugin does not yet specify).
 On an end-of-utterance the session emits a segment final and requests the decoder-state reset
 through the model plugin's segment-completion reporting. Until that lands, non-default
 `endpointing_config` is rejected per the disposition tables; when it lands, the six fields become

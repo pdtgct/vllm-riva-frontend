@@ -94,7 +94,8 @@ produces. `authority` is carried by `busy` only.
 ## Phase-specific mapping (authoritative)
 
 This table is the one place that fixes, for a streaming session, which code, gRPC status, Realtime
-event and close follow from the phase and cause. Other leaves refer to it and restate none of it.
+event and close follow from the phase and cause. Other leaves refer to it; where another leaf
+states one of these values, this table governs on any conflict.
 
 | Phase and cause | Code | gRPC | Realtime event, close |
 | --- | --- | --- | --- |
@@ -206,12 +207,12 @@ The file route's own errors:
 
 | Failure | Code | HTTP |
 | --- | --- | --- |
-| guard refusals (`use_beam_search`, completion limit, client `vllm_xargs`) | `invalid_config_field` | 400 |
+| guard refusals (`use_beam_search`, completion limit, sampling fields, ignored fields, `vllm_xargs` keys other than `locale`, unknown form fields) | `invalid_config_field` | 400 |
 | missing, duplicate or malformed fields; bad multipart structure | `malformed_request` | 400 |
-| unknown locale; no locale and no default | `unknown_locale`, `invalid_config_field` | 400 |
+| unknown `locale` in a client `vllm_xargs` | `unknown_locale` | 400 |
 | body, content type, boundary, part or text field above its bound | `request_too_large` | 413 |
 | body read timeout (a stalled upload) | `request_timeout` | 408 |
-| core execution or response send timeout | `request_timeout` | 504 |
+| core execution or response send timeout | `request_timeout` | 504 before response headers; after headers the event stream is terminated |
 | files disabled on this server | `unsupported_capability` | 501 |
 | cancelled by shutdown | `service_unavailable` | 503 before headers; after headers the event stream is terminated |
 | draining; ingress cap full; gate wait expired | `service_unavailable`; `busy`; `busy` | 503 |
