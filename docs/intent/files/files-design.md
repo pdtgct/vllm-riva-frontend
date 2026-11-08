@@ -235,48 +235,80 @@ a minimal Starlette `Request` from a synthetic scope `{"type": "http", "headers"
 per-request metadata to its `state` (which Starlette creates on demand); it reads no body and polls
 no disconnect, so the minimal scope is sufficient.
 
-The frontend does not rely on closing generators to stop inference. Core's transcription wrappers
-forward results without `finally` blocks, and the engine aborts a request only when its innermost
-result generator is closed or finalized (`AsyncLLM.generate`), which nothing guarantees once the
-outer generator has returned or is suspended at a `yield`. So on client disconnect, deadline,
-shutdown or any failure the route's owner calls the engine client's `abort(<engine request ID>)`
-itself, within the bound below. This holds equally while the
-route is suspended at a yield of a streaming response, and for a request that already returned its
-event generator. Cancelling the child that made the call, or closing the outer generator, is never
-treated as ending the engine request.
+The frontend does not rely on core's cancellation handling or on closing generators to stop
+inference. Core aborts the engine request when its awaited call is cancelled, but the owner never
+cancels that call: core decodes audio on an executor thread, so a cancelled await would release the
+frontend's accounting while the thread still holds the audio; a request can still be submitted to
+the engine after a cancelled await; and for `stream=true` the call has already returned an event
+generator, whose remaining work no cancellation of the call reaches. So on client disconnect,
+deadline, shutdown or any failure the route's owner calls the engine client's
+`abort(<engine request ID>)` itself, within the bound below. This holds equally while a pull of a
+streaming response's generator is outstanding. Cancelling the child that made the call, or closing
+the outer generator, is never treated as ending the engine request.
 
-**Structured ownership.** The route does not rely on core's `with_cancellation` either: it spawns a
-handler task and a disconnect-listener task and cancels the pending one without awaiting it. The
+**Structured ownership.** The route does not rely on core's `with_cancellation` either: it spawns
+a handler task and a disconnect-listener task and cancels the pending one without awaiting it. The
 route's owner task owns the core call (a child task) and the disconnect watcher (a second child).
-The owner never cancels the core call (only `stop` does, below): core decodes audio on an executor thread, and cancelling the
-await would release the frontend's accounting while that thread still holds the audio, and a call
-cancelled during decoding never reaches the engine anyway. Instead, on a disconnect, cancellation,
-shutdown or timeout while the core call is executing (until it returns, and for a returned event
-stream until the generator is exhausted) the owner aborts the engine request ID, and repeats the abort every
-250 ms until the core call returns on its own (a decode in progress finishes, the request
-reaches the engine, and the repeated abort ends it); it then cancels the disconnect watcher and,
-for a returned event stream, closes the generator. The owner waits for settlement for at most
-`session_cleanup_timeout` (during drain, by the smaller of that and the time left to the drain
-deadline); the bound limits the wait, not the settlement, which can outlast it (below). Aborting an ID the engine does not know is harmless. The same contract applies to
-`Recognize`, whose engine request ID is fixed by its synthetic request. The owner keeps its permit and its
-file-owner slot until the children have settled: accounting is never released while work it covers
-still runs. A child that has not settled when the bound expires stays under the owner, which
-remains registered and keeps its permit and slot, and `stop` cancels it; the stuck permit is
-visible rather than hidden. A disconnect before the permit is taken discards only multipart memory, with no abort.
-A disconnect after the service completed normally and during the response send suppresses the
-response only, with no abort.
+The owner never cancels the core call (only `stop` does, below).
+
+A file request passes four milestones: the permit; the return of core's service call, once core's
+preprocessing (decode and prompt construction) is done, which for `stream=true` returns an event
+generator; the exhaustion of that generator (`stream=true` only); and the delivery of the response.
+The owner alone advances the event generator, one pull at a time. Pulls never overlap, so the
+generator is never closed while a pull is running.
+
+**One terminal cause.** The owner records exactly one terminal cause at its operation boundaries:
+the permit, the call's return, each generator pull and each response send. A client disconnect or
+RPC cancellation observed before any cause is selected wins and produces no response. Otherwise the
+first of shutdown, a deadline (compared by the errors leaf's deadline rule) or a failure stays
+primary and decides the response. A disconnect observed after a cause was selected suppresses the
+response and leaves the recorded cause unchanged. A later abort, close or settlement failure never
+changes the response.
+
+**Abort and settlement.** When a cause is selected after the permit and before the call has
+returned or, for `stream=true`, before the generator is exhausted, the owner aborts the engine
+request ID and repeats the abort every 250 ms until the call has returned and any outstanding pull
+has finished (a decode in progress finishes, the request reaches the engine, and the repeated abort
+ends it). Core submits the request to the engine lazily, on the generator's first pull, so an abort
+sent before submission finds nothing and a pull can submit the request between two retries.
+Therefore, once the call has returned and any outstanding pull has finished, the owner sends one
+final awaited abort for the ID, before it closes the generator and before any accounting is
+released. It then cancels the disconnect watcher and, for a returned event generator, closes it with
+`aclose`. Aborting an ID the engine does not know is harmless. The cleanup deadline starts when the
+cause is selected and covers the abort retries, the final abort, the generator's close and the
+children's settlement: `session_cleanup_timeout`, or during drain the smaller of that and the time
+left to the drain deadline. The bound limits the wait, not the settlement, which can outlast it.
+The same contract applies to `Recognize`, whose engine request ID is fixed by its synthetic request.
+
+**Cleanup continuation.** A file request's cleanup is a cleanup continuation registered in the owner
+registry with the request's record. It owns the abort retries, the final abort, the generator's
+close, the children's settlement and the exactly-once release of the permit, the file-owner slot
+and the server-load count: accounting is never released while work it covers still runs. Normally
+the owner runs the continuation to its end before it returns. When the cleanup bound expires first,
+the handler sends its response, if any, and transfers ownership of the remaining cleanup to the
+continuation; the record stays registered, with the permit, slot and count, until the continuation
+finishes, and `stop` cancels the continuation and the children it holds. The stuck permit is
+visible rather than hidden. A disconnect before the permit is taken discards only multipart memory,
+with no abort. A cause selected after the service completed normally (the call returned for a
+complete response, the generator exhausted for `stream=true`), including a disconnect during the
+response send, suppresses the response only, with no abort.
 
 **Load accounting.** The route does its own server-load accounting instead of calling core's
 `load_aware_call`: when `enable_server_load_tracking` is set, the owner increments
-`server_load_metrics` when it is admitted and decrements it exactly once in a `finally` at the
-end of the owner, after settlement and after the response send finished or failed. Core's
-decorator catches only `Exception`, so cancellation could leak its counter, and its decrement
-rides on a response background task that does not run when a send fails; a decrement owned by the
-owner's own `finally` is exactly once on normal completion, cancellation and failed sends.
+`server_load_metrics` when it is admitted, and the cleanup continuation decrements it exactly once,
+after settlement and after the response send finished or failed, whether the owner ran the
+continuation itself or handed it over. Core's decorator catches only `Exception`, so cancellation
+could leak its counter, and its decrement rides on a response background task that does not run
+when a send fails; a decrement owned by the continuation is exactly once on normal completion,
+cancellation, failed sends and a handler that answered before settlement.
 
 **Deadline and streams.** `file_execution_timeout` is an absolute deadline from the permit to the
-end of the response, and for `stream=true` it runs through exhaustion of core's event generator,
-not around `create_transcription` alone. Before response headers are sent, any failure is an
+return of core's service call, and for `stream=true` to the exhaustion of core's event generator,
+not around `create_transcription` alone. Delivery after that point is governed only by
+`response_send_timeout` for each send, so a complete response whose inference finished within the
+deadline is not turned into a timeout by a slow send. For `stream=true` the deadline includes
+delivery pacing: each pull of the generator waits until the previous event has been sent, so a slow
+event-stream reader consumes `file_execution_timeout`. Before response headers are sent, any failure is an
 ordinary HTTP error in core's shape. After headers are sent, a failure ends the event stream with
 core's streaming error event shape when it can be serialized, or closes the connection; an HTTP
 status is never sent after headers. On shutdown the route answers `service_unavailable` (503
@@ -289,7 +321,10 @@ stream whose generator is not exhausted, the engine request is aborted; after th
 normally, delivery is suppressed and nothing is aborted. In both cases the permit is released after
 settlement.
 
-Core's own errors pass through unchanged.
+Core's own errors pass through unchanged: a returned `ErrorResponse` is returned as core's route
+returns it, and a raised exception is re-raised from the route handler (the owner carries it out of
+the core-call child), so that core's application exception handlers shape it as they shape core's
+own route.
 
 ## `Recognize`
 
@@ -317,10 +352,12 @@ accepts is not rejected by core's decoder.
 
 **After handing the request to core.** Core's execution is bounded by `file_execution_timeout`, for
 `Recognize` and the route alike; its default is `max(300 s, 2 * unary_max_decoded_duration_seconds)`
-(1200 s at the defaults), generous so legitimate long files are not cut. The terminal deadline for
-`Recognize` is the earlier of that bound and the RPC's absolute deadline. Expiry of the bound is
-`request_timeout`; cancellation or deadline expiry aborts the engine request, settles under the
-rules above and releases the permit before the RPC returns, and emits no response. Engine death while a file runs is core's to
+(1200 s at the defaults), generous so legitimate long files are not cut. The RPC's absolute deadline
+applies to `Recognize` from servicer entry, through validation, the gate wait and execution; where
+it and `file_execution_timeout` both apply, the earliest wins under the errors leaf's precedence
+rule. Expiry of the bound is
+`request_timeout`; cancellation or deadline expiry aborts the engine request and settles under the
+rules above, the permit being released after settlement, and emits no response. Engine death while a file runs is core's to
 handle through its own engine watchdog; the frontend does not escalate for it (vehicle leaf).
 
 **Server-load accounting.** `Recognize` has no HTTP request, so it is outside the server-load
@@ -332,8 +369,8 @@ model's `ValueError` from `get_generation_prompt`, decoder `ValueError`s such as
 an exceeded duration limit, and `VLLMValidationError`). The errors leaf's classification of raised
 exceptions is authoritative. A file that exceeds the model's token budget (the model's `ValueError`, which core returns as 400)
 projects `request_too_large` for `Recognize` (`RESOURCE_EXHAUSTED`); on the route the response stays
-core's own 400. The frontend identifies the refusal by the model's budget message, shared with and
-pinned by a test in the model plugin repository. There is no startup relation between the duration
+core's own 400. The frontend identifies the refusal by the fixed prefix `file exceeds max_model_len: ` with which
+the model plugin begins that message (its FILE-BUD-003), pinned by tests on both sides. There is no startup relation between the duration
 cap and `max_model_len`: the budget depends on the model's emission bound, which the frontend cannot
 compute, so a file the frontend accepts can still be refused by the model.
 
@@ -370,10 +407,10 @@ of this budget.
 ## Equivalence
 
 A complete file's transcript equals the transcript of a factory session fed the same audio at the
-cadence core's file path uses, the manifest's `num_lookahead_tokens` (ING-EP-054); the factory
+cadence core's file path uses, the deployment guide's `num_lookahead_tokens` (ING-EP-058); the factory
 accepts any served cadence, so the comparison opens its session at that cadence. It is not the
 output of the frontend's 560 ms streaming surface, which is a different lookahead arm unless the
-file path's cadence is also 560 ms. Under matched conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
+file path's cadence is also 560 ms (it is 1120 ms in the reference deployment). Under matched conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
 applied to the stream side too (audio leaf); the same cadence, locale, precision and endpointing
 setting (the model plugin's file design states the model's side). The frontend's contribution is
 that the decoded samples it hands to core are exactly the samples the stream side would hand to
@@ -397,13 +434,17 @@ failure.
 | Gate size | Below both the slot count and the active-request limit; files disabled (route stays registered, refuses with 501) when capacity is below 2 and no cap is configured | Equal to the limit | A full gate must leave slots for streams |
 | Ownership of the core call | The route's owner task owns the call and the disconnect watcher; it never cancels the call, aborts the engine ID repeatedly until the call returns, and holds accounting until then | Core's `with_cancellation`; cancelling the call child | The decorator does not await the cancelled child, and cancelling the await leaves core's executor-thread decode holding audio outside the frontend's accounting |
 | Stream deadline | Absolute through generator exhaustion | A timeout around `create_transcription` | For `stream=true` the call returns before the work is done |
-| Stopping inference | The route fixes the engine request ID through `X-Request-Id` and calls `abort` itself | Close the generator; cancel the call child | Core's wrappers have no `finally`, and the engine aborts only when the innermost generator is closed, which is not guaranteed once the outer one returned or is suspended |
-| Accounting on unsettled children | The owner keeps its permit and file-owner slot until they settle | Hand off to a bounded cleanup capacity | Releasing accounting while work still runs would let new files overcommit slots |
-| Server-load counter | The owner increments and decrements itself, once, in a `finally` | Wrap `load_aware_call` | The core decorator misses cancellation and failed sends |
+| End of the execution deadline | The core call's return, or generator exhaustion for `stream=true`; each send bounded separately | The end of the response | A complete response whose inference finished in time should not become a timeout because a send was slow; the send bound covers its delivery. For `stream=true`, pulls wait on sends, so the deadline includes delivery pacing and a slow reader consumes it |
+| File terminal cause | One cause at operation boundaries; a disconnect observed before any cause wins; otherwise the first of shutdown, deadline or failure; a later disconnect suppresses the response and keeps the recorded cause | Priority by kind; the last cause wins | Racing causes must yield one testable response; a client that left receives nothing either way |
+| Event generator | Advanced and closed by the owner alone, one pull at a time; aborts repeat until any outstanding pull has finished | Close it from the cancelling task | An asynchronous generator cannot be closed while a pull is running, and the pull ends only when the abort reaches the engine |
+| Stopping inference | The route fixes the engine request ID through `X-Request-Id` and calls `abort` itself | Close the generator; cancel the call child | Core aborts on cancellation of its awaited call, which the owner never cancels (its decode runs on an executor thread outside the frontend's accounting); a request can still be submitted after a cancelled await; and a returned event generator is out of that call's reach |
+| Accounting on unsettled children | A registered cleanup continuation keeps the permit, file-owner slot and load count until they settle and releases each exactly once | Hand off to a bounded cleanup capacity; release in the handler's `finally` | Releasing accounting while work still runs would let new files overcommit slots, and a handler that has answered can no longer run a `finally` for work that settles later |
+| Final abort | One awaited abort after the call returned and any pull finished | Stop at the call's return | Core submits lazily, so earlier aborts can all precede submission |
+| Server-load counter | The owner increments when admitted; the owner or its cleanup continuation decrements exactly once after settlement and the send | Wrap `load_aware_call` | The core decorator misses cancellation and failed sends |
 | Ignored fields | Explicit non-default `n`, `length_penalty`, `include_stop_str_in_output` refused | Accept silently | Unsupported features are refused, never ignored |
 | Request fields | Explicit allowlist; explicit non-default sampling refused; inherited values not inspected | Pass unknown fields to core; refuse inherited values | Extra fields would reach the model unvalidated; inherited values are operator configuration |
 | File owners | Counted in `max_file_owners` inside the ingress cap | A shared cap | A backlog of waiting files must not refuse streams |
-| Equivalence reference | A factory session at the cadence core's file path uses (the manifest's `num_lookahead_tokens`, ING-EP-054) | The 560 ms streaming surface | The file runs at that cadence and the factory serves any served cadence, so the comparison is exact |
+| Equivalence reference | A factory session at the cadence core's file path uses (the deployment guide's `num_lookahead_tokens`, ING-EP-058) | The 560 ms streaming surface | The file runs at that cadence and the factory serves any served cadence, so the comparison is exact |
 | Over-budget file | `request_too_large` for `Recognize`, no startup relation to `max_model_len` | `INVALID_ARGUMENT`; a startup check | The file is too large for the configured model length; the frontend cannot compute the model's budget |
 | `Recognize` accounting | Outside the server-load counter | Count it too | The counter reports HTTP load; the synthetic request exists only to fix the engine request ID |
 | Gate placement | In the frontend, before `generate` | Core's queue | A queued file counts against the active-request limit and refuses streams |

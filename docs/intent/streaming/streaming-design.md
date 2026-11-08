@@ -147,6 +147,20 @@ the audio:
   of the stream"; any other length is explicit and truncates the audio at that many bytes; chunks
   after `data` are ignored.
 
+### Message limits
+
+`init_state` requires finite positive `unary_max_encoded_audio_bytes`,
+`unary_max_decoded_duration_seconds`, `max_riff_header_bytes` and `grpc_config_envelope_max_bytes`.
+`grpc_receive_max_bytes` equals the encoded-audio limit plus the envelope allowance. That framework
+message cap applies to every request message of both RPCs: a message above it may be rejected by
+gRPC itself with its native `RESOURCE_EXHAUSTED` framing error before the servicer runs, the one
+exception to the stable catalog-detail rule.
+
+The size and duration limits below are unary only. A `StreamingRecognize` message is limited only
+by the framework cap and is decoded in bounded slices (audio leaf), and a stream's total duration is
+unlimited unless `max_session_duration` is set. A resource or decode failure after `open` ends the
+session with abnormal lease cleanup (session leaf) and its phase-table code.
+
 ### Unary `Recognize` request handling
 
 The handler for `Recognize` runs here up to the point where it hands audio to the files leaf's path.
@@ -154,16 +168,11 @@ It processes request audio in bounded memory and performs no filesystem write, l
 retained upload artifact on success, rejection, cancellation, deadline or failure; client fixture
 reads and test-result writes are outside this prohibition.
 
-`init_state` requires finite positive `unary_max_encoded_audio_bytes`,
-`unary_max_decoded_duration_seconds`, `max_riff_header_bytes` and `grpc_config_envelope_max_bytes`.
-`grpc_receive_max_bytes` equals the encoded-audio limit plus the envelope allowance, so every
-audio-size or duration overflow the handler can reach returns `RESOURCE_EXHAUSTED` with code
-`request_too_large`, before the server opens an engine session or takes a permit. A message above
-the framework cap may be rejected by gRPC itself with its native `RESOURCE_EXHAUSTED` framing error
-before the servicer runs; that is the one exception to the stable catalog-detail rule. Before
-allocating decoded or resampled audio, the handler derives the duration from the bounded payload
-bytes and the fixed-width cell of the accept-matrix (PCM16 two bytes per sample; G.711 one byte),
-so conversion cannot create an unbounded second copy.
+For `Recognize`, every encoded-size or decoded-duration overflow the handler can reach returns
+`RESOURCE_EXHAUSTED` with code `request_too_large` before the handler takes a file-gate permit.
+Before allocating decoded or resampled audio, the handler derives the duration from the bounded
+payload bytes and the fixed-width cell of the accept-matrix (PCM16 two bytes per sample; G.711 one
+byte), so conversion cannot create an unbounded second copy.
 
 ### `GetRivaSpeechRecognitionConfig`
 
@@ -247,14 +256,20 @@ event type, or structurally invalid required fields or field types on a known ev
 state; the adapter emits one field-specific `error` with catalog code `invalid_event` when a response
 can be serialized safely, then closes 1008. A structurally valid event carrying semantically
 unsupported configuration instead takes the specific catalog code of the configuration rules below.
-Traffic that races the terminal completion observes closure and causes no second feed, final or
-state transition.
+After `input_audio_buffer.done` the owner keeps a bounded receive observer until the final's send
+begins or the shutdown trigger cancels it (session leaf). A malformed or unknown envelope it sees
+keeps `invalid_event` (1008), and a message above the receive cap keeps `request_too_large` (1009);
+every other client message (`append`, `clear`, `commit`, `done`, `transcription_session.update`)
+fails the session with `session_terminal` and suppresses the final if its send has not begun. Once
+the final's send has begun it is irrevocable and later traffic is not read.
 
 Each Realtime owner processes accepted commands through one FIFO. Every accepted
 `input_audio_buffer.append` ahead of a `clear` completes its bounded lease handoff before `clear`
-takes effect and therefore survives it. At that point `clear` drops only raw-byte residual,
-deferred-header bytes and decoded pieces still local to the frontend, acknowledges
-`input_audio_buffer.cleared`, and never cancels or rewinds audio handed to `feed`, audio the lease
+takes effect and therefore survives it. At that point `clear` discards all audio not yet handed
+to `feed`: raw-byte residual, deferred-header bytes, decoded pieces still local to the frontend and
+the resampler's pending output. It resets the resampler (FIR history, delay compensation and
+lookahead) to its initial state (audio leaf), acknowledges `input_audio_buffer.cleared`, and never
+cancels or rewinds audio handed to `feed`, audio the lease
 accepted or model state. Clearing a partial deferred RIFF header restarts the bounded scan from
 empty.
 
@@ -315,6 +330,9 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | Receive cap | The dispatcher counts bytes and closes 1009 | Read the ASGI server's limit and fail if smaller; set the server limit | A plugin cannot set the ASGI server's frame limit and the server does not expose it uniformly; counting makes the cap independent of server settings. The server's own limit still bounds what arrives before the count |
 | WebSocket `none` format | Deferred-header mode, outside the honoured enum | Honour as an OpenAI enum value | It is a client-specific declaration; keeping it separate keeps the OpenAI enum exact |
 | Incremental deltas | True suffix, one terminal `completed` | Cumulative deltas and interim completions | Deltas carry new text only, so a client concatenating them gets the transcript; one terminal event matches the stock client's `is_last_result` handling |
+| `clear` and resampler state | Discard all audio not yet handed to `feed` and reset the resampler to its initial state | Continuity across `clear` (keep FIR history and delayed samples) | `clear` means discard what is buffered; delayed samples surviving it would reach the engine after the client asked to discard them |
+| Traffic after `done` | A bounded receive observer until the final's send begins; observed traffic fails with `session_terminal` | Stop reading at `done`; let traffic race the close | Reading only between calls makes the outcome depend on timing; an observer gives one testable result |
+| Message limits | Framework cap for both RPCs; size and duration limits for `Recognize` only | Apply the unary limits to streams | A stream's duration is open-ended by design; `max_session_duration` is the option that bounds it |
 | `commit` | Advisory | Force a step | Cadence is the model's; a sub-cadence step would break equivalence with files |
 | Large legal messages | Split into feeds of at most the pre-submit bound, reads paused while feeding | Reject a message above the bound with `buffer_overflow` | A client may legally send a large message; rejecting it would turn framing choices into errors; `buffer_overflow` stays reserved at this layer |
 | RIFF `data` length | 0 and `0xFFFFFFFF` mean to end of stream; an explicit length truncates; later chunks ignored | Trust the declared length; reject unknown length | Writers that stream a WAV cannot know the length; a declared length is a promise about the file |

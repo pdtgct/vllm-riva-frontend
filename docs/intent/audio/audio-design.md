@@ -73,15 +73,19 @@ named value `scipy-poly-v1`. Its parameters are fixed:
 - one low-pass FIR of 41 taps (half-length 20), designed with a Kaiser window of beta 5.0 and a
   cutoff at 4 kHz (the 8 kHz input's Nyquist frequency, half the 16 kHz output's), scaled by the
   ratio 2;
-- the filter's 20-sample output delay discarded once at the start, and its 20-sample lookahead
-  drained once on flush;
-- filter state carried across pieces.
+- the filter's 20-sample output delay discarded once at the start of each segment, and its
+  20-sample lookahead drained once on flush;
+- filter state carried across pieces within a segment, and reset to its initial state by a Realtime
+  `clear` (streaming leaf).
 
 These are the parameters `scipy.signal.resample_poly` uses for `up=2, down=1` with its default
-window, and they are the reference: for any split of an input into pieces, the concatenated output
-equals `resample_poly(x, up=2, down=1)` of the whole input within an absolute tolerance of 1e-6 (the
-existing frontend test pins this). The output does not depend on how the input was split into
-pieces. The identifier is published in the deployment provenance for any result produced
+window, and they are the reference. A segment is the audio between the start of a stream or a
+`clear` and the next `clear` or finalization. For any split into pieces of a segment that ends at
+finalization, the concatenated output equals `resample_poly(x, up=2, down=1)` of the whole segment
+within an absolute tolerance of 1e-6 (the existing frontend test pins this); a segment that ends at
+a `clear` yields a prefix of that result, because `clear` discards everything not yet handed to
+`feed`, the resampler's pending output included. Within a segment the output does not depend on how
+the input was split into pieces. The identifier is published in the deployment provenance for any result produced
 from resampled input (operations leaf), and `resampler_identifier` in configuration must equal the
 built-in identifier: it is a fact of the build, not a choice. Parity and golden comparisons stay at
 16 kHz native; 8 kHz comparisons are normalized comparisons, not exact matches.
@@ -147,6 +151,7 @@ is used only by the comparison; live streams are not requantized.
 | Compressed streams | Rejected in the streaming path | Add FLAC/Opus decoders | Codec dependencies with no constituency among Riva streaming clients; the file route has core's decoders |
 | Whole-sample carry | Byte-level residual | Decode what arrives | A straddling sample decoded as halves corrupts audio and drifts accuracy for reasons unrelated to the model |
 | Resampler | Polyphase FIR, pinned and named | A newer or faster resampler | The identity is part of a result's fingerprint; changing it is a versioned change (`scipy-poly-v1` -> new name) |
+| Resampler across `clear` | Reset to the initial state; pending output discarded | Continuity across `clear` | `clear` means discard what is buffered; delayed samples surviving it would reach the engine after the client asked to discard them; the whole-input oracle then applies to each uninterrupted segment |
 | Segmentation | Left to the model's packer | Frontend cadence buffer | Two segmenters could cut the same audio differently |
 | Pre-submit credit | Released from `on_accepted` | Released when `feed` returns | `feed` returns after units complete, which can take engine time; the credit is about the packer having the samples |
 | Stream and file decode | One decoder implementation | Separate file decoder | File-vs-stream equivalence needs the same samples |

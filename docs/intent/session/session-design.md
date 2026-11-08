@@ -182,6 +182,27 @@ been flushed is never aborted (the flushed state allows only `finish`, `release`
 and its cleanup goes to `release`. `finish` and `abort` are mutually exclusive, and `release` never
 precedes the selected terminal cleanup.
 
+**Traffic after client-selected finalization.** Once the owner accepts the half-close (Riva) or
+`input_audio_buffer.done` (Realtime), it keeps reading the transport with a receive observer until
+the final's send begins. The observer runs under the finalization bound and holds at most one
+received message. It reads during the final-tail `feed` and `flush` too: this is the one exception
+to the rule that a handler stops reading while `feed` awaits the engine. On the Realtime adapter its
+dispositions are:
+
+- a malformed or unknown envelope keeps `invalid_event` and close 1008 (streaming leaf);
+- a message above the receive cap keeps `request_too_large` and close 1009 (each of these, like
+  the next, runs the state-aware cleanup and suppresses a final whose send has not begun);
+- every other client message (`input_audio_buffer.append`, `clear`, `commit` or `done`, or
+  `transcription_session.update`) fails the session with `session_terminal` (state-aware abnormal
+  cleanup) and suppresses the final if its send has not begun. When the observer fires after
+  `release`, no lease call is made.
+
+Once the final's send has begun, the final is irrevocable: the owner reads no further traffic and
+the connection closes. On gRPC the half-close ends the request stream, so the observer sees only
+cancellation. The observer is cancelled when the owner observes the shutdown trigger, including
+when the trigger finds this finalization running: after the trigger the owner reads nothing
+(below).
+
 ### Shutdown finalization
 
 At the drain settle point the vehicle leaf raises a shutdown trigger with the drain deadline; it
@@ -193,25 +214,37 @@ cause; what the owner does depends on its state:
 | waiting for configuration or first audio, no lease | nothing to finalize: end the stream with the shutdown code (errors leaf, `service_unavailable`) |
 | `open` pending | let it complete or cancel it under the cancelled-`open` rule; then treat the result as no lease (end with the shutdown code) or as an open lease (below) |
 | open or idle with a lease | the sequence below |
-| already finalizing (client-selected) | continue from its current step; never re-feed the tail or re-`flush`; the final then follows the normal path |
+| already finalizing (client-selected) | cancel the receive observer; continue from its current step; never re-feed the tail or re-`flush`; the final then follows the normal path, with that finalization's own deadlines and codes (waits clipped to the drain deadline); a wait that ends because it reached the drain deadline before its own deadline ends it with the shutdown abort row |
 | abnormal cleanup already selected | continue it; the cause stays the selected one |
 
 For an open lease the stream's own owner runs the same state-aware sequence as any finalization,
 serialized with its other work:
 
-1. The owner wakes if it is blocked in a transport receive by cancelling that receive, not a lease
-   call. If a lease call is outstanding it first awaits the call's settlement, bounded by the drain
-   deadline; two lease calls never overlap.
-2. It enters `finalizing` with the terminal cause "shutdown finalization". After the trigger the
+1. On observing the trigger the owner selects provisional shutdown mode, before anything else.
+2. It wakes if it is blocked in a transport receive by cancelling that receive, not a lease call. If
+   a lease call is outstanding it first awaits the call's settlement under the call's own deadline,
+   the wait clipped to the drain deadline; two lease calls never overlap.
+3. It enters `finalizing` for shutdown finalization. After the trigger the
    owner reads no further transport message, and unread traffic is not classified:
    `session_terminal` applies to client-selected finalization only.
-3. It runs the finalization sequence (step 0 to 3 above) under the time remaining to the drain
+4. It runs the finalization sequence (step 0 to 3 above) under the time remaining to the drain
    deadline. The final is delivered only after `release` succeeded, then the stream ends as the
    vehicle leaf states (gRPC `OK`; WebSocket close 1001).
-4. If the sequence fails or the deadline arrives first, the cause becomes an abort during shutdown:
+5. If the settlement or the sequence fails, its finalization bound or a deadline the owner already
+   held expires, or the drain deadline arrives first, the cause becomes an abort during shutdown:
    an open or broken lease takes `abort` then `release`; a lease already flushed takes `release`
    only. The stream ends with the failure of the errors leaf's phase table (`UNAVAILABLE`;
    WebSocket close 1012).
+
+**Cause classification.** The owner selects provisional shutdown mode at the instant it observes
+the trigger, before it settles an outstanding call, unless a client-selected finalization is
+already running (it keeps its own codes, table above) or an abnormal cause was already selected
+(it is kept). Provisional shutdown mode is not an immutable cause: any failure or deadline expiry
+after the trigger is observed, including during the settlement of the outstanding call (a
+`lease_call_timeout`, the finalization bound), ends the stream with the shutdown abort row
+(`service_unavailable`, `UNAVAILABLE`, close 1012) because the session is being shut down, not with
+the row that failure or deadline has outside shutdown. Every deadline keeps its original absolute
+value and identity; only the waits are clipped to the drain deadline.
 
 A client disconnect during shutdown finalization wins as usual and selects the abnormal path.
 
@@ -238,7 +271,11 @@ with abnormal lease cleanup.
 Every adapter funnels terminal selection through its serialized owner. The owner records exactly one
 winning cause at an owner-operation boundary:
 
-- a transport cancellation or deadline already observed before the next boundary wins there;
+- a transport cancellation, or an expired deadline, already observed before the next boundary wins
+  there; among expired deadlines the earliest absolute deadline wins, a phase's code requires that
+  phase's own unclipped deadline to have expired, a phase deadline wins a tie between unclipped
+  deadlines, and an abnormal cause already selected is kept (errors leaf); a provisional normal or
+  shutdown finalization is not such a cause and yields to a later abnormal cause or deadline;
 - otherwise an already-computed validation or protocol result, or the first timer, shutdown,
   factory, input or engine cause recorded at that boundary, stays primary;
 - later transport or cleanup failures are secondary evidence and never replace the primary catalog
@@ -248,7 +285,7 @@ After selecting an abnormal cause (a transport cancellation, disconnect, deadlin
 validation, input or engine cause), the owner cancels and awaits bounded settlement of its current
 `open`, `feed`, `update_locale`, `flush` or `finish`, and only then runs terminal cleanup, shielded
 from further cancellation. Shutdown finalization is the one exception: it settles the current call
-(awaits it, bounded by the drain deadline) instead of cancelling it, because its purpose is a
+(awaits it under its own deadline, the wait clipped to the drain deadline) instead of cancelling it, because its purpose is a
 complete final; if the call fails or the deadline arrives, the cause becomes an abort during
 shutdown and the abnormal rule applies. Two lease calls never overlap, and every lease call is
 serialized by the owner.
@@ -290,7 +327,8 @@ A detected disconnect (WebSocket disconnect, TCP FIN or RST, gRPC stream cancell
 abnormal termination immediately. gRPC observes cancellation through the context's done callback
 at once, even during a lease call. A WebSocket disconnect during an outstanding call is observed
 when that call returns or its per-operation bound expires, whichever is first, because the adapter
-reads the transport only between calls. Once observed: shielded, bounded `abort` and `release`. The session is never left
+reads the transport only between calls, except for the receive observer of client-selected
+finalization (above), which observes it at once. Once observed: shielded, bounded `abort` and `release`. The session is never left
 to the engine's idle deadlines. An undetected half-open connection falls to the idle bound
 below, the only application-level mechanism available; transport keepalive may turn it into a detected
 drop sooner but is never the activity clock.
@@ -308,6 +346,7 @@ Every lease call and every wait for client input runs under a finite frontend bo
 | `max_session_duration` (optional) | successful `open` | never | `request_timeout` |
 | `session_finalization_timeout` | finalization accepted | never | `finalization_timeout` |
 | `session_cleanup_timeout` | terminal cleanup begins | never | hand-over to the factory (above) |
+| `response_send_timeout` | a send or close starts | never | transport failure: no further sends; cleanup as for a disconnect |
 
 "Accepted audio" is a `feed` call whose `on_accepted` fired, not socket bytes, keepalive or rejected
 overflow. Client-idle timing (`first_audio_timeout`, `session_idle_timeout`) is suspended while a lease call
@@ -324,9 +363,14 @@ resumes when the call returns.
 Accepted finalization atomically disarms the idle, first-audio and duration bounds and
 applies the finalization and cleanup bounds. Expiry of the first-audio, idle or duration bound
 before accepted finalization selects abnormal termination (`abort`, `release`) and projects the
-code in the table. While the plugin is draining, every bound is the time remaining to the drain
-deadline, if that is smaller. The bounds are checked at startup against the engine deadlines
-(vehicle leaf).
+code in the table. While the plugin is draining, every wait is clipped to the time remaining to
+the drain deadline, if that is smaller; the bound keeps its own absolute deadline and identity, and
+a wait that ends because it reached the drain deadline expires as the drain deadline (the shutdown
+row), not as its phase. The bounds are checked at startup against the engine deadlines
+(vehicle leaf). Every send and close on a streaming surface, including the refusals that create no
+owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and the drain deadline.
+When several deadlines apply, the earliest absolute deadline wins (the errors leaf's precedence
+rule).
 
 ### Engine idle abort
 
@@ -363,6 +407,9 @@ its sessions, including the cleanup of a session whose owner is gone.
 | Cancelled `open` | Left to the factory; owner calls nothing on a lease it never received | Owner aborts and releases a lease that arrives late | A late lease is the owner's only after `open` returns it; the factory's table already owns the session through the cancellation |
 | First-audio and idle bounds | One timer: first-audio duration until the first accepted audio, then the idle duration | Idle bound from `open` only | A client that never sends audio should be freed quickly, below the engine's never-fed deadline |
 | Idle timing during lease calls | Suspended; each call has its own bound, expiry `service_unavailable` | Keep the idle clock running; project call expiry as `idle_timeout` | Waiting on the engine is not client idleness; a slow engine call is the server's failure and the client may retry |
+| Shutdown cause | Intent recorded when the trigger is observed; shutdown finalization provisional; later failures and deadlines take the shutdown abort row; existing deadlines clipped to the drain deadline | Keep each failure's own row; replace every deadline by the drain deadline | The session is being shut down, so the client's right move is to retry elsewhere (1012, `UNAVAILABLE`); the shorter deadlines still bound each call |
+| Traffic after client-selected finalization | A bounded receive observer until the final's send begins | Read nothing after accepted finalization | A violation becomes observable and has one outcome; the final is irrevocable once its send begins |
+| Sends | Every send and close bounded by `response_send_timeout` | Unbounded sends on streams | A stalled reader would otherwise hold an owner, its slot and its lease |
 | Shutdown finalization | The stream's own owner runs it; vehicle supplies only trigger and deadline | The vehicle drives lease calls; cancel at the settle point | Lease calls are serialized and state-aware only inside the owner; a second driver could overlap calls or abort a flushed lease |
 | Finalization tail | Feed the audio frontend's drained tail before `flush` | Flush only | The resampler's lookahead and byte residual belong to the audio; dropping them loses the last samples |
 | Unresolved deferred header at finalization | Zero bytes: empty final; partial header: `unsupported_format` | Always error; always empty final | No audio is a valid session; a partial header is a malformed file |

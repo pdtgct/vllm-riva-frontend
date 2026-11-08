@@ -37,7 +37,9 @@ servicer runs.
 **Riva Realtime WebSocket.** Transcription failures use
 `conversation.item.input_audio_transcription.failed`; protocol and session failures use `error`.
 An `error` event carries the code and the field names, and `authority` for `busy`. Catalog entries
-that require a close mark the adapter terminal; every pending event is sent before the close. The
+that require a close mark the adapter terminal; every pending event is sent before the close while the transport accepts each send within
+`response_send_timeout` (session leaf); a send that exceeds it ends the owner by the transport-failure
+path with no further sends. The
 close codes are:
 
 | Close | Used for |
@@ -97,6 +99,14 @@ This table is the one place that fixes, for a streaming session, which code, gRP
 event and close follow from the phase and cause. Other leaves refer to it; where another leaf
 states one of these values, this table governs on any conflict.
 
+**Deadline precedence.** Every deadline an owner holds (a phase bound, the gRPC RPC's absolute
+deadline, the drain deadline) keeps its original absolute value and identity; clipping shortens only
+the wait, and a wait that ends because it reached the drain deadline expires as the drain deadline.
+The earliest expired deadline wins. A phase's row requires that phase's own unclipped deadline to
+have expired; when two unclipped deadlines fall due at the same instant, the phase deadline wins. An
+abnormal cause already selected is kept; a provisional normal or shutdown finalization is not a
+selected cause and does not block a later deadline.
+
 | Phase and cause | Code | gRPC | Realtime event, close |
 | --- | --- | --- | --- |
 | refused before configuration: ingress cap, capacity, draining | `busy`, `service_unavailable` | `RESOURCE_EXHAUSTED`, `UNAVAILABLE` | `error`, 1013 |
@@ -105,17 +115,19 @@ states one of these values, this table governs on any conflict.
 | first-audio or idle bound; engine `expired` | `idle_timeout` | `ABORTED` | `error`, 1011 |
 | `max_session_duration` | `request_timeout` | `DEADLINE_EXCEEDED` | `error`, 1011 |
 | a `feed` or `update_locale` call exceeded `lease_call_timeout` | `service_unavailable` | `UNAVAILABLE` | `error`, 1011 |
-| finalization bound | `finalization_timeout` | `DEADLINE_EXCEEDED` | `error`, 1011 |
+| finalization bound of a client-selected finalization | `finalization_timeout` | `DEADLINE_EXCEEDED` | `error`, 1011 |
 | undecodable audio | `invalid_audio` | `INVALID_ARGUMENT` | `...transcription.failed`, 1008 |
 | `flush` fails; unexpected failure; `finish` fails; cleanup bound expires on the normal path; `release` fails (other than `engine_dead`) | `internal` | `INTERNAL` | `...transcription.failed`, 1011 |
 | `engine_dead` in any call, including `release` | `service_unavailable` | `UNAVAILABLE` | `...transcription.failed`, 1011 |
-| traffic after finalization accepted | `session_terminal` | `FAILED_PRECONDITION` | `error`, 1008 |
+| a client message the receive observer sees after client-selected finalization was accepted and before the final's send began, other than a malformed or unknown envelope (`invalid_event`) or an oversized message (`request_too_large`) | `session_terminal` | `FAILED_PRECONDITION` (unreachable: no message follows a gRPC half-close) | `error`, 1008 |
 | oversized message or event | `request_too_large` | `RESOURCE_EXHAUSTED` | `error`, 1009 |
 | shutdown finalization succeeded | none | `OK` after the final | `completed`, 1001 |
-| shutdown finalization failed or missed the deadline | `service_unavailable` | `UNAVAILABLE` | `error`, 1012 |
+| after the owner observed the trigger and selected provisional shutdown mode, a failure or a lease-call, finalization or cleanup deadline expired (including while settling the outstanding call), or the drain deadline arrived first (also for a client-selected finalization the trigger found running), unless an abnormal cause was selected before the trigger | `service_unavailable` | `UNAVAILABLE` | `error`, 1012 |
 
 A client disconnect produces no response. A cleanup failure never changes the row selected by the
-primary cause.
+primary cause. During shutdown finalization the shutdown abort row replaces the rows that a
+lease-call timeout, an `internal` failure or `engine_dead` would otherwise select, because the
+session is being shut down.
 
 ## Raised exceptions from core's service
 
@@ -134,12 +146,14 @@ an exception raised from the call. For `Recognize` the two are projected separat
 | `ValueError` that matches none of the cases above | `invalid_config_field` | `INVALID_ARGUMENT` |
 | any other exception | `internal` | `INTERNAL` |
 
-The frontend sees only the exception type and message, and identifies the decoder and budget
-cases by the message text core and the model plugin publish, pinned by tests on both sides. An
+The frontend sees only the exception type and message. It identifies core's size-limit and
+decoder cases by core's own published types and message texts, each pinned by a frontend test that
+runs against core's code, and the budget refusal by the fixed prefix `file exceeds max_model_len: `
+with which the model plugin begins that message (its FILE-BUD-003). An
 unmatched `ValueError` is `invalid_config_field` (core's own `ValueError` handler returns 400), not
 `internal`. A returned `ErrorResponse` is projected by its HTTP status
-as in the file-route section. On the route, raised exceptions go to core's own exception handlers
-and keep core's shape.
+as in the file-route section. On the route, the owner re-raises them from the route handler, so
+they go to core's own application exception handlers and keep core's shape.
 
 ## Code meanings
 
@@ -156,15 +170,15 @@ and keep core's shape.
 - `configuration_timeout`: the initial configuration plus `open` exceeded
   `preconfiguration_timeout`.
 - `request_timeout`: a streaming session exceeded `max_session_duration`; or a file request exceeded
-  its body-read bound; or a gRPC absolute deadline was already expired at an owner boundary outside
-  a more specific active phase deadline.
+  its body-read bound; or a gRPC absolute deadline won under the deadline precedence rule above.
 - `malformed_request`: invalid multipart content type, boundary, structure, required file, or
   framing on the file route.
 - `request_too_large`: the bounded unary body, encoded audio, decoded duration, WebSocket envelope
   or file-route body (or its content type, boundary, part, header or text field) exceeded its limit;
   the message names which.
-- `session_terminal`: audio, an update or finalization arrived after finalization was accepted but
-  before the transport close won the race. No surface inherits core's silent second-commit behaviour.
+- `session_terminal`: after client-selected finalization was accepted and before the final's send
+  began, the receive observer saw a well-formed client message (audio, `clear`, `commit`, another
+  `done` or an update). No surface inherits core's silent second-commit behaviour.
 - `protocol_order`, `invalid_event`: wrong message order; malformed or unknown Realtime events.
 - `invalid_config_field`, `unsupported_capability`: a rejected scalar or default-shaped field, or
   an absent capability class (word offsets, diarization, word boosting, endpointing).
@@ -212,7 +226,8 @@ The file route's own errors:
 | unknown `locale` in a client `vllm_xargs` | `unknown_locale` | 400 |
 | body, content type, boundary, part or text field above its bound | `request_too_large` | 413 |
 | body read timeout (a stalled upload) | `request_timeout` | 408 |
-| core execution or response send timeout | `request_timeout` | 504 before response headers; after headers the event stream is terminated |
+| core execution timeout | `request_timeout` | 504 before response headers; after headers the event stream is terminated |
+| response send timeout | `request_timeout` (recorded) | no further send; headers are the first send, so no status follows |
 | files disabled on this server | `unsupported_capability` | 501 |
 | cancelled by shutdown | `service_unavailable` | 503 before headers; after headers the event stream is terminated |
 | draining; ingress cap full; gate wait expired | `service_unavailable`; `busy`; `busy` | 503 |
@@ -240,7 +255,7 @@ failure or a cleanup bound that expires; none emits a final.
 | Seam reasons | One mapping row per reason | All refusals to capacity | `locale` is a client error, `cadence` a configuration error, `capacity` is load; collapsing them hides the cause |
 | `engine_dead` projection | `service_unavailable` (and escalate) | `internal` | The client's right move is to retry elsewhere or later, which is what `UNAVAILABLE` says; the process is about to be restarted |
 | Phase mapping | One authoritative table in this leaf; siblings refer to it | Each leaf states its own codes | Sibling statements drifted apart; one table cannot conflict |
-| Stalled upload | HTTP 408 | 504 | The client was slow, not the server; 504 stays for core execution and response send |
+| Stalled upload | HTTP 408 | 504 | The client was slow, not the server; 504 stays for core execution |
 | Files disabled | `unsupported_capability`, HTTP 501 | 404; 503 | The capability is absent from this server by configuration, not temporarily unavailable |
 | Raised exceptions | Classified separately from returned `ErrorResponse` | One mapping by status | Core raises expected failures as exceptions, which have no HTTP status to map |
 | Per-operation bound expiry | `service_unavailable` | `idle_timeout` | The server did not answer in time; the client may retry |

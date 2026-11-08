@@ -215,15 +215,19 @@ gate size must be below both (files leaf). If either value is not yet available 
 per file-route request. A handler registers its owner task before it reads its first message or
 request body and keeps it registered until its last cleanup step: for a stream, `SessionLease.release`
 (or the factory's handover of a cancelled `open`); for a file request, the release of its file-gate
-permit. Refusals register nothing. The frontend starts no task outside the registry, apart from the
+permit after its children have settled. The registry holds one record per owner. A file
+request's cleanup runs as a cleanup continuation registered with its record: when the route or RPC
+answers before settlement, the continuation keeps the record, with its permit, file-owner slot and
+load count, until it finishes or `stop` cancels it. Refusals register nothing. The frontend starts no task outside the registry, apart from the
 two long-lived supervision tasks (fault collector, listener monitor) that `start` creates and `stop`
 cancels. The model plugin's factory owns every engine-facing task of its sessions.
 
 **Ingress cap.** One finite positive cap (`load_shed_max_sessions`) counts active owners across
 `StreamingRecognize`, `Recognize`, the Realtime WebSocket and the file route together. It excludes
 core's `/v1/realtime`, `GetRivaSpeechRecognitionConfig`, the bootstrap POST and the operational
-routes. Before a handler reads its first message or body, parses multipart or calls `open`, it
-atomically checks that the plugin is serving (`state.draining` unset, admission open) and that the
+routes. Before a handler reads its first message or body (for `Recognize`, whose request is already in
+memory under the framework cap, at servicer entry before any decode), parses multipart or calls
+`open`, it atomically checks that the plugin is serving (`state.draining` unset, admission open) and that the
 count is below the cap, and registers its owner when both hold. A draining plugin answers
 `service_unavailable`; a full cap answers retryable `busy` with `authority: load_shed`. Below the
 cap the counter claims no residency, reserves no engine capacity and queues nothing, and sessions
@@ -266,11 +270,12 @@ the surface consumes no audio and answers `busy` carrying `authority: provider`.
 success acknowledgement and the Realtime configuration acknowledgement is not relabelled as
 admission. The other seam reasons are mapped by the errors leaf.
 
-**Bounded ingress.** Every read and wait of an admitted owner is finite: the first message
-(`preconfiguration_timeout`), a file request's body read (`http_body_read_timeout`) and a file-gate
-wait (`file_gate_wait_timeout`). A client disconnect releases what the owner held: its registry
-entry, its ingress-cap count, its permit, its multipart memory, and, for a stream, its lease through
-the session leaf's cleanup.
+**Bounded ingress.** Every read, wait and send of an admitted owner is finite: the first message
+(`preconfiguration_timeout`), a file request's body read (`http_body_read_timeout`), a file-gate
+wait (`file_gate_wait_timeout`) and each send (`response_send_timeout`, on every surface). A client
+disconnect releases what the owner held: its multipart memory and, for a stream, its lease through
+the session leaf's cleanup, and, once its children have settled (files leaf), its registry entry,
+its ingress-cap count, its permit and its file-owner slot.
 
 ## Listener (`start`)
 
@@ -306,8 +311,12 @@ owner runs the legal, serialized finalization sequence for each stream.
 2. Let owners finish normally until the settle point, `D - min(5 s, (D - now) / 4)`. Clients that
    finish their audio get their finals.
 3. At the settle point, raise the shutdown trigger with `D` for every remaining stream owner.
-   Each owner wakes if it is blocked in a transport receive by cancelling that receive (never a
-   lease call), settles any outstanding call, feeds the audio frontend's drained tail, calls
+   An owner whose lease is open and that has selected neither a client finalization nor an
+   abnormal cause selects provisional shutdown mode when it observes the trigger; an owner already
+   finalizing for its client or already cleaning up keeps that path, as the session leaf's
+   shutdown finalization states. An owner in shutdown mode wakes if it is blocked
+   in a transport receive by cancelling that receive (never a lease call), settles any outstanding
+   call under that call's own deadline with the wait clipped to `D`, feeds the audio frontend's drained tail, calls
    `flush`, `finish` and `release`, delivers the final only after `release`, and ends the stream:
    gRPC `OK` after the final, WebSocket close 1001. An owner whose sequence fails or does not finish
    by `D` aborts as the session leaf states (an open or broken lease takes `abort` then `release`;
@@ -337,7 +346,8 @@ startup rollback before any engine shutdown:
    `release` and call the lease's synchronous `teardown`).
 2. Call `factory.teardown_all()`, which is terminal: after it, `open` and lease calls raise and
    owner cancellation cannot create factory work.
-3. Cancel the owners, the fault collector and the listener monitor.
+3. Cancel the owners, every file cleanup continuation with the children it holds (a core call or
+   disconnect watcher that outlived its cleanup bound), the fault collector and the listener monitor.
 4. Stop the gRPC server without grace.
 5. Wait once for the cancelled tasks, with a short fixed bound (1 s), only so that cancellation is
    delivered; return whether or not they finished.
@@ -419,7 +429,7 @@ The set is deliberately the set of options with an operator-visible effect; prot
 | `http_text_field_max_bytes` | 4,096 | one text part |
 | `http_body_read_timeout` | 120 s | total time to read the request body |
 | `file_execution_timeout` | derived: `max(300 s, 2 * unary_max_decoded_duration_seconds)` | bound on core's execution of one file, `Recognize` and route |
-| `response_send_timeout` | 60 s | bound on one response send on the route |
+| `response_send_timeout` | 60 s | bound on each send and close, on the route and both streaming surfaces (clipped to the RPC deadline and the drain deadline) |
 | `session_factory` | unset | entry-point name that selects one factory when several accept |
 | `resampler_identifier` | `scipy-poly-v1` | must equal the built-in identifier; a fixed fact |
 | `deployment_image`, `pin`, `precision_policy` | `unspecified`, `unspecified`, `fp32-bringup-v1` | deployment-owned identifiers shown by the metadata route |
@@ -438,7 +448,7 @@ advertises another deployment's image or pin.
 
 ## Deployment
 
-The documented deployment sets:
+The repository's deployment guide, `docs/deployment.md`, sets:
 
 - `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming`: core loads no endpoint plugin when the
   variable is unset, and allowlists by entry-point name in every plugin group, so the model plugin
@@ -447,13 +457,16 @@ The documented deployment sets:
   `stream_admission`;
 - `--shutdown-timeout` above the engine's drain time (the engine's `draining_timeout` default is
   40 s; 60 s is the documented value);
-- the model plugin's own serve flags (HLD Constraints), including `supported_num_lookahead_tokens`
-  containing 6 (the 560 ms arm that streaming surfaces open at) and `num_lookahead_tokens`, which
-  fixes the cadence complete files run at;
+- the model plugin's own serve flags (HLD Constraints). The reference deployment serves
+  `supported_num_lookahead_tokens` `[6, 13]` with `num_lookahead_tokens` 13: 6 is the 560 ms arm
+  that the Riva streaming surfaces open at, and 13 fixes the 1120 ms cadence at which complete
+  files and core's own `/v1/realtime` run;
 - `--max-model-len` large enough for the longest file `unary_max_decoded_duration_seconds` admits at
-  the default lookahead. The model's worst-case token budget is `1 + (C + 1) * Q + 1` with `C`
-  the number of whole cadence chunks and `Q = (r + 1) * 10 + 1`; at 560 ms (`r = 6`, `Q = 71`,
-  8,960 samples per chunk) a 600 s file needs at least 76,114 (the model plugin's README uses 76,800).
+  the cadence `num_lookahead_tokens` fixes. The model's worst-case token budget is
+  `1 + (C + 1) * Q + 1` with `r` that lookahead, `Q = (r + 1) * 10 + 1` and `C` the number of whole
+  cadence chunks of `(r + 1) * 1280` samples. At the reference `r = 13` (`Q = 141`, 17,920 samples
+  per chunk) a 600 s file needs at least 75,578; the model plugin's README serves 76,800. A
+  deployment that runs files at 560 ms (`r = 6`, `Q = 71`, 8,960 samples per chunk) needs 76,114.
   The frontend does not compute the model's budget (it needs model-specific knowledge outside the
   structural seam); the formula and values here are for operators.
 
