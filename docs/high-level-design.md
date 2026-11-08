@@ -135,12 +135,17 @@ flowchart LR
 - **Bounds.** Every lease call runs under a finite frontend bound (configuration, first audio,
   idle, finalization, cleanup). `init_state` reads the engine's stream deadlines (the
   `stream_admission` settings: never-fed, parked-idle and draining) and fails startup unless each
-  frontend bound is below the matching engine deadline, so the frontend's timeouts fire first and
-  the engine's idle abort (`expired`, reported as an idle timeout) is a backstop. During `drain`,
+  frontend bound is below the matching engine deadline, so the frontend's bounds are below the engine's
+  and the engine's idle abort (`expired`, reported as an idle timeout) is a backstop. The engine
+  is the authority for sub-unit traffic and the frontend suspends client-idle timing while a
+  lease call is outstanding, so the engine can still end a stream first. During `drain`,
   every bound is the remaining time to one absolute deadline.
 - **`drain(state, timeout)`.** Health `NOT_SERVING`; close admission; let owners finish until a
-  settle point; cancel the rest, each taking abort then release within the deadline; stop the gRPC
-  server with the remaining grace; then `factory.drain(deadline)`, logging the faults it returns.
+  settle point; then each remaining stream's owner finalizes it (the client gets its final after
+  release) or, if that cannot finish, cleans it up as the session design prescribes (abort an open
+  lease, never a flushed one, then release), all within the deadline; stop the gRPC server with
+  the remaining grace; then `factory.drain(...)`, logging the faults it returns. The plugin finishes
+  early enough to leave core time to shut the engine down.
 - **`stop(state)`.** Terminal and prompt: mark torn down, `factory.teardown_all()`, cancel owners,
   stop the listener, one short bounded wait for cancellation delivery; no awaited engine work.
 - **Faults.** A frontend task collects factory cleanup faults while serving (calling the factory's
@@ -155,7 +160,9 @@ flowchart LR
 - **One gate.** A counting gate of `max_concurrent_files` covers `Recognize` and the HTTP route. It
   caps files in flight; it does not reserve capacity for streams (a finished file's slot is held
   until it retires). `init_state` fails unless the cap is below both the state-slot count and the
-  engine's active-request limit.
+  engine's active-request limit; when that capacity is below 2 and no cap is configured, files are
+  disabled with a warning instead (`Recognize` answers `UNIMPLEMENTED`, no `offline` listing, and
+  the frontend's route refuses with 501).
 - **HTTP route.** The frontend's route replaces core's `POST /v1/audio/transcriptions`. After the
   ingress cap admits it, it reads the request body into memory up to a configured bound (larger
   bodies get 413), parses the multipart form in memory with the frontend's bounded parser (no
@@ -169,10 +176,12 @@ flowchart LR
   a stable contract; the frontend pins it with tests.
 - **`Recognize`.** Converts the request's audio to an in-memory 16 kHz mono 16-bit WAV and calls the
   same service through the same gate.
-- **Locale.** The client's locale is validated against the factory's `locales` and sent exactly as
-  `vllm_xargs={"locale": ...}`; `language` carries the locale's language only when it is in the
-  model's `supported_languages`, else `None` (also for `auto`). Languages core does not know remain
-  reachable this way. Defaults follow the factory's `default_locale`, on every surface and in the
+- **Locale.** For `Recognize`, the client's locale is validated against the factory's `locales` and
+  sent exactly as `vllm_xargs={"locale": ...}`; `language` carries the locale's language only when
+  it is in the model's `supported_languages`, else `None` (also for `auto`). Languages core does not
+  know remain reachable this way. The HTTP route keeps core's contract: it forwards the client's
+  `language` unchanged, for the model to map, and accepts a client `vllm_xargs` whose only key is
+  `locale`. Defaults follow the factory's `default_locale`, on every surface and in the
   realtime bootstrap response; when it is `None`, the client must name a locale.
 - **Capability.** `Recognize` and the HTTP route need the model's `transcription` task. Core
   attaches its transcription route only for such a model, so `attach_router` replaces the route only
@@ -232,7 +241,8 @@ module. Every spec ID cited in this repository resolves here or in the model plu
    startup rollback and terminal stop.
 2. A40: `nvidia-riva/python-clients` streaming, complete-file and model-listing scripts unmodified;
    the Riva Realtime WebSocket client; core `POST /v1/audio/transcriptions`; complete-file
-   transcripts equal to streaming transcripts under matched conditions (the same decoded samples,
+   transcripts equal to the transcript of a factory session at the server's default cadence under
+   matched conditions (the same decoded samples,
    with `Recognize`'s PCM16 requantization applied to the stream side too; the same cadence, locale,
    precision and endpointing).
 3. Mixed load: streams' p95 final latency with one complete file in flight within 10 % of the same

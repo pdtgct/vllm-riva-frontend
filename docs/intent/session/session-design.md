@@ -1,0 +1,382 @@
+---
+parent: high-level-design
+prefix: ING
+facets: [CORE, LIFE]
+---
+
+# Session
+
+## Context and Design Philosophy
+
+A live stream (Riva `StreamingRecognize`, a Riva Realtime WebSocket session) runs on a session
+factory that the model plugin publishes. This leaf is the frontend's side of that seam and the
+per-stream owner that drives it: how the factory is found and checked, which calls the frontend
+makes on it and in what order, how a stream ends, and which time bounds apply. Wire formats belong
+to the streaming leaf; the lease calls themselves are specified by the model plugin's session
+design (`SESS-*`), which this leaf consumes and does not restate.
+
+Principles:
+
+- **Structural coupling only.** The frontend and the model plugin import neither each other nor
+  each other's exceptions. The factory and lease are protocols; error information travels as two
+  attributes.
+- **One owner per stream, one terminal cause.** A stream has one serialized owner. It records
+  exactly one winning cause for how the stream ends and never overlaps two lease calls.
+- **Finish or abort, never both; release always.** The two ways to end an engine stream are
+  mutually exclusive; the resource is always released, or handed to the factory.
+- **Direct translation.** Each surface translates its dialect straight to lease calls and results.
+  There is no generic session event bus, and no surface re-implements what the model's session
+  owns.
+
+## Responsibility split
+
+The frontend owns decode and resample, the bounded buffer between a transport read and `feed`,
+read-side flow control, wire projection, and the transport owner's lifecycle. The model plugin's
+session owns the packer (cadence segmentation, `chunk_sequence`, the final-tail unit), the engine
+binding, and the consequences of a failed unit (`SESS-PACK-*`, `SESS-ENG-*`, `SESS-LEASE-005`).
+No surface duplicates those behaviours: there is no accepted-audio queue in the frontend beyond the
+pre-submit bound (audio leaf), no cadence arithmetic, no batcher, no generation or render loop and
+no internal WebSocket loopback. Complete files do not use the factory (files leaf).
+
+Every streaming surface binds only through the factory and lease the model plugin publishes, in
+process. It implements no remote provider, provider-mode switch or generic session broker.
+
+## Discovery and selection
+
+The entry-point group `vllm_riva_frontend.session_factories` is owned and documented by this
+package. The model plugin registers a constructor under it. `init_state` calls every constructor in
+the group with `(engine_client, engine_client.model_config)`, unchanged.
+
+- A constructor returns `None` when it does not serve the model.
+- Exactly one constructor must return a factory, unless `additional_config.riva_frontend.session_factory`
+  names an entry point, in which case only that constructor's result is used and an absent or
+  declining named factory fails startup. Zero or several accepting factories without a selection
+  fail startup, listing the entry-point names.
+- A constructor that raises fails startup with its message. That raise is the frontend's only
+  engine-capability check: the engine-client protocol does not declare the stream-admission calls,
+  so only the factory, which uses them, knows whether the engine has them.
+
+## Structural protocol
+
+The frontend uses the following surface and nothing else.
+
+| Object | Member | Use |
+| --- | --- | --- |
+| factory | `served_cadences: frozenset[str]` | startup check; cadence selection |
+| factory | `locales: frozenset[str]` | locale validation on every surface |
+| factory | `default_locale: str \| None` | default when the client names none |
+| factory | `open(*, cadence, locale)` | opens a lease; may raise a refusal or failure |
+| factory | `drain(deadline) -> list` | await orphan cleanup until an absolute `time.monotonic()` deadline; returns cleanup faults, clearing them |
+| factory | `teardown_all() -> set[Task]` | terminal close; returns the cancelled tasks |
+| lease | `feed(samples, *, on_accepted) -> list[str]` | one call per piece; returns cumulative transcripts, one per unit whose text changed |
+| lease | `update_locale(locale) -> None` | locale change |
+| lease | `flush() -> str` | final tail; returns the final cumulative transcript or raises |
+| lease | `finish()`, `abort()`, `release()` | terminal calls (`release` returns after the slot has retired) |
+| lease | `teardown()` | synchronous, engine-free; for `stop` |
+
+Errors: an exception from `open` or a lease may carry `session_error` (`"refused"` or `"failed"`)
+and `reason`. The frontend reads both with `getattr` and treats an exception with neither as an
+unexpected failure (errors leaf maps every reason). It catches no model-plugin exception class by
+name.
+
+## Cadence and locale
+
+Streaming surfaces open at `560ms`. `init_state` fails startup if `served_cadences` does not
+contain it; the factory and the model separately refuse an unserved cadence, so a stream never
+opens at one.
+
+A stream's locale is the client's, validated against `locales`. When the client names none, the
+locale is `default_locale`. When that is `None`, the client must name one, and a client that names
+none is refused with `invalid_config_field` naming `language_code` (Riva) or the dialect's own
+field (Realtime). A name outside `locales` is `unknown_locale`. The same rules govern the Realtime
+bootstrap response and a Realtime update (streaming leaf), and the file path (files leaf).
+
+## Seam conformance
+
+The repository ships a conformance suite for the seam, run against a fake factory implementing the
+protocol; the model plugin repository runs the same suite against its real factory. It covers
+`drain` (absolute deadline, faults returned once and cleared), `teardown_all` (terminal; `open`
+afterwards fails), the call order the owner relies on, and the error attributes, including a
+reason the frontend does not know.
+
+## The stream owner
+
+One owner task serves one stream. It registers before reading anything (vehicle leaf), and its
+states are:
+
+| State | Entered when | Meaning |
+| --- | --- | --- |
+| `awaiting_configuration` | registration | only the first message may be read |
+| `configured` | `open` returned a lease after complete validation | the lease exists; the transport is now consumed |
+| `streaming` | first message after configuration | audio is accepted |
+| `finalizing` | finalization accepted: client half-close or `done`, or shutdown finalization | no more audio, updates or finals accepted; later traffic is `session_terminal` |
+| terminal | cleanup done | the owner unregisters |
+
+### First message and configuration
+
+The first client message on every streaming surface is that dialect's configuration. Any other
+message first is `protocol_order`: gRPC `FAILED_PRECONDITION`; Realtime `error`, then close.
+
+The handler reads exactly that message, validates it fully (either a concrete accepted audio cell,
+or the dialect's explicit deferred-RIFF declaration; the streaming leaf lists the checks), calls
+`open`, and only then advances the gRPC request iterator or receives another WebSocket message.
+Pipelined audio before `open` remains under transport flow control and enters no frontend buffer.
+In deferred-RIFF mode the handler holds at most `max_riff_header_bytes` after `open` and calls no
+`feed` until the concrete cell resolves.
+
+When `open` returns, the engine has admitted the stream. The owner enters `configured` before the
+transport is consumed. Riva emits no invented configuration or admission acknowledgement. The
+Realtime adapter's required `transcription_session.updated` acknowledges the validated
+configuration and adds no admission vocabulary. A `SessionRefused` for capacity is answered `busy`
+with `authority: provider` and consumes no audio (vehicle leaf).
+
+A finite `preconfiguration_timeout` begins when the owner registers and ends only when the complete
+configuration validates and `open` succeeds. Expiry is `configuration_timeout`: the owner cancels
+a pending `open`, releases its registration and creates no lease. It calls neither `abort` nor
+`release` for a lease it never received; a cancelled `open` is the factory's to clean up
+(`SESS-OPEN-006`). The bootstrap POST creates no owner and starts no timer.
+
+### Hypotheses
+
+Each cumulative transcript string a `feed` call returns is projected by the surface:
+
+- Riva emits a changed cumulative hypothesis as a non-final result only when `interim_results` is
+  true.
+- Realtime emits the true incremental suffix between consecutive cumulative hypotheses.
+- A `feed` that returns no transcript (no unit completed, or no unit changed the text) emits
+  nothing.
+
+### Finalization
+
+Three triggers select a finalization: client half-close (Riva), `input_audio_buffer.done`
+(Realtime), and **shutdown finalization**, which the vehicle leaf raises at the drain settle point.
+Each produces exactly one dialect final, after normal finish and release succeed; multi-utterance reuse
+is not part of this design. The surface then closes. A finalization with zero audio is a valid
+degenerate stream: it calls `flush`, which sends the zero-sample final tail, then `finish` and
+`release`, and yields one empty final. A finalization while a deferred RIFF header is still
+unresolved is split: if zero bytes were received, it is a zero-audio stream with a valid empty
+final; if a partial header was received, the stream ends with `unsupported_format` naming the
+fields, with `abort` and `release` and no final.
+
+For every streaming surface, normal finalization is one sequence, derived at one point shared by
+all surfaces:
+
+0. Feed the audio frontend's drained tail (the resampler's lookahead and any byte residual, audio
+   leaf) to the lease, under the finalization bound. A residual that is not a whole sample is
+   discarded.
+1. `flush`, always, including for zero audio. Its return value must be a string; that string is the
+   final transcript. Any other return is a failed `flush`.
+2. After a successful `flush`: `finish` exactly once, then `release`.
+3. Only after both succeed does the surface expose the dialect final. A failure of either emits no
+   final; its projection is in the errors leaf.
+
+If `flush` fails, or cancellation, a deadline, a disconnect, an idle timeout or an abort during
+shutdown wins before normal completion, the owner calls `abort`, then `release`, and never `finish`.
+`finish` and `abort` are mutually exclusive, and `release` never precedes the selected terminal
+cleanup. A lease that has already been flushed is never aborted (the model forbids it): its cleanup
+goes to `release`.
+
+### Shutdown finalization
+
+At the drain settle point the vehicle leaf raises a shutdown trigger with the drain deadline; it
+owns only that trigger and deadline. The trigger preserves every completed step and the selected
+cause; what the owner does depends on its state:
+
+| Owner state at the trigger | Transition |
+| --- | --- |
+| waiting for configuration or first audio, no lease | nothing to finalize: end the stream with the shutdown code (errors leaf, `service_unavailable`) |
+| `open` pending | let it complete or cancel it under the cancelled-`open` rule; then treat the result as no lease (end with the shutdown code) or as an open lease (below) |
+| open or idle with a lease | the sequence below |
+| already finalizing (client-selected) | continue from its current step; never re-feed the tail or re-`flush`; the final then follows the normal path |
+| abnormal cleanup already selected | continue it; the cause stays the selected one |
+
+For an open lease the stream's own owner runs the same state-aware sequence as any finalization,
+serialized with its other work:
+
+1. The owner wakes if it is blocked in a transport receive by cancelling that receive, not a lease
+   call. If a lease call is outstanding it first awaits the call's settlement, bounded by the drain
+   deadline; two lease calls never overlap.
+2. It enters `finalizing` with the terminal cause "shutdown finalization". After the trigger the
+   owner reads no further transport message, and unread traffic is not classified:
+   `session_terminal` applies to client-selected finalization only.
+3. It runs the finalization sequence (step 0 to 3 above) under the time remaining to the drain
+   deadline. The final is delivered only after `release` succeeded, then the stream ends as the
+   vehicle leaf states (gRPC `OK`; WebSocket close 1001).
+4. If the sequence fails or the deadline arrives first, the cause becomes an abort during shutdown:
+   an open or broken lease takes `abort` then `release`; a lease already flushed takes `release`
+   only. The stream ends with the failure of the errors leaf's phase table (`UNAVAILABLE`;
+   WebSocket close 1012).
+
+A client disconnect during shutdown finalization wins as usual and selects the abnormal path.
+
+### Locale updates and configuration changes (Realtime)
+
+A later update that changes locale is validated and run through the serialized
+`update_locale`. An unknown locale answers `unknown_locale` and keeps the prior selection. A valid
+locale is acknowledged only after the call succeeds and applies to every unit packed after the
+call (`SESS-LOC-001`, `SESS-LOC-002`). Accepted finalization freezes the current locale and
+rejects every later update.
+
+After the first successful update and open, every changed cadence, audio-format, sample-rate,
+channel or recognition-option field answers `config_change_rejected` and leaves the active lease
+and front end unchanged, even when no audio has arrived. When one later update contains an honoured
+locale change and rejected fields, the adapter emits the field rejection events first and then
+`transcription_session.updated` reflecting exactly the honoured subset: the acknowledgement is last,
+truthful and has no admission claim. A later Riva `streaming_config` is terminal `protocol_order`
+with abnormal lease cleanup.
+
+## Terminal cause and cleanup
+
+### One cause
+
+Every adapter funnels terminal selection through its serialized owner. The owner records exactly one
+winning cause at an owner-operation boundary:
+
+- a transport cancellation or deadline already observed before the next boundary wins there;
+- otherwise an already-computed validation or protocol result, or the first timer, shutdown,
+  factory, input or engine cause recorded at that boundary, stays primary;
+- later transport or cleanup failures are secondary evidence and never replace the primary catalog
+  code.
+
+After selecting an abnormal cause (a transport cancellation, disconnect, deadline, timer,
+validation, input or engine cause), the owner cancels and awaits bounded settlement of its current
+`open`, `feed`, `update_locale`, `flush` or `finish`, and only then runs terminal cleanup, shielded
+from further cancellation. Shutdown finalization is the one exception: it settles the current call
+(awaits it, bounded by the drain deadline) instead of cancelling it, because its purpose is a
+complete final; if the call fails or the deadline arrives, the cause becomes an abort during
+shutdown and the abnormal rule applies. Two lease calls never overlap, and every lease call is
+serialized by the owner.
+
+### Cleanup order
+
+| Selected outcome | Calls |
+| --- | --- |
+| Normal | `flush` (success), `finish`, `release`; wire final after both |
+| Any other cause with a lease | `abort`, then `release` |
+| Cause selected while `open` is pending | cancel `open`; no lease call (the factory owns the cancelled `open`) |
+| `finish` fails or is cancelled after a successful `flush` | `release` only: the stream already ended normally at `flush`, and a flushed lease does not accept `abort` |
+| `stop` (torn-down plugin) | the lease's synchronous `teardown()` only |
+
+If `finish` settles successfully, the normal engine terminal stands and cleanup proceeds only to
+`release`; a transport failure arriving afterwards suppresses the wire final but does not turn the
+stream into an abort.
+
+Terminal cleanup runs under one finite positive `session_cleanup_timeout`, shared by its calls; while
+the plugin is draining, the bound is instead the time remaining to the drain deadline. The owner
+always reaches `release`: if `abort` consumed the budget, `release` still runs and is cancelled at
+once, which hands the session to the factory (`SESS-REL-003`). When the cleanup bound expires, the
+owner stops waiting and the factory's cleanup owns the session. This is not an escalation (vehicle
+leaf). A cleanup failure whose reason is `engine_dead` is an escalation; any other cleanup failure
+is recorded and never replaces the primary result.
+
+If a primary cancellation, deadline, validation, transport or engine error is selected, a later
+cleanup error is recorded without replacing the primary wire result. On an otherwise normal path, a
+`finish` failure, a `release` failure or a cleanup-bound expiry emits no final and does not claim
+the resource was released; its code, status and close are in the errors leaf's phase table.
+
+### Disconnect
+
+A detected disconnect (WebSocket disconnect, TCP FIN or RST, gRPC stream cancellation) selects
+abnormal termination immediately. gRPC observes cancellation through the context's done callback
+at once, even during a lease call. A WebSocket disconnect during an outstanding call is observed
+when that call returns or its per-operation bound expires, whichever is first, because the adapter
+reads the transport only between calls. Once observed: shielded, bounded `abort` and `release`. The session is never left
+to the engine's idle deadlines. An undetected half-open connection falls to the idle bound
+below, the only application-level mechanism available; transport keepalive may turn it into a detected
+drop sooner but is never the activity clock.
+
+## Bounds
+
+Every lease call and every wait for client input runs under a finite frontend bound.
+
+| Bound | Starts | Resets | Expiry |
+| --- | --- | --- | --- |
+| `preconfiguration_timeout` | owner registered | never | `configuration_timeout` |
+| `first_audio_timeout` | successful `open` | not reset; replaced by the idle bound on first accepted audio | `idle_timeout` |
+| `session_idle_timeout` | first accepted audio | each successful application-level audio acceptance | `idle_timeout` |
+| `lease_call_timeout` | a `feed` or `update_locale` call starts | never | `service_unavailable` (retryable); the lease is broken (`abort`, `release`) |
+| `max_session_duration` (optional) | successful `open` | never | `request_timeout` |
+| `session_finalization_timeout` | finalization accepted | never | `finalization_timeout` |
+| `session_cleanup_timeout` | terminal cleanup begins | never | hand-over to the factory (above) |
+
+"Accepted audio" is a `feed` call whose `on_accepted` fired, not socket bytes, keepalive or rejected
+overflow. Client-idle timing (`first_audio_timeout`, `session_idle_timeout`) is suspended while a lease call
+is outstanding: time spent waiting for the engine is not the client's idleness, and the client's
+audio is held back by the owner's flow control, not by the client. Each call has its own
+per-operation bound instead: `lease_call_timeout` for `feed` and `update_locale`, the finalization
+bound for the finalization sequence, `preconfiguration_timeout` for `open`. Expiry of
+`lease_call_timeout` is `service_unavailable` (the server did not answer in time, so the client may
+retry), cancels the call, which breaks the lease, and takes `abort` then `release`. The other
+phases take their codes from the errors leaf's phase table and their cleanup from the state-aware
+rules above (a lease already flushed is never aborted). Idle timing
+resumes when the call returns.
+
+Accepted finalization atomically disarms the idle, first-audio and duration bounds and
+applies the finalization and cleanup bounds. Expiry of the first-audio, idle or duration bound
+before accepted finalization selects abnormal termination (`abort`, `release`) and projects the
+code in the table. While the plugin is draining, every bound is the time remaining to the drain
+deadline, if that is smaller. The bounds are checked at startup against the engine deadlines
+(vehicle leaf).
+
+### Engine idle abort
+
+If a lease fails with reason `expired` (the engine ended an idle stream), the surface projects
+`idle_timeout`. This is the backstop. The frontend's bounds are below the engine's deadlines, but
+the frontend cannot guarantee that they fire first: sub-unit traffic (accepted audio shorter than
+one unit, including before the engine's never-fed deadline) does not reset the engine's clock, and
+client-idle timing is suspended while a lease call is outstanding, so the engine can end a stream
+first.
+
+## Ownership
+
+Every stream owner and every file-request owner that passed the ingress cap registers exactly one
+owner task before reading its first message or request body, and keeps it tracked until its last
+cleanup step (vehicle leaf). A stream owner serializes every lease call and atomically selects
+exactly one terminal cause; normal finalization and abnormal termination never both execute `finish`
+and `abort`. The frontend starts no detached task. The factory owns every engine-facing task of
+its sessions, including the cleanup of a session whose owner is gone.
+
+## Decisions & Alternatives
+
+| Decision | Chosen | Alternatives Considered | Rationale |
+| --- | --- | --- | --- |
+| Coupling to the model plugin | Entry-point discovery, structural protocol, `getattr` on two attributes | Import the model plugin's classes; a base class in the frontend | The two packages release separately, and neither can import the other without a cycle or a lock-step version |
+| Engine capability check | The factory constructor raises | A frontend check on the engine client | The engine-client protocol does not declare the stream-admission calls; only the party using them can test for them |
+| Factory selection | Exactly one accepts, unless a name is configured | First accepting; priority order | Two factories for one model is a deployment error; ordering would hide it |
+| Cadence | `560ms` for every stream; startup fails if not served | Client-chosen cadence; model default | Riva has no cadence field; one cadence for both streaming surfaces means one clip decodes on the same lookahead over either |
+| Default locale | The factory's `default_locale`; client must name one when `None` | A frontend-chosen default; always `auto` | The locale table is the model's; a guessed default changes transcripts silently |
+| Final transcript | Taken from `flush`'s string at one shared point | Per-surface accumulation of `feed` results | A transcript is final only after a normal close; one derivation point cannot diverge between surfaces |
+| Final delivery | Only after `finish` and `release` succeed | After `flush` | A wire terminal that precedes resource cleanup lets a client reconnect into a slot that is still held |
+| Cleanup after a flushed lease | `release` only | `abort` then `release` | A flushed lease rejects `abort`, and the stream has already ended at `flush`; `abort` would be a failure that hides the real outcome |
+| Cleanup budget | One bound for the whole cleanup, `release` always reached | A bound per call | A per-call bound lets a slow `abort` multiply the wait; reaching `release` with no budget hands the session to the factory, which cannot leak it |
+| Cleanup-bound expiry | Hand to the factory; no escalation | Escalate | The factory is the owner of an orphaned session and reports real faults (vehicle leaf) |
+| Cancelled `open` | Left to the factory; owner calls nothing on a lease it never received | Owner aborts and releases a lease that arrives late | A late lease is the owner's only after `open` returns it; the factory's table already owns the session through the cancellation |
+| First-audio and idle bounds | One timer: first-audio duration until the first accepted audio, then the idle duration | Idle bound from `open` only | A client that never sends audio should be freed quickly, below the engine's never-fed deadline |
+| Idle timing during lease calls | Suspended; each call has its own bound, expiry `service_unavailable` | Keep the idle clock running; project call expiry as `idle_timeout` | Waiting on the engine is not client idleness; a slow engine call is the server's failure and the client may retry |
+| Shutdown finalization | The stream's own owner runs it; vehicle supplies only trigger and deadline | The vehicle drives lease calls; cancel at the settle point | Lease calls are serialized and state-aware only inside the owner; a second driver could overlap calls or abort a flushed lease |
+| Finalization tail | Feed the audio frontend's drained tail before `flush` | Flush only | The resampler's lookahead and byte residual belong to the audio; dropping them loses the last samples |
+| Unresolved deferred header at finalization | Zero bytes: empty final; partial header: `unsupported_format` | Always error; always empty final | No audio is a valid session; a partial header is a malformed file |
+| WebSocket disconnect during a call | Observed within that call's bound | Concurrent reader task | One reader keeps the command FIFO and backpressure simple; the bound makes the delay finite. gRPC has a callback |
+| Idle clock | Application-level accepted audio | Socket bytes; keepalive | A client trickling bytes or pings holds a slot without sending audio |
+| Zero-audio finalization | Normal flush path with an empty final | Reject | A valid degenerate session; both dialects have clients that do this |
+| Deferred-RIFF scan | After `open`, bounded, no `feed` until resolved | Before `open` | The stream is admitted only when the configuration is complete; the scan needs the audio that arrives after it |
+
+## Open Questions & Future Decisions
+
+### Deferred
+1. **Per-utterance finals.** The model plugin binds no endpoint policy and its lease reports no
+   segment completions. A stream's one final at the end is the behaviour until both are designed
+   together with the frontend; then multi-utterance reuse of a session is revisited.
+2. A cleanup that expires while its `abort` is cancelled mid-flight leaves the factory to retire the
+   session through the cancelled `release`; if the model plugin adds a state where `release` is not
+   accepted after a cancelled `abort`, this leaf's cleanup order is re-checked against it.
+
+## References
+
+- Model plugin session design and specs: `pdtgct/vllm-nemotron-asr-streaming-plugin`
+  `docs/intent/session/` (`SESS-FAC-*`, `SESS-OPEN-*`, `SESS-LEASE-*`, `SESS-LOC-*`, `SESS-EXP-001`,
+  `SESS-OWN-*`, `SESS-ERR-*`).
+- RFC 1 client path: `docs/design/persistent_state.md` on `pdtgct/vllm` branch
+  `persistent-state-primitive-v2`.
+- High-level design: `docs/high-level-design.md`; vehicle leaf (bounds against engine deadlines,
+  escalation); streaming leaf (wire projection); errors leaf (reason mapping).
