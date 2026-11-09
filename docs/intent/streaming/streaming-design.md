@@ -113,8 +113,10 @@ fails until the field is dispositioned. Rejected fields answer `INVALID_ARGUMENT
 
 `StreamingRecognitionConfig.interim_results` is honoured for both values. The request-level
 `runtime_config` of a `StreamingRecognizeRequest` (a rider, not a `RecognitionConfig` field) is
-rejected as `invalid_config_field` naming `runtime_config` before `open` when non-empty, and is not
-treated as a `RecognitionConfig` field or silently ignored. (The unary `RecognizeRequest` of the
+rejected as `invalid_config_field` naming `runtime_config` when non-empty, and is not treated as a
+`RecognitionConfig` field or silently ignored. On the first message the rejection comes before
+`open`; on a later message it is terminal: none of that message's audio is fed, and the open lease
+takes `abort` then `release`. (The unary `RecognizeRequest` of the
 pinned stubs has no such field.)
 
 `enable_automatic_punctuation` and `verbatim_transcripts` are accepted under either value because
@@ -211,9 +213,13 @@ apply to a received message:
   decode, one `error` carrying `request_too_large`, then close 1009.
 
 A frame the server's own limit rejects first may produce the server's native close 1009 without
-the stable event; the dispatcher's caps hold whichever limit is lower. Before resample allocation the
-adapter derives decoded sample counts and rejects an append that cannot fit the applicable bounded
-path. `pre_submit_max_samples` remains the separate bound on samples outstanding at `feed`.
+the stable event; the dispatcher's caps hold whichever limit is lower. The bound on an
+`input_audio_buffer.append` is the envelope cap: an append above `ws_event_envelope_max_bytes` is
+refused as above (`request_too_large`, close 1009) before any decode, `feed` or allocation, so an
+append the adapter decodes carries at most the samples that the cap's base64 payload can encode.
+Before resample allocation the adapter derives that decoded sample count from the payload length
+and splits the append into feeds of at most `pre_submit_max_samples` samples, which remains the
+separate bound on samples outstanding at `feed`.
 
 ### Bootstrap
 
@@ -295,7 +301,8 @@ The first update's sections are dispositioned field for field like the gRPC tabl
 is set, the default object round-trips without rejection; when it is `None`, the default object's
 language is empty and the client must name a locale. A section becomes non-default only through
 its enable toggle, non-zero windows or non-emptiness. A non-empty `input_audio_transcription.prompt` and `modalities` other than
-`["text"]` are rejected as capability or configuration errors. `id`, `object`, `client_secret` and
+`["text"]` are `invalid_config_field` naming `prompt` or `modalities`: they are scalar or
+default-shaped fields, not capability sections. `id`, `object`, `client_secret` and
 `provenance` are echo keys, not configuration. Unknown keys answer `invalid_config_field` naming the
 dialect-native field. Rejections name the dialect's own field names.
 

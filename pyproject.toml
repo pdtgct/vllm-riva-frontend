@@ -32,8 +32,10 @@ riva_frontend = "vllm_riva_frontend:plugin"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "mypy>=1.11",
     "pytest>=8",
+    "pytest-asyncio>=1.4",
     "pytest-cov>=7",
     "ruff>=0.15",
     "types-pyyaml>=6",
@@ -48,6 +50,14 @@ version = { attr = "vllm_riva_frontend.version.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "engine: imports the RFC 1 + RFC 2 vLLM tree",
+    "real_factory: seam conformance against the model plugin's factory",
+    "gpu: needs an installed engine on CUDA",
+]
 addopts = [
     "-ra",
     "--cov=vllm_riva_frontend",

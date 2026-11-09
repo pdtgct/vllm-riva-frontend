@@ -62,7 +62,10 @@ stopping at the first, and fails closed; a gate whose exit status a pipeline can
 reports one failure per module, does not count. The linter target version and the type checker's
 language level name the lowest supported version, so a later-version-only construct fails review.
 Versions in the range that no gate runs are recorded as declared-but-unverified, not reported as
-supported.
+supported. The record is the README's "Supported Python versions" section: a table with columns
+`Python` and `Status` and one row per minor version of the declared range, in order, whose status
+is `supported` when a CI workflow's `python-version` matrix executes that version and
+`declared-but-unverified` otherwise.
 
 ## One process, one engine
 

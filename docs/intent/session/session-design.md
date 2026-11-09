@@ -214,7 +214,7 @@ cause; what the owner does depends on its state:
 | waiting for configuration or first audio, no lease | nothing to finalize: end the stream with the shutdown code (errors leaf, `service_unavailable`) |
 | `open` pending | let it complete or cancel it under the cancelled-`open` rule; then treat the result as no lease (end with the shutdown code) or as an open lease (below) |
 | open or idle with a lease | the sequence below |
-| already finalizing (client-selected) | cancel the receive observer; continue from its current step; never re-feed the tail or re-`flush`; the final then follows the normal path, with that finalization's own deadlines and codes (waits clipped to the drain deadline); a wait that ends because it reached the drain deadline before its own deadline ends it with the shutdown abort row |
+| already finalizing (client-selected) | cancel the receive observer; continue from its current step; never re-feed the tail or re-`flush`; the final then follows the normal path, with that finalization's own deadlines, codes and outcome (waits clipped to the drain deadline): on success the final is delivered and the stream ends as a client-selected finalization ends (gRPC `OK`; WebSocket close 1000, not 1001); a wait that ends because it reached the drain deadline before its own deadline ends it with the shutdown abort row |
 | abnormal cleanup already selected | continue it; the cause stays the selected one |
 
 For an open lease the stream's own owner runs the same state-aware sequence as any finalization,
@@ -258,11 +258,12 @@ rejects every later update.
 
 After the first successful update and open, every changed cadence, audio-format, sample-rate,
 channel or recognition-option field answers `config_change_rejected` and leaves the active lease
-and front end unchanged, even when no audio has arrived. When one later update contains an honoured
-locale change and rejected fields, the adapter emits the field rejection events first and then
-`transcription_session.updated` reflecting exactly the honoured subset: the acknowledgement is last,
-truthful and has no admission claim. A later Riva `streaming_config` is terminal `protocol_order`
-with abnormal lease cleanup.
+and front end unchanged, even when no audio has arrived. Every later update before accepted
+finalization ends with exactly one `transcription_session.updated`: the adapter emits the field
+rejection events first and then the acknowledgement reflecting exactly the honoured subset (an
+honoured locale change, or the unchanged session when nothing is honoured). The acknowledgement is
+last, truthful and has no admission claim. A later Riva `streaming_config` is terminal
+`protocol_order` with abnormal lease cleanup.
 
 ## Terminal cause and cleanup
 

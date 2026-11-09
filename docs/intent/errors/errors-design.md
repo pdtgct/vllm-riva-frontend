@@ -39,7 +39,7 @@ servicer runs.
 An `error` event carries the code and the field names, and `authority` for `busy`. Catalog entries
 that require a close mark the adapter terminal; every pending event is sent before the close while the transport accepts each send within
 `response_send_timeout` (session leaf); a send that exceeds it ends the owner by the transport-failure
-path with no further sends. The
+path and abandons the connection with no further send, including the close frame. The
 close codes are:
 
 | Close | Used for |
@@ -48,13 +48,15 @@ close codes are:
 | 1008 | protocol or format violation (`protocol_order`, `invalid_event`, `unsupported_format` after configuration, `invalid_audio`, `session_terminal`) |
 | 1009 | oversized message or event (`request_too_large`) |
 | 1011 | internal or finalization failure, and timeouts (the phase table below says which event precedes it) |
-| 1001 | the server is draining and the stream was finalized: sent after the final |
+| 1001 | the server is draining and its shutdown finalization finalized the stream: sent after the final |
 | 1012 | the server is draining and the stream was aborted (`service_unavailable`) |
 | 1013 | refused before configuration: `busy`, `service_unavailable` |
 
 During drain, a stream finalized at the settle point ends with gRPC `OK` after its final and
 WebSocket close 1001; a stream aborted because its finalization failed or missed the deadline ends
-with gRPC `UNAVAILABLE` (`service_unavailable`) and WebSocket close 1012 (vehicle leaf).
+with gRPC `UNAVAILABLE` (`service_unavailable`) and WebSocket close 1012 (vehicle leaf). A
+client-selected finalization that the shutdown trigger finds running keeps its own outcome: on
+success it ends with gRPC `OK` and WebSocket close 1000 after its final (session leaf).
 
 A format or configuration rejection before the first configuration completes does not close the
 connection, so the client can retry with a corrected `transcription_session.update`.
@@ -181,7 +183,7 @@ they go to core's own application exception handlers and keep core's shape.
   `done` or an update). No surface inherits core's silent second-commit behaviour.
 - `protocol_order`, `invalid_event`: wrong message order; malformed or unknown Realtime events.
 - `invalid_config_field`, `unsupported_capability`: a rejected scalar or default-shaped field, or
-  an absent capability class (word offsets, diarization, word boosting, endpointing).
+  an absent capability class (diarization, word boosting, endpointing).
 - `unknown_locale`: the locale is not in the factory's `locales`.
 - `config_change_rejected`: a Realtime update changed a field that is immutable after
   configuration.

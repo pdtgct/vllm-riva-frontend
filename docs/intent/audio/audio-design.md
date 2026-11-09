@@ -41,7 +41,18 @@ exactly these mono cells:
 
 When a request declares or resolves any other encoding, sample rate or channel count, the surface
 answers `unsupported_format` naming the offending fields. G.711 is intrinsically 8 kHz, so a
-declared 16 kHz G.711 stream is a client error and is never resampled. FLAC, Opus and other
+declared 16 kHz G.711 stream is a client error and is never resampled.
+
+The offending fields are named one per offence, in this order:
+
+1. the encoding field, when the encoding is none of the three accepted encodings (its rate is then
+   not judged);
+2. otherwise the sample-rate field, when the rate is not a cell of that encoding (a 16 kHz G.711
+   declaration names the rate, not the encoding);
+3. the channel field, when the audio is not mono, alongside either of the above.
+
+Each surface uses its dialect's names: `encoding`, `sample_rate_hertz` and `audio_channel_count` on
+Riva gRPC; `input_audio_format`, `sample_rate_hz` and `num_channels` on the Realtime WebSocket. FLAC, Opus and other
 compressed streams, other rates and multichannel audio are rejected explicitly: they carry codec
 dependencies with no telephony constituency in the streaming path. (The file route accepts the
 containers core's decoder accepts, within core's limits.) General negotiation of formats is left
