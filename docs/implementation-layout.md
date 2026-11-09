@@ -98,8 +98,15 @@ entry names its ground: a design section, a spec, a core file or the public clie
   turn it is put in `record.unsettled_sends`, which holds the record until it settles or `stop`
   cancels it, so a cancellation of the handler during the turn cannot orphan it; one that settles
   in the turn leaves the set again. The same applies when the handler is cancelled while a send
-  waits. Owner cleanup then starts at once under its one `session_cleanup_timeout` budget. A
-  refusal has no record: its send is kept by `registry.keep(task)` from its start. A waiting
+  waits, before its bound is seen to pass: the cancellation then propagates and the owner takes
+  the shutdown abort row (its status gets the one attempt). Once the failure is established (the
+  bound seen to pass, or a terminal attempt incomplete at its first suspension), it is final: a
+  cancellation of the handler during the abandonment's turn, or one that finds the terminal
+  attempt incomplete, is absorbed and withdrawn (`Task.uncancel`), `bounded_send` still raises
+  `TimeoutError`, and the handler takes the transport-failure path (next bullet), so no further
+  send follows, the close included. Owner cleanup then starts at once under its one
+  `session_cleanup_timeout` budget. A refusal has no record: its send is kept by
+  `registry.keep(task)` from its start. A waiting
   send's deadline is a sleeper task held like the send, so `stop`, which cancels both, wakes the
   wait. Ground: ING-LIFE-051; session design, Bounds ("Sends"); ING-EP-059, ING-EP-060.
 - A send past its bound, or a failed write, takes the transport-failure path: the owner is failed

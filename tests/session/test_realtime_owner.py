@@ -552,14 +552,18 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
 class StubbornSendWebSocket(BlockingSendWebSocket):
     """A ``BlockingSendWebSocket`` whose parked sends resist cancellation.
 
-    A parked send that is cancelled counts the cancellation, then either
-    delays it until ``settled`` is set (``suppress=False``) or swallows it
-    and returns as if it had been sent (``suppress=True``).
+    A parked send that is cancelled counts the cancellation, calls
+    ``on_cancel`` when one is given, then either delays it until
+    ``settled`` is set (``suppress=False``) or swallows it and returns as
+    if it had been sent (``suppress=True``).
     """
 
-    def __init__(self, *args, suppress: bool = False, **kwargs) -> None:
+    def __init__(
+        self, *args, suppress: bool = False, on_cancel=None, **kwargs
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.suppress = suppress
+        self.on_cancel = on_cancel
         self.settled = asyncio.Event()
         self.cancellations = 0
 
@@ -568,6 +572,8 @@ class StubbornSendWebSocket(BlockingSendWebSocket):
             await super()._send(message)
         except asyncio.CancelledError:
             self.cancellations += 1
+            if self.on_cancel is not None:
+                self.on_cancel()
             if self.suppress:
                 return
             await self.settled.wait()
@@ -861,3 +867,96 @@ async def test_a_send_suppressing_its_cancellation_still_failed(
     assert ws.stalled == 1  # nothing further, the close included
     assert session.close_code is None
     assert len(started.registry.records) == 0
+
+
+# ------------------------- an established send failure and a cancellation
+
+
+# @spec ING-LIFE-051, ING-ERR-051, ING-LIFE-038, ING-EP-059, ING-EP-060
+async def test_a_cancellation_while_a_failed_send_is_abandoned(
+    realtime, first_update, fake_factory, test_app, started, app_state
+):
+    # The parked acknowledgement's cancellation (its abandonment at the
+    # bound) cancels the handler too, as a drain within the engine reserve
+    # would at that moment: the handler is then in the abandonment's turn.
+    # The client is still connected.
+    ws = StubbornSendWebSocket(
+        test_app, REALTIME_URL, on_cancel=started.registry.cancel_owners
+    )
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1
+    lease = _lease(fake_factory)
+    (record,) = started.registry.records.values()
+
+    try:
+        await session.advance(started.config.response_send_timeout + 0.1)
+
+        assert ws.cancellations == 1
+        # The failure stood: cleanup as for a disconnect, and no further
+        # send started (no shutdown ``error``, no close frame).
+        assert ws.done, "the handler waited on a further send"
+        assert ws.app_error is None
+        assert ws.stalled == 1
+        assert lease.names() == ["abort", "release"]
+        assert record.owner.cause.code == "internal"
+        assert record.owner.cause.phase == "transport"
+        # The unsettled send holds the record and stays reachable by
+        # ``stop``.
+        assert list(started.registry.records.values()) == [record]
+        (unsettled,) = record.unsettled_sends
+        assert unsettled in record.children and not unsettled.done()
+        assert started.ingress.count == 1
+
+        from support.app import stop_plugins
+
+        await stop_plugins(app_state)
+        await session.settle()
+        assert unsettled.cancelled()
+    finally:
+        ws.settled.set()
+        await session.settle()
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+    assert ws.stalled == 1
+
+
+# @spec ING-LIFE-051, ING-ERR-051, ING-ERR-059
+async def test_a_cancellation_while_a_failed_terminal_error_is_abandoned(
+    realtime, first_update, fake_factory, test_app, drain_trigger, started
+):
+    # The shutdown abort row's ``error`` is due after D: its one attempt
+    # parks, so it has failed, and the handler is cancelled while it is
+    # abandoned.
+    ws = StubbornSendWebSocket(
+        test_app, REALTIME_URL, on_cancel=started.registry.cancel_owners
+    )
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    lease.script("flush", Block())
+    _, deadline = await drain_trigger()
+    await session.settle()
+    assert "flush" in lease.names()
+    ws.block = True
+
+    try:
+        await session.advance(deadline - started.clock.monotonic() + 0.01)
+        await session.settle()
+
+        assert ws.cancellations == 1
+        # The handler ended by the transport path, not by the cancellation,
+        # and sent nothing after the failed attempt, the close included.
+        assert ws.done
+        assert ws.app_error is None
+        assert ws.stalled == 1
+        assert json.loads(ws.parked[0]["text"])["type"] == ERROR
+        assert lease.names()[-3:] == ["flush", "abort", "release"]
+    finally:
+        ws.settled.set()
+        await session.settle()
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0

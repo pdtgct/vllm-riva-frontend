@@ -736,13 +736,16 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
 # ------------------------------------- terminal sends, refusals and the drain
 
 
-def _resisting(context, *, suppress: bool = False) -> SimpleNamespace:
+def _resisting(
+    context, *, suppress: bool = False, on_park=None, on_cancel=None
+) -> SimpleNamespace:
     """Make ``context``'s parked calls resist cancellation.
 
     A parked ``write`` or ``abort`` that is cancelled counts it, then either
     delays the cancellation until ``settled`` is set or, with ``suppress``,
     swallows it and goes on as if the client had read it. ``tasks`` are the
-    tasks of the parked calls, in order.
+    tasks of the parked calls, in order. ``on_park`` is called as a call
+    parks, ``on_cancel`` as a parked call is cancelled.
     """
     state = SimpleNamespace(settled=asyncio.Event(), cancellations=0, tasks=[])
 
@@ -752,10 +755,14 @@ def _resisting(context, *, suppress: bool = False) -> SimpleNamespace:
         context.stalled += 1
         context.parked.append(item)
         state.tasks.append(asyncio.current_task())
+        if on_park is not None:
+            on_park()
         try:
             await context.unblocked.wait()
         except asyncio.CancelledError:
             state.cancellations += 1
+            if on_cancel is not None:
+                on_cancel()
             if suppress:
                 return
             await state.settled.wait()
@@ -1119,3 +1126,95 @@ class TestUnsettledSend:
         await call.settle()
         assert call.finals == []
         assert len(started.registry.records) == 0
+
+    # @spec ING-LIFE-051, ING-LIFE-038, ING-EP-059, ING-EP-060
+    async def test_a_cancellation_while_a_failed_write_is_abandoned(
+        self, riva, fake_factory, started, app_state
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Return(["hello"]))
+        # The parked write's cancellation (its abandonment at the bound)
+        # cancels the handler too, as a drain within the engine reserve
+        # would at that moment; the client has not cancelled.
+        resist = _resisting(
+            call.context, on_cancel=started.registry.cancel_owners
+        )
+        call.context.block = True
+        call.audio(PIECE)
+        await call.until(lambda: call.context.stalled == 1, what="a write")
+        (record,) = started.registry.records.values()
+        (write,) = resist.tasks
+
+        try:
+            await call.advance(5.1)
+
+            assert resist.cancellations == 1
+            assert not call.context.cancelled()
+            # The failure stood: cleanup as for a disconnect, and the
+            # handler ended with no status and nothing further written.
+            assert call.done, "the handler waited on a further send"
+            await call.wait()
+            assert call.abandoned
+            assert call.context.stalled == 1 and call.context.aborts == []
+            assert lease.names() == ["feed", "abort", "release"]
+            assert record.owner.cause.code == "internal"
+            assert record.owner.cause.phase == "transport"
+            # The unsettled write holds the record and stays reachable by
+            # ``stop``.
+            assert write in record.unsettled_sends and not write.done()
+            assert list(started.registry.records.values()) == [record]
+            assert started.ingress.count == 1
+
+            from support.app import stop_plugins
+
+            await stop_plugins(app_state)
+            await call.settle()
+            assert write.cancelled()
+        finally:
+            resist.settled.set()
+            await call.settle()
+        assert len(started.registry.records) == 0
+        assert started.ingress.count == 0
+        assert call.responses == []
+
+    # @spec ING-LIFE-051, ING-ERR-059
+    @pytest.mark.parametrize("when", ["first_step", "abandonment"])
+    async def test_a_cancellation_during_a_failed_last_attempt_changes_nothing(
+        self, riva, fake_factory, started, when
+    ):
+        call = riva(time_remaining=20)
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        clock = call.clock
+        lease.script("feed", Raise(failed("expired")))
+        # Cleanup returns just after the RPC deadline: the status is then
+        # due past its bound and gets its one attempt, which parks.
+        lease.after("release", lambda: clock.set(call.context.deadline + 1))
+        cancel = started.registry.cancel_owners
+        resist = _resisting(
+            call.context,
+            on_park=cancel if when == "first_step" else None,
+            on_cancel=cancel if when == "abandonment" else None,
+        )
+        call.context.block = True
+        call.audio(PIECE)
+        try:
+            await call.until(lambda: call.done, what="the handler's end")
+
+            # The attempt failed whatever cancelled the handler meanwhile:
+            # it ended by the transport path, with no further status.
+            assert resist.cancellations == 1
+            await call.wait()
+            assert call.abandoned
+            assert call.context.stalled == 1 and call.context.aborts == []
+            assert isinstance(call.context.parked[0], RpcAbort)
+            assert lease.names() == ["feed", "abort", "release"]
+        finally:
+            resist.settled.set()
+            await call.settle()
+        assert len(started.registry.records) == 0
+        assert started.ingress.count == 0

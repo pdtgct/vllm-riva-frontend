@@ -382,8 +382,12 @@ reading. A send that has not completed when its bound passes has failed, even if
 later. The handler cancels it and does not wait for it to settle: a send still unsettled after one
 turn of the event loop stays under the stream's record (or, for a refusal that created no record,
 under the registry) until it settles or `stop`, so cleanup starts at once and spends no second
-budget. Once the plugin is torn down, every send bound counts as passed. The stream's record stays registered until
-both its handler and its cleanup continuation have ended, so the drain and `stop` reach a terminal
+budget. Once the plugin is torn down, every send bound counts as passed. A send's failure, once
+established, is final: a cancellation of the handler while it abandons the send changes nothing and
+no further send follows. A send that the plugin's own cancellation of the owner interrupts first (a
+drain within the engine reserve, or `stop`) is not a transport failure: the owner takes the
+shutdown abort row, and its terminal status gets the one attempt. The stream's record stays registered until
+its handler, its cleanup continuation and every unsettled send have ended, so the drain and `stop` reach a terminal
 send. After a gRPC send fails, the handler ends without writing a status; the HTTP/2 stream stays
 open until the client cancels, its deadline passes, transport keepalive finds the peer dead or the
 server stops. The owner, its slot and its lease are already released by then.

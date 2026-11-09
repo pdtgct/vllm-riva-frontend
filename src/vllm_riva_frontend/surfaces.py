@@ -17,7 +17,7 @@ import contextlib
 import inspect
 import math
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any, TypeVar
+from typing import Any, NoReturn, TypeVar
 
 from vllm_riva_frontend import errors, frontend, lease
 
@@ -300,24 +300,55 @@ async def _abandon(plugin: Any, record: Any, task: asyncio.Future[Any]) -> None:
     await asyncio.sleep(0)
 
 
+def _withdraw_cancellation() -> None:
+    """Withdraw the cancellation the current task has just absorbed."""
+    current = asyncio.current_task()
+    if current is not None and current.cancelling():
+        current.uncancel()
+
+
+async def _failed(
+    plugin: Any, record: Any, task: asyncio.Future[Any]
+) -> NoReturn:
+    """A send whose failure is established: abandon it, raise ``TimeoutError``.
+
+    The failure is final. A cancellation of the caller during the
+    abandonment's turn is absorbed and withdrawn, so the caller still takes
+    the transport-failure path and sends nothing more; the send stays where
+    ``stop`` reaches it.
+    """
+    if not task.done():
+        try:
+            await _abandon(plugin, record, task)
+        except asyncio.CancelledError:
+            _withdraw_cancellation()
+    raise TimeoutError
+
+
 async def _last_attempt(plugin: Any, record: Any, send: Awaitable[T]) -> T:
     """A terminal status past its bound: one attempt that adds no wait.
 
     The send starts and runs to its first suspension; it succeeds only if
-    it is complete then, and is otherwise abandoned.
+    it is complete then, and has otherwise failed. The caller resumes only
+    after that first step, so a cancellation of the caller meanwhile does
+    not change an incomplete attempt's failure; one that finds the attempt
+    complete propagates.
     """
     task = _start(plugin, record, send)
     task.add_done_callback(_consume)
     try:
         await asyncio.sleep(0)
+    except asyncio.CancelledError:
+        if task.done():
+            raise
+        _withdraw_cancellation()
     except BaseException:
         if not task.done():
             await _abandon(plugin, record, task)
         raise
     if task.done():
         return task.result()
-    await _abandon(plugin, record, task)
-    raise TimeoutError
+    await _failed(plugin, record, task)
 
 
 # @spec ING-LIFE-051, ING-ADM-016, ING-EP-059, ING-EP-060
@@ -347,9 +378,15 @@ async def bounded_send(
     checked before the send's outcome. A failed send is cancelled and
     given one loop turn, never a wait for it to settle; one still pending
     stays under ``record`` (or, with none, the registry) until it settles
-    or ``stop``. The same holds when the caller is cancelled meanwhile.
-    Raises ``TimeoutError`` for a send past its bound; the send's own
-    failure propagates.
+    or ``stop``. Raises ``TimeoutError`` for a send past its bound; the
+    send's own failure propagates.
+
+    A cancellation of the caller while the send waits, before its bound
+    is seen to pass, abandons the send the same way and propagates: the
+    caller takes the shutdown path. Once the bound is seen to pass, the
+    failure is established and final: a cancellation during the
+    abandonment is withdrawn and ``TimeoutError`` raised all the same, so
+    the caller takes the transport-failure path and sends nothing more.
     """
     clock = plugin.clock
     limit = clock.monotonic() + float(plugin.config.response_send_timeout)
@@ -376,10 +413,11 @@ async def bounded_send(
                 if notice is not None:
                     notice.cancel()
             deadline = _send_bound(limit, plugin, owner, rpc_deadline)
-    finally:
+    except BaseException:
         if not task.done():
             await _abandon(plugin, record, task)
-    raise TimeoutError
+        raise
+    await _failed(plugin, record, task)
 
 
 def header_problem(
