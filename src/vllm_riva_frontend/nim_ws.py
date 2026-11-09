@@ -663,7 +663,6 @@ class RealtimeAdapter:
         self._send = send
         self._owner: Any = None
         self._record: Any = None
-        self._watch: surfaces.ShutdownWatch | None = None
         self._gone = False
         self._closed = False
         self._item_id = _hex_id("item")
@@ -707,6 +706,7 @@ class RealtimeAdapter:
         record = registry.register(
             admission.OwnerKind.realtime, asyncio.current_task()
         )
+        surfaces.hold(record)
         try:
             self._record = record
             self._owner = lease.StreamOwner(
@@ -718,7 +718,6 @@ class RealtimeAdapter:
                 record=record,
                 catalog=plugin.catalog,
             )
-            self._watch = surfaces.watch_shutdown(registry, record, self._owner)
             await self._serve()
         finally:
             surfaces.release_owner(registry, record, admitted)
@@ -727,8 +726,8 @@ class RealtimeAdapter:
         """Accept, send the one ``error``, close 1013: no owner, no read."""
         try:
             await self._send_bounded({"type": "websocket.accept"})
-            await self._emit(_ERROR, error=_error_object(error))
-            await self._close(1013)
+            await self._emit_error(_ERROR, error, terminal=True)
+            await self._close(1013, terminal=True)
         except _Gone:
             return
 
@@ -782,8 +781,8 @@ class RealtimeAdapter:
             return
         event, close = _ending(self._plugin.catalog, error, owner)
         try:
-            await self._emit_error(event, error)
-            await self._close(close)
+            await self._emit_error(event, error, terminal=True)
+            await self._close(close, terminal=True)
         except _Gone:
             return
 
@@ -817,11 +816,15 @@ class RealtimeAdapter:
 
     # ------------------------------------------------------------- sends
 
-    async def _send_bounded(self, message: Message) -> None:
+    async def _send_bounded(
+        self, message: Message, *, terminal: bool = False
+    ) -> None:
         """One send or close under the send bound (``bounded_send``).
 
         A send that exceeds it, or fails, ends the connection by the
-        transport path: nothing further is sent, the close included.
+        transport path: nothing further is sent, the close included. Only
+        a terminal error event and its close (``terminal``) are attempted
+        once the bound has passed; any other send then never starts.
         """
         if self._gone or self._closed:
             raise _Gone
@@ -830,7 +833,8 @@ class RealtimeAdapter:
                 self._plugin,
                 self._send(message),
                 owner=self._owner,
-                watch=self._watch,
+                record=self._record,
+                terminal=terminal,
             )
         except asyncio.CancelledError:
             raise
@@ -839,19 +843,29 @@ class RealtimeAdapter:
             raise _Gone from failure
 
     async def _emit(self, kind: str, **fields: Any) -> None:
-        event = project_event({"type": kind, **fields})
+        await self._send_event({"type": kind, **fields})
+
+    async def _send_event(
+        self, event: dict[str, Any], *, terminal: bool = False
+    ) -> None:
+        text = json.dumps(project_event(event))
         await self._send_bounded(
-            {"type": "websocket.send", "text": json.dumps(event)}
+            {"type": "websocket.send", "text": text}, terminal=terminal
         )
 
-    async def _emit_error(self, kind: str, error: errors.FrontendError) -> None:
-        fields: dict[str, Any] = {"error": _error_object(error)}
+    async def _emit_error(
+        self, kind: str, error: errors.FrontendError, *, terminal: bool = False
+    ) -> None:
+        """An error event; ``terminal`` for the one that ends the session."""
+        event: dict[str, Any] = {"type": kind, "error": _error_object(error)}
         if kind == _FAILED:
-            fields.update(item_id=self._item_id, content_index=0)
-        await self._emit(kind, **fields)
+            event.update(item_id=self._item_id, content_index=0)
+        await self._send_event(event, terminal=terminal)
 
-    async def _close(self, code: int) -> None:
-        await self._send_bounded({"type": "websocket.close", "code": code})
+    async def _close(self, code: int, *, terminal: bool = False) -> None:
+        await self._send_bounded(
+            {"type": "websocket.close", "code": code}, terminal=terminal
+        )
         self._closed = True
 
     # ------------------------------------------------------------- reads

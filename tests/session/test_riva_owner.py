@@ -7,6 +7,9 @@ registry.
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import grpc
 import pytest
 from support.audio import pcm16_bytes, pcm16_sine, wav_pcm16
@@ -727,3 +730,205 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     assert lease.names() == ["feed", "abort", "release"]
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
+
+
+# ------------------------------------- terminal sends, refusals and the drain
+
+
+def _resisting(context, *, suppress: bool = False) -> SimpleNamespace:
+    """Make ``context``'s parked calls resist cancellation.
+
+    A parked ``write`` or ``abort`` that is cancelled counts it, then either
+    delays the cancellation until ``settled`` is set or, with ``suppress``,
+    swallows it and goes on as if the client had read it.
+    """
+    state = SimpleNamespace(settled=asyncio.Event(), cancellations=0)
+
+    async def stall(item) -> None:
+        if not context.block:
+            return
+        context.stalled += 1
+        context.parked.append(item)
+        try:
+            await context.unblocked.wait()
+        except asyncio.CancelledError:
+            state.cancellations += 1
+            if suppress:
+                return
+            await state.settled.wait()
+            raise
+
+    context._stall = stall
+    return state
+
+
+# @spec ING-LIFE-051, ING-EP-060
+async def test_a_final_stalled_before_the_drain_ends_by_d(
+    riva, fake_factory, started, drain_trigger
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    call.context.block = True
+    call.half_close()
+    await call.until(lambda: call.context.stalled == 1, what="the final")
+    assert lease.names() == ["flush", "finish", "release"]
+    # The owner's cleanup has ended; the handler still holds the record.
+    assert len(started.registry.records) == 1
+
+    _, deadline = await drain_trigger()
+    assert not call.done
+    await call.advance(deadline - call.clock.monotonic() + 0.01)
+
+    assert call.done, "the final's write outlived D"
+    await call.wait()
+    assert call.abandoned
+    assert call.responses == [] and call.context.aborts == []
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-058
+async def test_a_status_stalled_before_the_drain_ends_by_d(
+    riva, fake_factory, started, drain_trigger
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    lease.script("feed", Raise(failed("expired")))
+    call.context.block = True
+    call.audio(PIECE)
+    await call.until(lambda: call.context.stalled == 1, what="the status")
+    assert lease.names() == ["feed", "abort", "release"]
+
+    # Lease cleanup has ended; the record stays while the status is sent.
+    (record,) = started.registry.records.values()
+    assert not record.task.done()
+    assert not started.registry.settled()
+
+    _, deadline = await drain_trigger()
+    assert not call.done
+    await call.advance(deadline - call.clock.monotonic() + 0.01)
+
+    assert call.done, "the status outlived D"
+    await call.wait()
+    assert call.abandoned and call.context.aborts == []
+    assert call.context.code is None
+    assert len(started.registry.records) == 0
+
+
+# @spec ING-LIFE-051, ING-ERR-015
+async def test_a_blocked_refusal_ends_by_an_earlier_d(
+    riva, started, drain_trigger
+):
+    started.ingress.close()  # refused before any drain begins
+    refused = riva(start=False)
+    refused.context.block = True
+    refused.start()
+    await refused.until(lambda: refused.context.stalled == 1, what="refusal")
+    assert len(started.registry.records) == 0
+
+    # The refusal's own bound (60 s) is far off; a drain then sets D = +3 s.
+    _, deadline = await drain_trigger()
+    assert not refused.done
+    await refused.advance(deadline - refused.clock.monotonic() + 0.01)
+
+    assert refused.done, "the refusal outlived D"
+    await refused.wait()
+    assert refused.abandoned and refused.context.aborts == []
+    assert refused.requests.pulls == 0
+
+
+# @spec ING-LIFE-051
+async def test_a_final_due_after_the_rpc_deadline_is_not_started(
+    riva, fake_factory, started
+):
+    call = riva(time_remaining=20)
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    clock = call.clock
+    # ``release`` returns just after the RPC deadline; the final is then due.
+    lease.after("release", lambda: clock.set(call.context.deadline + 1))
+
+    await call.finish()
+
+    assert lease.names() == ["flush", "finish", "release"]
+    # Never started: no final and no status, as for a transport failure.
+    assert call.abandoned
+    assert call.responses == [] and call.context.aborts == []
+    assert call.context.code is None
+    assert len(started.registry.records) == 0
+
+
+class TestUnsettledSend:
+    @pytest.fixture
+    def riva_options(self):
+        return {"response_send_timeout": 5}
+
+    # @spec ING-LIFE-051, ING-EP-060, ING-ADM-016
+    async def test_a_write_delaying_its_cancellation_fails_at_its_bound(
+        self, riva, fake_factory, started
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Return(["hello"]))
+        resist = _resisting(call.context)
+        call.context.block = True
+        call.audio(PIECE)
+        await call.until(lambda: call.context.stalled == 1, what="a write")
+
+        await call.advance(5.1)
+        assert resist.cancellations == 1
+        assert not call.done  # it may settle within a cleanup wait
+        await call.advance(started.config.session_cleanup_timeout)
+
+        # Failed at its bound; the handler did not wait for it any longer.
+        assert call.done
+        await call.wait()
+        assert call.abandoned and call.context.aborts == []
+        assert lease.names() == ["feed", "abort", "release"]
+        (record,) = started.registry.records.values()
+        (unsettled,) = record.unsettled_sends
+        assert unsettled in record.children and not unsettled.done()
+        assert started.ingress.count == 1
+
+        # The record and admission go once the send settles.
+        resist.settled.set()
+        await call.settle()
+        assert unsettled.done()
+        assert len(started.registry.records) == 0
+        assert started.ingress.count == 0
+        assert call.responses == []
+
+    # @spec ING-LIFE-051
+    async def test_a_write_suppressing_its_cancellation_still_failed(
+        self, riva, fake_factory, started
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Return(["hello"]))
+        resist = _resisting(call.context, suppress=True)
+        call.context.block = True
+        call.audio(PIECE)
+        await call.until(lambda: call.context.stalled == 1, what="a write")
+
+        await call.advance(5.1)
+        await call.settle()
+
+        # The write went on after its cancellation; it failed all the same.
+        assert resist.cancellations == 1
+        assert call.done, "the handler took the late write as delivered"
+        await call.wait()
+        assert call.abandoned and call.context.aborts == []
+        assert lease.names() == ["feed", "abort", "release"]
+        call.half_close()
+        await call.settle()
+        assert call.finals == []
+        assert len(started.registry.records) == 0

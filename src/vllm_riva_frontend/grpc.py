@@ -326,12 +326,13 @@ async def _abort(
     *,
     rpc_deadline: float | None,
     owner: Any = None,
-    watch: surfaces.ShutdownWatch | None = None,
+    record: Any = None,
 ) -> NoReturn:
     """End the RPC with ``error``'s status under the send bound.
 
     Raises what ``context.abort`` raises; a status the transport does not
-    take within the bound raises ``_Abandoned`` instead.
+    take within the bound raises ``_Abandoned`` instead. A status is
+    terminal: past its bound it still gets one attempt that adds no wait.
     """
     status = plugin.catalog.grpc_status(error.code)
     try:
@@ -339,8 +340,9 @@ async def _abort(
             plugin,
             context.abort(status, error.grpc_details()),
             owner=owner,
+            record=record,
             rpc_deadline=rpc_deadline,
-            watch=watch,
+            terminal=True,
         )
     except TimeoutError:
         raise _Abandoned from None
@@ -400,14 +402,12 @@ class _RivaStream:
         record: Any,
         context: Any,
         requests: AsyncIterator[rasr.StreamingRecognizeRequest],
-        watch: surfaces.ShutdownWatch,
     ) -> None:
         self._plugin = plugin
         self._config = plugin.config
         self._owner = owner
         self.record = record
         self._context = context
-        self._watch = watch
         self._requests = requests.__aiter__()
         self._interim = True
         self._hypothesis = ""
@@ -443,7 +443,11 @@ class _RivaStream:
     # ------------------------------------------------------------- writes
 
     async def _write(self, response: rasr.StreamingRecognizeResponse) -> None:
-        """One response under the send bound; past it, the transport path."""
+        """One response under the send bound; past it, the transport path.
+
+        A response is an ordinary send: due after its bound, it is not
+        started.
+        """
         if self.gone:
             raise _ClientGone
         try:
@@ -451,8 +455,8 @@ class _RivaStream:
                 self._plugin,
                 self._context.write(response),
                 owner=self._owner,
+                record=self.record,
                 rpc_deadline=self._owner.rpc_deadline,
-                watch=self._watch,
             )
         except Exception as failure:  # beyond the bound, or the write failed
             self.gone = True
@@ -466,7 +470,7 @@ class _RivaStream:
             error,
             rpc_deadline=self._owner.rpc_deadline,
             owner=self._owner,
-            watch=self._watch,
+            record=self.record,
         )
 
     # -------------------------------------------------------------- reads
@@ -681,8 +685,10 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         Every terminal outcome is the owner's one selected cause, projected
         with ``context.abort``; a client cancellation produces no response,
         and a final is sent only after ``finish`` and ``release`` succeeded.
-        A write or status beyond its send bound ends the call cancelled, for
-        which ``grpc.aio`` sends no status: nothing more reaches the client.
+        After a write or status fails its send bound the handler ends with
+        no status: nothing more is written, and the HTTP/2 stream stays open
+        until the client cancels, its deadline passes, keepalive finds the
+        peer dead or the server stops.
         """
         try:
             await self._streaming(request_iterator, context)
@@ -711,6 +717,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         record = registry.register(
             admission.OwnerKind.stream, asyncio.current_task()
         )
+        surfaces.hold(record)
         stream: _RivaStream | None = None
         try:
             owner = lease.StreamOwner(
@@ -723,9 +730,8 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                 catalog=plugin.catalog,
             )
             owner.rpc_deadline = rpc_deadline
-            watch = surfaces.watch_shutdown(registry, record, owner)
             stream = _RivaStream(
-                plugin, owner, record, context, request_iterator, watch
+                plugin, owner, record, context, request_iterator
             )
             stream.arm()
             try:
@@ -804,7 +810,9 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         Every validation, the encoded-size and decoded-duration bounds and
         header inference finish before a file-gate permit is taken; at each
         boundary a cancellation or an already expired RPC deadline wins. A
-        status beyond its send bound ends the call cancelled, with none.
+        status that fails its send bound ends the handler with no status.
+        The response itself is written by ``grpc.aio`` after the handler
+        returns, so the frontend does not bound its delivery.
         """
         try:
             return await self._recognize(request, context)

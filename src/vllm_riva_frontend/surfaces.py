@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, TypeVar
 
@@ -97,26 +98,53 @@ def unregister(registry: Any, record: Any) -> None:
         registry.unregister(record)
 
 
+def hold(record: Any) -> None:
+    """Make the handler, not the owner's cleanup, end ``record``.
+
+    The record then stays registered while the handler sends its final,
+    error or close after the cleanup ended, so the drain and ``stop`` still
+    reach it; ``release_owner`` removes it when the handler ends.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        record.held_by_handler = True
+
+
+def _holding(record: Any) -> asyncio.Future[Any] | None:
+    """A task that still holds ``record``: its continuation or a send."""
+    continuation: asyncio.Future[Any] | None = getattr(
+        record, "continuation", None
+    )
+    if continuation is not None and not continuation.done():
+        return continuation
+    sends: Iterable[asyncio.Future[Any]] = getattr(
+        record, "unsettled_sends", ()
+    )
+    for task in list(sends):
+        if not task.done():
+            return task
+    return None
+
+
 # @spec ING-LIFE-058, ING-EP-060
 def release_owner(registry: Any, record: Any, admitted: Any) -> None:
     """Release a handler's record and admission as its handler ends.
 
     A ``record.continuation`` still running (an owner's cleanup that
-    outlived the answer) holds both until it ends: they are released from
-    its done callback instead, once. ``Admission.release`` is idempotent and
-    ``unregister`` tolerates a record the continuation already removed.
+    outlived the answer) or a send cancelled at its bound and not yet
+    settled holds both until it ends: they are released from its done
+    callback instead, once nothing holds the record. ``Admission.release``
+    is idempotent and ``unregister`` tolerates a record already removed.
     """
-    continuation = getattr(record, "continuation", None)
-    if continuation is not None and not continuation.done():
 
-        def released(_: Any) -> None:
-            unregister(registry, record)
-            admitted.release()
+    def release(_: Any = None) -> None:
+        holder = _holding(record)
+        if holder is not None:
+            holder.add_done_callback(release)
+            return
+        unregister(registry, record)
+        admitted.release()
 
-        continuation.add_done_callback(released)
-        return
-    unregister(registry, record)
-    admitted.release()
+    release()
 
 
 def torn_down(plugin: Any) -> bool:
@@ -171,42 +199,6 @@ async def settle_shielded(
 # ------------------------------------------------------------------- sends
 
 
-class ShutdownWatch:
-    """A stream record's shutdown observer: the owner first, then its sends.
-
-    It forwards the drain's trigger to the stream owner, then wakes a send
-    in progress, which recomputes its bound against the owner's ``D``.
-    """
-
-    def __init__(self, owner: Any) -> None:
-        """Watch for the trigger on behalf of ``owner``."""
-        self.owner = owner
-        self.observed = asyncio.Event()
-
-    def observe_shutdown(self, trigger: Any) -> Any:
-        """Deliver ``trigger`` to the owner, then wake the sends."""
-        try:
-            return self.owner.observe_shutdown(trigger)
-        finally:
-            self.observed.set()
-
-
-def watch_shutdown(registry: Any, record: Any, owner: Any) -> ShutdownWatch:
-    """Put a ``ShutdownWatch`` in front of ``owner`` as the record's observer.
-
-    ``attach_owner`` delivers a trigger already raised, which the owner
-    ignores when it has already observed it.
-    """
-    watch = ShutdownWatch(owner)
-    attach = getattr(registry, "attach_owner", None)
-    if callable(attach):
-        attach(record, watch)
-    else:
-        with contextlib.suppress(AttributeError, TypeError):
-            record.owner = watch
-    return watch
-
-
 def _send_bound(
     limit: float, plugin: Any, owner: Any, rpc_deadline: float | None
 ) -> float:
@@ -218,61 +210,167 @@ def _send_bound(
     return min([limit, *(float(d) for d in candidates if d is not None)])
 
 
+def _settle_bound(plugin: Any, owner: Any) -> float:
+    """How long a cancelled send may take to settle: as a cleanup wait.
+
+    The owner's cleanup budget while its cleanup runs, otherwise
+    ``session_cleanup_timeout`` from now; clipped to ``D`` while draining.
+    """
+    cleanup = getattr(getattr(owner, "bounds", None), "cleanup", None)
+    deadline: float | None = getattr(cleanup, "deadline", None)
+    if deadline is None:
+        deadline = plugin.clock.monotonic() + float(
+            plugin.config.session_cleanup_timeout
+        )
+    drains = [
+        getattr(plugin, "drain_deadline", None),
+        None if owner is None else owner.drain_deadline,
+    ]
+    return min([float(deadline), *(float(d) for d in drains if d is not None)])
+
+
+def _start(
+    plugin: Any, record: Any, awaitable: Awaitable[T]
+) -> asyncio.Future[T]:
+    """Start a send's task under ``record`` or, with none, the registry."""
+    if record is not None:
+        return child(record, awaitable)
+    task = asyncio.ensure_future(awaitable)
+    keep = getattr(getattr(plugin, "registry", None), "keep", None)
+    if callable(keep):
+        keep(task)
+    return task
+
+
+def _consume(task: asyncio.Future[Any]) -> None:
+    """Retrieve an abandoned send's outcome so none is reported unseen."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _until(
+    plugin: Any,
+    record: Any,
+    futures: set[asyncio.Future[Any]],
+    deadline: float,
+) -> None:
+    """Wait for one of ``futures`` or ``deadline`` on the plugin's clock.
+
+    The deadline is a ``clock.sleep`` in a task kept like the send's, so
+    the wait starts no task outside the registry.
+    """
+    remaining = max(0.0, deadline - plugin.clock.monotonic())
+    sleeper = _start(plugin, record, plugin.clock.sleep(remaining))
+    try:
+        await asyncio.wait(
+            {*futures, sleeper}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        sleeper.cancel()
+
+
+def _drain_notice(plugin: Any) -> asyncio.Future[None] | None:
+    """The plugin's drain announcement, while ``D`` is not yet set."""
+    announced = getattr(plugin, "drain_announced", None)
+    if not callable(announced):
+        return None
+    notice: asyncio.Future[None] = announced()
+    if notice.done():
+        return None
+    return notice
+
+
+async def _settle(
+    plugin: Any, owner: Any, record: Any, task: asyncio.Future[Any]
+) -> None:
+    """Wait for a cancelled send to settle, no longer than a cleanup wait.
+
+    An expired bound still gives it one loop turn to act on its
+    cancellation. A send still unsettled then holds the record
+    (``unsettled_sends``) until it settles or ``stop`` cancels it.
+    """
+    deadline = _settle_bound(plugin, owner)
+    while not task.done():
+        if plugin.clock.monotonic() >= deadline:
+            await asyncio.sleep(0)
+            break
+        await _until(plugin, record, {task}, deadline)
+    if task.done():
+        return
+    sends = getattr(record, "unsettled_sends", None)
+    if isinstance(sends, set):
+        sends.add(task)
+        task.add_done_callback(sends.discard)
+
+
 # @spec ING-LIFE-051, ING-ADM-016
 async def bounded_send(
     plugin: Any,
     send: Awaitable[T],
     *,
     owner: Any = None,
+    record: Any = None,
     rpc_deadline: float | None = None,
-    watch: ShutdownWatch | None = None,
+    terminal: bool = False,
 ) -> T:
     """One send or close under ``response_send_timeout``, on either surface.
 
     The bound runs from the send's start and is clipped to ``rpc_deadline``
     and, while draining, to ``D`` (the plugin's, or the owner's once it
-    observed the trigger). A watched send is woken by the trigger and
-    recomputes its bound, so a send already waiting when ``D`` is set
-    observes it. A bound already reached leaves no wait: the send starts and
-    runs to its first suspension, so a transport that takes it at once still
-    gets it (the abort row at ``D``), and anything else is cancelled. Raises
-    ``TimeoutError`` when the bound is exceeded; the send's own failure
-    propagates.
+    observed the trigger). A waiting send also waits for the plugin's drain
+    announcement, so one in flight when the drain begins re-clips to ``D``
+    at once, with or without an owner.
+
+    A send whose bound has already passed does not start, unless it is
+    ``terminal`` (a gRPC status; a Realtime error event and its close):
+    that one starts, runs to its first suspension and is cancelled if not
+    complete, adding no wait. A send that exceeds its bound has failed,
+    even if it completes later: it is cancelled and its settlement awaited
+    no longer than a cleanup wait; one still unsettled stays under
+    ``record`` (or, with none, the registry) until it settles or ``stop``.
+    Raises ``TimeoutError`` for a send past its bound; the send's own
+    failure propagates.
     """
     clock = plugin.clock
     limit = clock.monotonic() + float(plugin.config.response_send_timeout)
-    task = asyncio.ensure_future(send)
-    first = True
+    expired = clock.monotonic() >= _send_bound(
+        limit, plugin, owner, rpc_deadline
+    )
+    if expired and not terminal:
+        if inspect.iscoroutine(send):
+            send.close()
+        raise TimeoutError
+    task = _start(plugin, record, send)
+    task.add_done_callback(_consume)
+    exceeded = False
     try:
+        first = True
         while not task.done():
             bound = _send_bound(limit, plugin, owner, rpc_deadline)
             if clock.monotonic() >= bound:
                 if not first:
+                    exceeded = True
                     break
+                # A terminal status's one attempt: its first step.
                 first = False
                 await asyncio.sleep(0)
                 continue
             first = False
             waits: set[asyncio.Future[Any]] = {task}
-            signal: asyncio.Future[Any] | None = None
-            if watch is not None and not watch.observed.is_set():
-                signal = asyncio.ensure_future(watch.observed.wait())
-                waits.add(signal)
+            notice = _drain_notice(plugin)
+            if notice is not None:
+                waits.add(notice)
             try:
-                await clock.wait_for(
-                    asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED),
-                    bound,
-                )
-            except TimeoutError:
-                pass
+                await _until(plugin, record, waits, bound)
             finally:
-                if signal is not None:
-                    signal.cancel()
+                if notice is not None:
+                    notice.cancel()
     finally:
         if not task.done():
+            exceeded = True
             task.cancel()
-            await asyncio.wait({task})
-    if task.cancelled():
+            await _settle(plugin, owner, record, task)
+    if exceeded:
         raise TimeoutError
     return task.result()
 

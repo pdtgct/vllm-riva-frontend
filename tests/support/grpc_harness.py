@@ -57,6 +57,11 @@ class FakeServicerContext:
     ``stalled`` counts the calls that waited and ``parked`` keeps what each
     carried (the response, or the ``RpcAbort``), in order. A call cancelled
     while parked delivers nothing: no write and no status.
+
+    That models a transport that takes nothing when cancelled while parked.
+    A real ``grpc.aio`` context differs: a write or status it has taken on
+    its first step is delivered even if the call is cancelled afterwards,
+    so a cancelled send is not proof that the client saw nothing.
     """
 
     def __init__(

@@ -15,7 +15,7 @@ paths below are relative to that tree.
 | `__init__` | `plugin()` (entry point `riva_frontend = vllm_riva_frontend:plugin` in group `vllm.endpoint_plugins`): a zero-argument factory returning `RivaFrontendPlugin`; `__version__` |
 | `version` | `__version__` (the distribution version `/v1/version` reports) |
 | `clock` | `Clock` (the structural `Protocol` of the clock seam: `monotonic()`, `async sleep(seconds)`, `async wait_for(awaitable, deadline)`, which awaits until the absolute `deadline` and otherwise cancels the awaitable and raises `TimeoutError`, as `asyncio.wait_for` does); `RealClock` (`time.monotonic` and asyncio), the clock `RivaFrontendPlugin(clock=None)` uses |
-| `lifecycle` | `RivaFrontendPlugin(*, clock=None, entry_points=None)` (`clock=None` is `clock.RealClock()`) with class attributes `name = "riva_frontend"`, `required_tasks = ("realtime",)`, `owns_non_http_listener = True`, and the lifecycle methods `attach_router(app)`, `async init_state(engine_client, state, args)`, `async start(state)`, `ready(state) -> bool`, `async drain(state, timeout)`, `async stop(state)`; attributes tests read after `init_state`: `config` (a `FrontendConfig`), `served_model` (the identity string), `deadlines` (a `StreamDeadlines`), `capacity` (a `Capacity`), `files_enabled`, `factory`, `registry` (an `OwnerRegistry`), `ingress` (an `IngressCap`), `file_gate` (a `FileGate` or `None`), `catalog` (an `ErrorCatalog`), `servicer` (a `RivaServicer`); after `start`: `server` (the `grpc.aio.Server`), `health` (the gRPC `HealthServicer`), `admission_open`, `fault_collector`, `listener_monitor` (tasks); `torn_down`, `fault` (the recorded fault or `None`), `drain_deadline` (`D`, set while draining). `OwnerRegistry()` with `register(kind, task) -> OwnerRecord`, `unregister(record)`, `records` (a mapping), `attach_continuation(record, task)`, `cancel_all() -> list[Task]`, and what owners need from the plugin without holding it (Registry contracts, below); `OwnerRecord(kind, task, continuation=None, children=set(), owner=None)` (`children` is a mutable `set[Task]`; `owner` is the record's shutdown observer); `ShutdownTrigger(deadline)`, the object `drain` raises for stream owners at the settle point; `engine_reserve(timeout)`, `settle_point(now, D)` (the two formulas of the vehicle leaf); `FaultCollector(factory, period=1.0, on_fault)`, `ListenerMonitor(server, on_exit)`; `StartupError` (the exception `init_state` and `start` raise, with `failures: list[str]`) |
+| `lifecycle` | `RivaFrontendPlugin(*, clock=None, entry_points=None)` (`clock=None` is `clock.RealClock()`) with class attributes `name = "riva_frontend"`, `required_tasks = ("realtime",)`, `owns_non_http_listener = True`, and the lifecycle methods `attach_router(app)`, `async init_state(engine_client, state, args)`, `async start(state)`, `ready(state) -> bool`, `async drain(state, timeout)`, `async stop(state)`; attributes tests read after `init_state`: `config` (a `FrontendConfig`), `served_model` (the identity string), `deadlines` (a `StreamDeadlines`), `capacity` (a `Capacity`), `files_enabled`, `factory`, `registry` (an `OwnerRegistry`), `ingress` (an `IngressCap`), `file_gate` (a `FileGate` or `None`), `catalog` (an `ErrorCatalog`), `servicer` (a `RivaServicer`); after `start`: `server` (the `grpc.aio.Server`), `health` (the gRPC `HealthServicer`), `admission_open`, `fault_collector`, `listener_monitor` (tasks); `torn_down`, `fault` (the recorded fault or `None`), `drain_deadline` (`D`, set while draining), `drain_announced() -> Future` (resolved once `drain` has set `D`; Servicer, below). `OwnerRegistry()` with `register(kind, task) -> OwnerRecord`, `unregister(record)`, `records` (a mapping), `attach_continuation(record, task)`, `keep(task)` (a task of no record, a refusal's send), `cancel_all() -> list[Task]`, and what owners need from the plugin without holding it (Registry contracts, below); `OwnerRecord(kind, task, continuation=None, children=set(), owner=None, held_by_handler=False, unsettled_sends=set())` (`children` is a mutable `set[Task]`; `owner` is the record's shutdown observer; `held_by_handler` and `unsettled_sends`: Registry contracts, below); `ShutdownTrigger(deadline)`, the object `drain` raises for stream owners at the settle point; `engine_reserve(timeout)`, `settle_point(now, D)` (the two formulas of the vehicle leaf); `FaultCollector(factory, period=1.0, on_fault)`, `ListenerMonitor(server, on_exit)`; `StartupError` (the exception `init_state` and `start` raise, with `failures: list[str]`) |
 | `config` | `FrontendConfig` (one attribute per option of the vehicle leaf's table, including the derived `max_concurrent_files`, `max_file_owners` and `file_execution_timeout`); `parse_config(additional_config) -> FrontendConfig` (reads key `riva_frontend`; raises `ConfigError` listing every failure; derives `file_execution_timeout`, which depends on configuration only, and leaves `max_concurrent_files` and `max_file_owners` `None` when unset, since they depend on the engine's capacity); `ConfigError(failures)`, a subclass of `lifecycle.StartupError`; `StreamDeadlines(never_fed_timeout, parked_idle_timeout, draining_timeout)`, `read_stream_deadlines(additional_config) -> StreamDeadlines`, `DEFAULT_STREAM_DEADLINES` (15, 60, 40); `check_bounds(config, deadlines) -> list[str]`; `Capacity(slots, active_limit)`, `read_capacity(vllm_config) -> Capacity`; `derive_file_caps(config, capacity, service_present) -> tuple[int, int, bool]` (`max_concurrent_files`, `max_file_owners`, files enabled); `DeploymentProvenance` and `build_deployment_provenance(config)` (the four typed fields of the metadata route); `PLUGIN_KEY = "riva_frontend"`, `STREAM_ADMISSION_KEY = "stream_admission"` |
 | `errors` | `ErrorCatalog` (the catalog of the errors leaf: `codes`, `grpc_status(code)`, `http_status(code)`, `realtime_close(code)`); `catalog()`; `FrontendError(code, detail="", fields=(), authority=None)` (the exception every surface projects; `grpc_details()` renders `<code>: <detail> (fields: <names>)`, `http_body(status)` renders core's error shape); `seam_error(exc) -> tuple[str | None, str | None]` (`getattr` of `session_error` and `reason`); `project_seam_error(exc) -> FrontendError` (the seam reason mapping); `classify_core_exception(exc) -> FrontendError` and `project_error_response(response) -> FrontendError` (the two file-path tables); `MODEL_LEN_PREFIX = "file exceeds max_model_len: "`; `ESCALATES = frozenset({"engine_dead"})` |
 | `frontend` | `ACCEPT_MATRIX`, `RESAMPLER_ID = "scipy-poly-v1"`, `validate_format(encoding, sample_rate_hz, channels) -> FormatError | None`, `FormatError(fields, detail)`, `RiffFormat(encoding, sample_rate_hz, channels, data_offset, data_length)`, `sniff_riff(buffer, *, max_header_bytes) -> RiffFormat | FormatError | None` (`None` means more bytes are needed), `mulaw_table()`, `alaw_table()`, `StreamingAudioFrontend(*, encoding, sample_rate_hz)` with `decode(data, *, max_samples) -> Iterator[np.ndarray]` (whole samples, resampled, sliced to at most `max_samples`), `drain() -> np.ndarray` (the resampler lookahead; the byte residual is discarded), `reset()` (the Realtime `clear`), `residual_bytes`; `pcm16(samples) -> np.ndarray[int16]`, `requantize(samples) -> np.ndarray[float32]` (the stream-side helper), `encode_wav16(samples) -> bytes` (44-byte header, 16 kHz mono); `duration_from_bytes(encoding, sample_rate_hz, byte_count) -> float` |
@@ -25,7 +25,7 @@ paths below are relative to that tree.
 | `multipart` | `MultipartLimits(envelope_max_bytes, content_type_max_bytes, boundary_max_bytes, max_parts, max_header_bytes, text_field_max_bytes)`; `parse_content_type(value: str, limits) -> bytes` (the boundary; raises `FrontendError`); `parse_content_length(headers, limits)`; `MultipartForm(fields: list[tuple[str, str]], file: io.BytesIO | None, filename, content_type)`; `async parse_multipart(receive, boundary, limits, *, deadline, clock) -> MultipartForm` (feeds ASGI chunks to `python_multipart.MultipartParser` callbacks; retains nothing beyond the parts; raises `FrontendError` or `ClientDisconnect`); `make_upload(form) -> UploadFile` (over the form's own `BytesIO`) |
 | `grpc` | `RivaServicer(plugin)` implementing `StreamingRecognize` (a coroutine that writes with `context.write`), `Recognize` and `GetRivaSpeechRecognitionConfig` (coroutines); `register_aio_services(server, servicer) -> HealthServicer` (servicer, health, reflection); `build_server(config, servicer) -> tuple[grpc.aio.Server, HealthServicer]` (options from `grpc_receive_max_bytes` and `grpc_keepalive_seconds`; the server is unbound: `start` binds `grpc_bind` and starts it; the health servicer is `grpc_health.v1.health.aio.HealthServicer`); `validate_recognition_config(config, *, served_model, locales, default_locale) -> list[FrontendError]`; `FIELD_DISPOSITIONS` (one entry per `RecognitionConfig` field of the pinned stubs); `ENCODING_NAMES`; `RIVA_SERVICE_NAME`; `config_response(plugin) -> RivaSpeechRecognitionConfigResponse` |
 | `nim_ws` | `RealtimeDispatcher(app, *, plugin)`: the pure-ASGI middleware `attach_router` adds; `dispatch_decision(scope) -> DispatchDecision` (an `Enum`: `CLAIM` or `PASS`); `bootstrap_session(model_name, default_locale) -> dict`; `RealtimeAdapter(*, plugin, scope, receive, send)` with `async run()`; `project_event(event) -> dict`; `validate_session_update(update, *, served_model, locales, default_locale, first) -> list[FrontendError]`; `EVENT_TYPES` (the client event names); `BOOTSTRAP_PATH = "/v1/realtime/transcription_sessions"`, `REALTIME_PATH = "/v1/realtime"`; `suffix(previous, current) -> str` |
-| `surfaces` | What `grpc` and `nim_ws` share (no test imports it): `owner_error(owner)`, `selected_error(owner, error)` (the owner's one selected cause wins on the wire), `async settle(owner, error, phase)`, `child(record, awaitable)` (a task kept in `record.children`), `unregister(registry, record)` (tolerates a record already removed), `release_owner(registry, record, admitted)` (a handler's end: at once, or from a running `record.continuation`'s done callback), `torn_down(plugin)`, `async join(tasks, *, stopped)` and `async settle_shielded(plugin, record, owner, error, phase)` (cleanup joined through cancellation), `ShutdownWatch` and `watch_shutdown(registry, record, owner) -> ShutdownWatch` (the record's shutdown observer in front of the owner), `async bounded_send(plugin, send, *, owner=None, rpc_deadline=None, watch=None)` (one send under ING-LIFE-051's bound; `TimeoutError` past it), `locale_error(value, *, field, locales, default_locale)` and `header_problem(header, declared_rate, declared_channels)` (a resolved RIFF header against the declared constraints and the accept-matrix) |
+| `surfaces` | What `grpc` and `nim_ws` share (no test imports it): `owner_error(owner)`, `selected_error(owner, error)` (the owner's one selected cause wins on the wire), `async settle(owner, error, phase)`, `child(record, awaitable)` (a task kept in `record.children`), `unregister(registry, record)` (tolerates a record already removed), `hold(record)` (sets `held_by_handler`), `release_owner(registry, record, admitted)` (a handler's end: at once, or from the done callback of a running `record.continuation` or unsettled send), `torn_down(plugin)`, `async join(tasks, *, stopped)` and `async settle_shielded(plugin, record, owner, error, phase)` (cleanup joined through cancellation), `async bounded_send(plugin, send, *, owner=None, record=None, rpc_deadline=None, terminal=False)` (one send under ING-LIFE-051's bound; `TimeoutError` past it), `locale_error(value, *, field, locales, default_locale)` and `header_problem(header, declared_rate, declared_channels)` (a resolved RIFF header against the declared constraints and the accept-matrix) |
 | `operational` | `OPERATIONAL_PATHS` (`/v1/health/ready`, `/v1/health/live`, `/v1/version`, `/v1/metadata`); `operational_router(plugin) -> APIRouter`; `readiness_body(ready) -> tuple[int, dict]`, `liveness_body()`, `version_body()`, `metadata_body(served_model, provenance)` |
 
 ### Routing constraints the tests observe
@@ -75,19 +75,44 @@ entry names its ground: a design section, a spec, a core file or the public clie
 - Every write and every `context.abort` (the pre-owner refusal of ING-ERR-015 included) runs
   through `surfaces.bounded_send`: `response_send_timeout` from the send's start, clipped to the
   RPC's absolute deadline and, while draining, to `D` (the plugin's `drain_deadline`, or the
-  owner's once it observed the trigger, which wakes a send already waiting). A bound already
-  reached leaves no wait: the send starts and runs to its first suspension, so a status the
-  transport takes at once (the ING-ERR-059 abort row at `D`, `request_timeout` after the RPC
-  deadline) is still made, and anything else is cancelled. A send past its bound, or a failed
-  write, takes the transport-failure path: the owner is failed with phase `transport` (cleanup as
-  for a disconnect, ING-LIFE-038), nothing more is written, and the handler ends cancelled, for
-  which `grpc.aio` sends no status (a refusal with no owner just ends so). Ground: ING-LIFE-051,
-  ING-ADM-016, ING-ERR-059, ING-ERR-056.
-- A handler's cleanup runs as a child of its record and is joined (`surfaces.settle_shielded`)
-  through any further cancellation, which is absorbed unless the plugin is torn down; the handler
-  then releases its record and admission with `surfaces.release_owner`, which leaves both to a
-  running `record.continuation` (Stream owner, "Cancellation settlement is bounded"). The same
-  holds on the Realtime adapter. Ground: ING-LIFE-058, ING-EP-059, ING-EP-060.
+  owner's once it observed the trigger). Ground: ING-LIFE-051, ING-ADM-016, ING-ERR-059,
+  ING-ERR-056.
+- Drain announcement: `drain` sets `drain_deadline` and then resolves every future handed out by
+  `RivaFrontendPlugin.drain_announced()`. A waiting send includes one in its wait, with or without
+  an owner, so a send already waiting when the drain begins re-clips to `D` at once, not at the
+  settle point; the trigger itself is delivered to the `StreamOwner`, which attaches itself as the
+  record's shutdown observer. Ground: ING-LIFE-051; session design, Bounds ("Sends").
+- Send rule. A send whose bound has already passed when it is due is not started (the coroutine
+  is closed) and takes the transport-failure path, unless it is `terminal=True`: a status
+  (`context.abort`) here, a terminal `error` event and its close on the Realtime adapter. A
+  terminal send starts, runs to its first suspension and is cancelled if not complete, adding no
+  wait, so a status the transport takes at once (the ING-ERR-059 abort row at `D`,
+  `request_timeout` after the RPC deadline) is still made. Writes (hypotheses, the final) are
+  ordinary sends. A send that exceeds its bound has failed even if the transport later completes
+  it or suppresses the cancellation: it is cancelled, and the wait for it to settle is bounded
+  like a cleanup wait (the owner's cleanup deadline while its cleanup runs, otherwise
+  `session_cleanup_timeout` from the cancellation; clipped to `D`; an expired bound still gives it
+  one loop turn). The send's task is a child of the stream's record (`record=`); one still
+  unsettled at that bound joins `record.unsettled_sends` and holds the record until it settles or
+  `stop` cancels it, and the handler does not wait for it. A refusal has no record: its send is
+  kept by `registry.keep(task)` instead. Ground: ING-LIFE-051; session design, Bounds ("Sends");
+  ING-EP-060.
+- A send past its bound, or a failed write, takes the transport-failure path: the owner is failed
+  with phase `transport` (cleanup as for a disconnect, ING-LIFE-038), nothing more is written,
+  and the handler ends with no status (it raises `CancelledError`; a refusal with no owner just
+  ends so). The HTTP/2 stream then stays open until the client cancels, its deadline passes,
+  transport keepalive finds the peer dead or the server stops; the owner, its slot and its lease
+  are already released. Ground: ING-LIFE-051, ING-LIFE-038; session design, Bounds ("Sends").
+- Record lifetime. Both streaming surfaces register the record and mark it `held_by_handler`
+  (`surfaces.hold`), so the end of the owner's cleanup does not remove it: the record stays
+  registered until the handler, its `record.continuation` and its `unsettled_sends` have all
+  ended, and the drain and `stop` reach a final, error or close still being sent. A handler's
+  cleanup runs as a child of its record and is joined (`surfaces.settle_shielded`) through any
+  further cancellation, which is absorbed unless the plugin is torn down; the handler then
+  releases its record and admission with `surfaces.release_owner`, which leaves both to a running
+  continuation (Stream owner, "Cancellation settlement is bounded") or unsettled send. The same
+  holds on the Realtime adapter. Ground: ING-LIFE-058, ING-EP-059, ING-EP-060; session design,
+  Bounds ("Sends").
 - `FrontendError.grpc_details()` renders `<code>: <detail>` and appends ` (fields: <a>, <b>)` only
   when the error names fields; a `busy` error's detail begins with `authority: <authority>`, so
   the gRPC details and the HTTP `message` both begin `busy: authority: load_shed` (or `provider`).
@@ -147,11 +172,12 @@ entry names its ground: a design section, a spec, a core file or the public clie
 - `dispatch_decision(scope) -> DispatchDecision`, an `Enum` in `nim_ws` with members `CLAIM` and
   `PASS`. Ground: the dispatcher section of the streaming design.
 - Every adapter send and close (the refusal of ING-NIMWS-016 included) runs through
-  `surfaces.bounded_send` with the bound of the Servicer section (no RPC deadline): clipped to `D`
-  whenever one is set, recomputed when the trigger reaches a send already waiting (the adapter puts
-  a `ShutdownWatch` in front of its owner), and offered without waiting once `D` has passed, so the
-  1012 abort row reaches a transport that takes it at once and a stalled one is abandoned at `D`.
-  Ground: ING-LIFE-051, ING-ERR-051, ING-ERR-059.
+  `surfaces.bounded_send` with the bound, drain announcement, send rule and record lifetime of the
+  Servicer section (no RPC deadline): clipped to `D` whenever one is set, re-clipped when the drain
+  begins, and, once `D` has passed, offered without waiting only for the terminal `error` (or
+  `failed`) event and its close, so the 1012 abort row reaches a transport that takes it at once
+  and a stalled one is abandoned at `D`. Other sends past `D` (`completed`, acknowledgements, a
+  refusal's `websocket.accept`) are not started. Ground: ING-LIFE-051, ING-ERR-051, ING-ERR-059.
 - A `base64` payload that does not decode is `invalid_audio` (the `failed` event, close 1008): the
   `audio` field has the right type, so the event is structurally valid and its payload is what
   cannot be decoded. Ground: ING-ERR-022, ING-NIMWS-023.
@@ -205,8 +231,14 @@ entry names its ground: a design section, a spec, a core file or the public clie
   ING-EP-035.
 - `OwnerRegistry()` takes no arguments. `register(kind, task)` returns an `OwnerRecord` with
   `continuation=None` and `children=set()`; `children` is a mutable `set[asyncio.Task]` the owner
-  adds to directly; `attach_continuation(record, task)` sets `continuation`. `cancel_all()` cancels
-  tasks, continuations and children and returns them. Ground: ING-EP-060, ING-FILE-071.
+  adds to directly; `attach_continuation(record, task)` sets `continuation` (a file request's
+  cleanup continuation, or a stream owner's that outlived its answer). `held_by_handler` (set by
+  the streaming surfaces) makes the handler's `surfaces.release_owner`, not the end of the
+  `StreamOwner`'s cleanup, remove the record; `unsettled_sends` are the stream's sends cancelled at
+  their bound and not yet settled, which hold the record (Servicer, "Record lifetime"). `keep(task)`
+  holds a task that belongs to no record (a refusal's unsettled send) until it ends. `cancel_all()`
+  cancels tasks, continuations, children and kept tasks and returns them. Ground: ING-EP-059,
+  ING-EP-060, ING-FILE-071.
 - `StartupError(failures)` is the exception `init_state` and `start` raise; `ConfigError` is a
   subclass of it raised by `parse_config`, so a configuration failure propagates from `init_state`
   as a `StartupError` whose `failures` list every option. `parse_config` derives
@@ -297,7 +329,8 @@ entry names its ground: a design section, a spec, a core file or the public clie
   continuation (`registry.attach_continuation(record, task)`). It waits, unbounded, for the call
   to settle, starts no other lease call before then, runs the remaining cleanup with the spent
   budget (each call started, then cancelled after its first suspension) and unregisters the record
-  when it ends; `stop` cancels it, and the lease then gets `teardown` only. A surface whose handler
+  when it ends, unless the record is `held_by_handler`, whose handler removes it (Servicer, "Record
+  lifetime"); `stop` cancels it, and the lease then gets `teardown` only. A surface whose handler
   ends while `record.continuation` is running releases its `Admission`, and unregisters the
   record, from that task's done callback, not at once. Ground: ING-LIFE-035, ING-LIFE-037,
   ING-LIFE-057, ING-LIFE-058 (the record persists until its last cleanup step), ING-EP-043.

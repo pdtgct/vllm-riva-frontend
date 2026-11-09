@@ -346,7 +346,7 @@ Every lease call and every wait for client input runs under a finite frontend bo
 | `lease_call_timeout` | a `feed` or `update_locale` call starts | never | `service_unavailable` (retryable); the lease is broken (`abort`, `release`) |
 | `max_session_duration` (optional) | successful `open` | never | `request_timeout` |
 | `session_finalization_timeout` | finalization accepted | never | `finalization_timeout` |
-| `session_cleanup_timeout` | terminal cleanup begins | never | hand-over to the factory (above) |
+| `session_cleanup_timeout` | terminal cleanup begins, including the settlement of a cancelled call | never | hand-over to the factory (above); an unsettled call and the rest of cleanup stay under the record's continuation |
 | `response_send_timeout` | a send or close starts | never | transport failure: no further sends; cleanup as for a disconnect |
 
 "Accepted audio" is a `feed` call whose `on_accepted` fired, not socket bytes, keepalive or rejected
@@ -370,6 +370,20 @@ a wait that ends because it reached the drain deadline expires as the drain dead
 row), not as its phase. The bounds are checked at startup against the engine deadlines
 (vehicle leaf). Every send and close on a streaming surface, including the refusals that create no
 owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and the drain deadline.
+
+**Sends.** The drain announces its deadline to every send in flight, with or without an owner, so a
+send already waiting re-clips its bound at once. A send whose bound has already passed when it is
+due does not start, and takes the transport-failure path, unless it carries a terminal status (a
+gRPC status or abort; a Realtime `error` event and its close). A terminal status gets one attempt
+that adds no wait: it starts, runs to its first suspension and is cancelled if it has not
+completed, so the shutdown and deadline rows of the errors leaf reach a client that is still
+reading. A send that exceeds its bound has failed, even if it later completes; the wait for the
+cancelled send to settle is bounded like every other cleanup wait, and a send still unsettled stays
+under the stream's record until it settles or `stop`. The stream's record stays registered until
+both its handler and its cleanup continuation have ended, so the drain and `stop` reach a terminal
+send. After a gRPC send fails, the handler ends without writing a status; the HTTP/2 stream stays
+open until the client cancels, its deadline passes, transport keepalive finds the peer dead or the
+server stops. The owner, its slot and its lease are already released by then.
 When several deadlines apply, the earliest absolute deadline wins (the errors leaf's precedence
 rule).
 

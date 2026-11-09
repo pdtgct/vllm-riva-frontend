@@ -69,7 +69,8 @@ One counting gate of `max_concurrent_files` covers `Recognize` and the file rout
   `file_gate_wait_timeout`; expiry answers `busy` with `authority: load_shed`.
 - A permit is held from the moment the request has passed every earlier check until the response
   body has been fully sent (including `stream=true`), and releases then. For `Recognize` it is held
-  until the response is returned.
+  until the response is returned. gRPC writes that unary response after the handler returns, so
+  the frontend does not bound its delivery; the server's stop at the drain deadline ends it.
 - The gate caps files in flight; it does not reserve capacity for streams. A finished file's slot
   stays occupied until the engine retires it, so for a short time slightly more than
   `max_concurrent_files` slots can be held by files. Streams keep the engine's admission, and

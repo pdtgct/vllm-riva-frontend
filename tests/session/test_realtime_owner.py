@@ -8,6 +8,8 @@ session object with a language set.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 
 import pytest
@@ -542,3 +544,249 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     assert lease.names() == ["feed", "abort", "release"]
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
+
+
+# ------------------------------------- terminal sends, refusals and the drain
+
+
+class StubbornSendWebSocket(BlockingSendWebSocket):
+    """A ``BlockingSendWebSocket`` whose parked sends resist cancellation.
+
+    A parked send that is cancelled counts the cancellation, then either
+    delays it until ``settled`` is set (``suppress=False``) or swallows it
+    and returns as if it had been sent (``suppress=True``).
+    """
+
+    def __init__(self, *args, suppress: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.suppress = suppress
+        self.settled = asyncio.Event()
+        self.cancellations = 0
+
+    async def _send(self, message) -> None:
+        try:
+            await super()._send(message)
+        except asyncio.CancelledError:
+            self.cancellations += 1
+            if self.suppress:
+                return
+            await self.settled.wait()
+            raise
+
+
+async def _final_stalled(realtime, first_update, fake_factory, ws):
+    """A session whose ``completed`` event is parked after ``release``."""
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    await session.append(PIECE)
+    await session.settle()
+    ws.block = True
+    await session.done_event()
+    await session.settle()
+    assert lease.names()[-3:] == ["flush", "finish", "release"]
+    assert ws.stalled == 1
+    assert json.loads(ws.parked[0]["text"])["type"] == COMPLETED
+    return session, lease
+
+
+# @spec ING-LIFE-051, ING-EP-060
+async def test_a_final_stalled_before_the_drain_ends_by_d(
+    realtime, first_update, fake_factory, test_app, drain_trigger, started
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session, _ = await _final_stalled(realtime, first_update, fake_factory, ws)
+    # The owner's cleanup has ended; the handler still holds the record.
+    assert len(started.registry.records) == 1
+
+    _, deadline = await drain_trigger()
+    assert not ws.done
+    await session.advance(deadline - started.clock.monotonic() + 0.01)
+
+    assert ws.done, "the final's send outlived D"
+    ws.unblocked.set()
+    await session.settle()
+    assert ws.stalled == 1  # no close after the failed send
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-058
+async def test_a_terminal_error_stalled_before_the_drain_ends_by_d(
+    realtime, first_update, fake_factory, test_app, drain_trigger, started
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    lease.script("feed", Raise(failed("expired")))
+    ws.block = True
+    await session.append(PIECE)
+    await session.settle()
+    assert lease.names() == ["feed", "abort", "release"]
+    assert ws.stalled == 1
+    assert json.loads(ws.parked[0]["text"])["type"] == ERROR
+
+    # Lease cleanup has ended; the record stays while its error is sent.
+    (record,) = started.registry.records.values()
+    assert not record.task.done()
+    assert not started.registry.settled()
+
+    _, deadline = await drain_trigger()
+    assert not ws.done
+    await session.advance(deadline - started.clock.monotonic() + 0.01)
+
+    assert ws.done, "the error's send outlived D"
+    ws.unblocked.set()
+    await session.settle()
+    assert ws.stalled == 1  # neither the close nor anything else followed
+    assert len(started.registry.records) == 0
+
+
+# @spec ING-LIFE-051, ING-NIMWS-016, ING-ERR-015
+async def test_a_blocked_refusal_ends_by_an_earlier_d(
+    realtime, test_app, drain_trigger, started
+):
+    started.ingress.close()  # refused before any drain begins
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    ws.block = True
+    session = realtime(ws)
+    assert await session.connect()
+    await session.settle()
+    assert ws.stalled == 1
+    assert json.loads(ws.parked[0]["text"])["type"] == ERROR
+    assert len(started.registry.records) == 0
+
+    # The refusal's own bound (60 s) is far off; a drain then sets D = +3 s.
+    _, deadline = await drain_trigger()
+    assert not ws.done
+    await session.advance(deadline - started.clock.monotonic() + 0.01)
+
+    assert ws.done, "the refusal outlived D"
+    ws.unblocked.set()
+    await session.settle()
+    assert ws.stalled == 1  # the 1013 close was not sent after it
+
+
+# @spec ING-LIFE-051
+async def test_a_final_due_after_d_is_not_started(
+    realtime, first_update, fake_factory, test_app, drain_trigger, started
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    await session.append(PIECE)
+    await session.settle()
+    clock = started.clock
+    # The shutdown finalization's ``release`` returns just after D.
+    lease.after("release", lambda: clock.set(started.drain_deadline + 0.5))
+
+    await drain_trigger()
+    await session.settle()
+
+    assert lease.names()[-3:] == ["flush", "finish", "release"]
+    assert ws.done
+    await session.drain_events()
+    # Neither the ``completed`` event nor its close was started.
+    assert COMPLETED not in session.types()
+    assert session.close_code is None
+    assert ws.stalled == 0
+
+
+# @spec ING-LIFE-051
+async def test_an_acknowledgement_due_after_d_is_not_started(
+    realtime, first_update, fake_factory, test_app, app_state, started
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    drain = asyncio.create_task(started.drain(app_state, 8.0))
+    try:
+        await session.settle()
+        deadline = started.drain_deadline
+        assert deadline is not None
+        clock = started.clock
+        # The locale change succeeds just after D; its ack is then due.
+        lease.after("update_locale", lambda: clock.set(deadline + 0.5))
+        await session.update(first_update("de-DE"))
+        await session.settle()
+
+        assert "update_locale" in lease.names()
+        assert ws.done
+        await session.drain_events()
+        assert session.types().count(UPDATED) == 1  # the first ack only
+        assert session.close_code is None
+        assert lease.names()[-2:] == ["abort", "release"]
+    finally:
+        drain.cancel()
+        with contextlib.suppress(BaseException):
+            await drain
+
+
+# @spec ING-LIFE-051, ING-EP-059, ING-EP-060
+async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
+    realtime, first_update, fake_factory, test_app, started, app_state
+):
+    ws = StubbornSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1
+    lease = _lease(fake_factory)
+    send_bound = started.config.response_send_timeout
+    settle_bound = started.config.session_cleanup_timeout
+
+    await session.advance(send_bound + 0.1)
+    assert ws.cancellations == 1
+    assert not ws.done  # the cancelled send may settle within a cleanup wait
+    await session.advance(settle_bound)
+
+    # Failed at its bound; the handler did not wait for it any longer.
+    assert ws.done
+    assert lease.names() == ["abort", "release"]
+    (record,) = started.registry.records.values()
+    (unsettled,) = record.unsettled_sends
+    assert unsettled in record.children and not unsettled.done()
+    assert started.ingress.count == 1
+
+    # ``stop`` reaches the unsettled send through the record.
+    from support.app import stop_plugins
+
+    await stop_plugins(app_state)
+    await session.settle()
+    assert unsettled.cancelled()
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+    assert ws.stalled == 1
+
+
+# @spec ING-LIFE-051
+async def test_a_send_suppressing_its_cancellation_still_failed(
+    realtime, first_update, fake_factory, test_app, started
+):
+    ws = StubbornSendWebSocket(test_app, REALTIME_URL, suppress=True)
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1
+    lease = _lease(fake_factory)
+
+    await session.advance(started.config.response_send_timeout + 0.1)
+
+    # The send returned after its cancellation; it failed all the same.
+    assert ws.cancellations == 1
+    assert ws.done
+    assert lease.names() == ["abort", "release"]
+    ws.block = False
+    await session.settle()
+    assert ws.stalled == 1  # nothing further, the close included
+    assert session.close_code is None
+    assert len(started.registry.records) == 0

@@ -22,9 +22,11 @@ How a surface drives an owner:
    ``update_locale`` as the dialect asks.
 4. End the stream with ``finalize()`` (the final transcript, only after
    ``finish`` and ``release`` succeeded) or ``fail(cause)``.
-5. When the handler ends, a ``record.continuation`` that is still running
-   holds the stream's admission and record: release them from its done
-   callback, not before.
+5. A surface sets ``record.held_by_handler``, so the record outlives the
+   owner's cleanup while the handler still sends. When the handler ends, a
+   ``record.continuation`` that is still running (or a send left
+   unsettled) holds the stream's admission and record: release them from
+   its done callback, not before.
 
 Every owner method that ends the stream raises ``FrontendError`` carrying
 the one selected cause, so the surface projects that cause and nothing
@@ -471,10 +473,12 @@ class StreamOwner:
     its registry record so a call can be cancelled without cancelling the
     surface. Exactly one terminal cause is selected; cleanup runs once, in
     one shielded task, as the lease's state allows, and it unregisters the
-    record when it ends. A cancelled call that has not settled when the
-    cleanup bound expires does not hold the stream's answer: the cleanup
-    task becomes the record's continuation, which waits for the call before
-    it makes any other lease call and runs the rest of the cleanup.
+    record when it ends, unless the surface's handler holds the record
+    (``held_by_handler``) and removes it itself. A cancelled call that has
+    not settled when the cleanup bound expires does not hold the stream's
+    answer: the cleanup task becomes the record's continuation, which waits
+    for the call before it makes any other lease call and runs the rest of
+    the cleanup.
     """
 
     def __init__(
@@ -1261,11 +1265,18 @@ class StreamOwner:
         self._notify()
 
     def _end(self) -> None:
-        """The cleanup ended: the stream is terminal and its record goes."""
+        """The cleanup ended: the stream is terminal.
+
+        The record goes with it unless the surface's handler holds it
+        (``held_by_handler``): the handler may still be sending its final,
+        error or close, which the drain and ``stop`` must reach, so the
+        handler's end removes the record instead.
+        """
         self._conclude()
         self.bounds.cleanup.disarm()
-        with contextlib.suppress(KeyError, ValueError):
-            self._registry.unregister(self._record)
+        if not getattr(self._record, "held_by_handler", False):
+            with contextlib.suppress(KeyError, ValueError):
+                self._registry.unregister(self._record)
         self._mark_answered()
 
     def _is_torn_down(self) -> bool:

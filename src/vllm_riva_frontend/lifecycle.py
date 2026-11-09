@@ -120,10 +120,18 @@ class ShutdownTrigger:
 class OwnerRecord:
     """One registered transport owner: its task and what it holds.
 
-    ``continuation`` is a file request's cleanup continuation, which keeps
-    the record after the route or RPC has answered; ``children`` are tasks
-    the owner adds directly. ``owner`` is the object that observes the
-    shutdown trigger (a stream's ``StreamOwner``), when one is attached.
+    ``task`` is the handler. ``continuation`` is a cleanup that outlived the
+    answer (a file request's, or a stream owner's waiting for a cancelled
+    call); ``children`` are tasks the owner adds directly, the stream's
+    sends included. ``owner`` is the object that observes the shutdown
+    trigger (a stream's ``StreamOwner``), when one is attached.
+
+    A streaming surface sets ``held_by_handler``: the record then stays
+    registered until its handler, its continuation and every send in
+    ``unsettled_sends`` (sends cancelled at their bound that have not
+    settled, also in ``children``) have ended, and the handler's end
+    (``surfaces.release_owner``) removes it, not the end of the owner's
+    cleanup. ``stop`` cancels all of them through ``cancel_all``.
     """
 
     kind: OwnerKind
@@ -131,6 +139,8 @@ class OwnerRecord:
     continuation: asyncio.Task[Any] | None = None
     children: set[asyncio.Task[Any]] = field(default_factory=set)
     owner: Any = None
+    held_by_handler: bool = False
+    unsettled_sends: set[asyncio.Task[Any]] = field(default_factory=set)
 
 
 def _shutdown_observer(record: OwnerRecord) -> Any:
@@ -158,6 +168,7 @@ class OwnerRegistry:
         """Create an empty registry."""
         self._records: dict[int, OwnerRecord] = {}
         self._waiters: set[asyncio.Future[None]] = set()
+        self._kept: set[asyncio.Task[Any]] = set()
         self.torn_down = False
         self.drain_deadline: float | None = None
         self.shutdown_trigger: ShutdownTrigger | None = None
@@ -205,9 +216,20 @@ class OwnerRegistry:
         if self.on_fault is not None:
             self.on_fault(error)
 
+    # @spec ING-EP-060
+    def keep(self, task: asyncio.Task[Any]) -> None:
+        """Keep ``task``, which belongs to no record, until it ends.
+
+        A refusal creates no owner, so its send is kept here instead of
+        under a record; ``cancel_all`` cancels it.
+        """
+        if not task.done():
+            self._kept.add(task)
+            task.add_done_callback(self._kept.discard)
+
     def cancel_all(self) -> list[asyncio.Task[Any]]:
-        """Cancel every owner, continuation and child; return them all."""
-        tasks: list[asyncio.Task[Any]] = []
+        """Cancel every owner, continuation, child and kept task; return all."""
+        tasks: list[asyncio.Task[Any]] = list(self._kept)
         for record in list(self._records.values()):
             tasks.append(record.task)
             if record.continuation is not None:
@@ -532,11 +554,36 @@ class RivaFrontendPlugin:
         self._shutdown_requested = False
         # Serializes factory.drain between the collector and drain.
         self._factory_lock = asyncio.Lock()
+        # Futures of the sends waiting for ``drain`` to set ``D``.
+        self._drain_waiters: set[asyncio.Future[None]] = set()
 
     @property
     def admission_open(self) -> bool:
         """Whether the ingress cap admits owners."""
         return self.ingress is not None and self.ingress.is_open
+
+    # @spec ING-LIFE-051
+    def drain_announced(self) -> asyncio.Future[None]:
+        """Return a future resolved once ``drain`` has set ``D``.
+
+        It is already resolved while draining. Every send in flight waits on
+        one, with or without an owner, so it re-clips its bound to ``D`` the
+        moment the drain begins rather than at the settle point.
+        """
+        future: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if self.drain_deadline is not None:
+            future.set_result(None)
+            return future
+        self._drain_waiters.add(future)
+        future.add_done_callback(self._drain_waiters.discard)
+        return future
+
+    def _announce_drain(self) -> None:
+        for future in list(self._drain_waiters):
+            if not future.done():
+                future.set_result(None)
 
     # ------------------------------------------------------ attach_router
 
@@ -991,6 +1038,8 @@ class RivaFrontendPlugin:
         registry = self.registry
         if registry is not None:
             registry.drain_deadline = deadline
+        # Sends already waiting re-clip to ``D`` now (ING-LIFE-051).
+        self._announce_drain()
         try:
             await self._set_health(_NOT_SERVING)
             if self.ingress is not None:
@@ -1069,8 +1118,9 @@ class RivaFrontendPlugin:
 
         Marks the plugin torn down (owners then call the lease's synchronous
         ``teardown`` only), tears the factory down, cancels every owner,
-        continuation, child and supervisor, stops the listener without grace
-        and waits once, at most 1 s, for the cancellations to be delivered.
+        continuation, child (a stream's unsettled sends included), kept task
+        and supervisor, stops the listener without grace and waits once, at
+        most 1 s, for the cancellations to be delivered.
         """
         del state
         self.torn_down = True
