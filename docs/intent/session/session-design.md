@@ -374,12 +374,15 @@ owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and t
 **Sends.** The drain announces its deadline to every send in flight, with or without an owner, so a
 send already waiting re-clips its bound at once. A send whose bound has already passed when it is
 due does not start, and takes the transport-failure path, unless it carries a terminal status (a
-gRPC status or abort; a Realtime `error` event and its close). A terminal status gets one attempt
+gRPC status or abort; a Realtime `error` event, or the `failed` event that ends the session, and its
+close). A terminal status gets one attempt
 that adds no wait: it starts, runs to its first suspension and is cancelled if it has not
 completed, so the shutdown and deadline rows of the errors leaf reach a client that is still
-reading. A send that exceeds its bound has failed, even if it later completes; the wait for the
-cancelled send to settle is bounded like every other cleanup wait, and a send still unsettled stays
-under the stream's record until it settles or `stop`. The stream's record stays registered until
+reading. A send that has not completed when its bound passes has failed, even if it completes
+later. The handler cancels it and does not wait for it to settle: a send still unsettled after one
+turn of the event loop stays under the stream's record (or, for a refusal that created no record,
+under the registry) until it settles or `stop`, so cleanup starts at once and spends no second
+budget. Once the plugin is torn down, every send bound counts as passed. The stream's record stays registered until
 both its handler and its cleanup continuation have ended, so the drain and `stop` reach a terminal
 send. After a gRPC send fails, the handler ends without writing a status; the HTTP/2 stream stays
 open until the client cancels, its deadline passes, transport keepalive finds the peer dead or the

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import math
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, TypeVar
 
@@ -202,31 +203,19 @@ async def settle_shielded(
 def _send_bound(
     limit: float, plugin: Any, owner: Any, rpc_deadline: float | None
 ) -> float:
+    """The send's absolute bound as it stands now.
+
+    ``limit`` clipped to the RPC deadline and, while draining, to ``D``;
+    once the plugin is torn down every bound has passed.
+    """
+    if torn_down(plugin):
+        return -math.inf
     candidates = [
         rpc_deadline,
         getattr(plugin, "drain_deadline", None),
         None if owner is None else owner.drain_deadline,
     ]
     return min([limit, *(float(d) for d in candidates if d is not None)])
-
-
-def _settle_bound(plugin: Any, owner: Any) -> float:
-    """How long a cancelled send may take to settle: as a cleanup wait.
-
-    The owner's cleanup budget while its cleanup runs, otherwise
-    ``session_cleanup_timeout`` from now; clipped to ``D`` while draining.
-    """
-    cleanup = getattr(getattr(owner, "bounds", None), "cleanup", None)
-    deadline: float | None = getattr(cleanup, "deadline", None)
-    if deadline is None:
-        deadline = plugin.clock.monotonic() + float(
-            plugin.config.session_cleanup_timeout
-        )
-    drains = [
-        getattr(plugin, "drain_deadline", None),
-        None if owner is None else owner.drain_deadline,
-    ]
-    return min([float(deadline), *(float(d) for d in drains if d is not None)])
 
 
 def _start(
@@ -257,7 +246,8 @@ async def _until(
     """Wait for one of ``futures`` or ``deadline`` on the plugin's clock.
 
     The deadline is a ``clock.sleep`` in a task kept like the send's, so
-    the wait starts no task outside the registry.
+    the wait starts no task outside the registry, and ``stop``, which
+    cancels that task, wakes the wait.
     """
     remaining = max(0.0, deadline - plugin.clock.monotonic())
     sleeper = _start(plugin, record, plugin.clock.sleep(remaining))
@@ -280,30 +270,57 @@ def _drain_notice(plugin: Any) -> asyncio.Future[None] | None:
     return notice
 
 
-async def _settle(
-    plugin: Any, owner: Any, record: Any, task: asyncio.Future[Any]
+def _leave_unsettled(
+    plugin: Any, record: Any, task: asyncio.Future[Any]
 ) -> None:
-    """Wait for a cancelled send to settle, no longer than a cleanup wait.
+    """Leave a cancelled send where ``stop`` reaches it until it settles.
 
-    An expired bound still gives it one loop turn to act on its
-    cancellation. A send still unsettled then holds the record
-    (``unsettled_sends``) until it settles or ``stop`` cancels it.
+    Under ``record.unsettled_sends``, which also holds the record; with no
+    record (a refusal), under ``registry.keep``.
     """
-    deadline = _settle_bound(plugin, owner)
-    while not task.done():
-        if plugin.clock.monotonic() >= deadline:
-            await asyncio.sleep(0)
-            break
-        await _until(plugin, record, {task}, deadline)
-    if task.done():
-        return
     sends = getattr(record, "unsettled_sends", None)
     if isinstance(sends, set):
         sends.add(task)
         task.add_done_callback(sends.discard)
+        return
+    keep = getattr(getattr(plugin, "registry", None), "keep", None)
+    if callable(keep):
+        keep(task)
 
 
-# @spec ING-LIFE-051, ING-ADM-016
+async def _abandon(plugin: Any, record: Any, task: asyncio.Future[Any]) -> None:
+    """Cancel a failed send and give it one loop turn; never wait longer.
+
+    It is left under its owner first, so a cancellation of the caller
+    during that turn cannot orphan it; one that settles in the turn
+    leaves again by its done callback.
+    """
+    task.cancel()
+    _leave_unsettled(plugin, record, task)
+    await asyncio.sleep(0)
+
+
+async def _last_attempt(plugin: Any, record: Any, send: Awaitable[T]) -> T:
+    """A terminal status past its bound: one attempt that adds no wait.
+
+    The send starts and runs to its first suspension; it succeeds only if
+    it is complete then, and is otherwise abandoned.
+    """
+    task = _start(plugin, record, send)
+    task.add_done_callback(_consume)
+    try:
+        await asyncio.sleep(0)
+    except BaseException:
+        if not task.done():
+            await _abandon(plugin, record, task)
+        raise
+    if task.done():
+        return task.result()
+    await _abandon(plugin, record, task)
+    raise TimeoutError
+
+
+# @spec ING-LIFE-051, ING-ADM-016, ING-EP-059, ING-EP-060
 async def bounded_send(
     plugin: Any,
     send: Awaitable[T],
@@ -317,62 +334,52 @@ async def bounded_send(
 
     The bound runs from the send's start and is clipped to ``rpc_deadline``
     and, while draining, to ``D`` (the plugin's, or the owner's once it
-    observed the trigger). A waiting send also waits for the plugin's drain
-    announcement, so one in flight when the drain begins re-clips to ``D``
-    at once, with or without an owner.
+    observed the trigger); once the plugin is torn down it has passed. A
+    waiting send also waits for the plugin's drain announcement, so one in
+    flight when the drain begins re-clips to ``D`` at once, with or without
+    an owner.
 
     A send whose bound has already passed does not start, unless it is
-    ``terminal`` (a gRPC status; a Realtime error event and its close):
-    that one starts, runs to its first suspension and is cancelled if not
-    complete, adding no wait. A send that exceeds its bound has failed,
-    even if it completes later: it is cancelled and its settlement awaited
-    no longer than a cleanup wait; one still unsettled stays under
-    ``record`` (or, with none, the registry) until it settles or ``stop``.
+    ``terminal`` (a gRPC status; a Realtime error or ``failed`` event and
+    its close): that one gets one attempt that adds no wait. A send not
+    complete when its bound passes has failed, even if it completes
+    before this coroutine resumes: whenever it resumes, the clock is
+    checked before the send's outcome. A failed send is cancelled and
+    given one loop turn, never a wait for it to settle; one still pending
+    stays under ``record`` (or, with none, the registry) until it settles
+    or ``stop``. The same holds when the caller is cancelled meanwhile.
     Raises ``TimeoutError`` for a send past its bound; the send's own
     failure propagates.
     """
     clock = plugin.clock
     limit = clock.monotonic() + float(plugin.config.response_send_timeout)
-    expired = clock.monotonic() >= _send_bound(
-        limit, plugin, owner, rpc_deadline
-    )
-    if expired and not terminal:
-        if inspect.iscoroutine(send):
-            send.close()
-        raise TimeoutError
+    deadline = _send_bound(limit, plugin, owner, rpc_deadline)
+    if clock.monotonic() >= deadline:
+        if not terminal:
+            if inspect.iscoroutine(send):
+                send.close()
+            raise TimeoutError
+        return await _last_attempt(plugin, record, send)
     task = _start(plugin, record, send)
     task.add_done_callback(_consume)
-    exceeded = False
     try:
-        first = True
-        while not task.done():
-            bound = _send_bound(limit, plugin, owner, rpc_deadline)
-            if clock.monotonic() >= bound:
-                if not first:
-                    exceeded = True
-                    break
-                # A terminal status's one attempt: its first step.
-                first = False
-                await asyncio.sleep(0)
-                continue
-            first = False
+        while clock.monotonic() < deadline:
+            if task.done():
+                return task.result()
             waits: set[asyncio.Future[Any]] = {task}
             notice = _drain_notice(plugin)
             if notice is not None:
                 waits.add(notice)
             try:
-                await _until(plugin, record, waits, bound)
+                await _until(plugin, record, waits, deadline)
             finally:
                 if notice is not None:
                     notice.cancel()
+            deadline = _send_bound(limit, plugin, owner, rpc_deadline)
     finally:
         if not task.done():
-            exceeded = True
-            task.cancel()
-            await _settle(plugin, owner, record, task)
-    if exceeded:
-        raise TimeoutError
-    return task.result()
+            await _abandon(plugin, record, task)
+    raise TimeoutError
 
 
 def header_problem(

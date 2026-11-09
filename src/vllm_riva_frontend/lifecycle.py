@@ -216,7 +216,7 @@ class OwnerRegistry:
         if self.on_fault is not None:
             self.on_fault(error)
 
-    # @spec ING-EP-060
+    # @spec ING-EP-059, ING-EP-060
     def keep(self, task: asyncio.Task[Any]) -> None:
         """Keep ``task``, which belongs to no record, until it ends.
 
@@ -227,8 +227,14 @@ class OwnerRegistry:
             self._kept.add(task)
             task.add_done_callback(self._kept.discard)
 
+    # @spec ING-EP-059
     def cancel_all(self) -> list[asyncio.Task[Any]]:
-        """Cancel every owner, continuation, child and kept task; return all."""
+        """Cancel every owner, continuation, child and kept task; return all.
+
+        That covers file and stream cleanup continuations, a stream's sends
+        (its unsettled ones are also its children) and the sends kept for
+        refusals that created no owner.
+        """
         tasks: list[asyncio.Task[Any]] = list(self._kept)
         for record in list(self._records.values()):
             tasks.append(record.task)
@@ -1117,10 +1123,11 @@ class RivaFrontendPlugin:
         """Tear everything down promptly, awaiting no engine work.
 
         Marks the plugin torn down (owners then call the lease's synchronous
-        ``teardown`` only), tears the factory down, cancels every owner,
-        continuation, child (a stream's unsettled sends included), kept task
-        and supervisor, stops the listener without grace and waits once, at
-        most 1 s, for the cancellations to be delivered.
+        ``teardown`` only, and every send bound counts as passed), tears the
+        factory down, cancels every owner, file or stream continuation,
+        child (a stream's unsettled sends included), kept task (a refusal's
+        send) and supervisor, stops the listener without grace and waits
+        once, at most 1 s, for the cancellations to be delivered.
         """
         del state
         self.torn_down = True

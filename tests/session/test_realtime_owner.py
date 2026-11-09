@@ -729,7 +729,7 @@ async def test_an_acknowledgement_due_after_d_is_not_started(
             await drain
 
 
-# @spec ING-LIFE-051, ING-EP-059, ING-EP-060
+# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-037
 async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
     realtime, first_update, fake_factory, test_app, started, app_state
 ):
@@ -740,15 +740,12 @@ async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
     await session.settle()
     assert ws.stalled == 1
     lease = _lease(fake_factory)
-    send_bound = started.config.response_send_timeout
-    settle_bound = started.config.session_cleanup_timeout
 
-    await session.advance(send_bound + 0.1)
+    await session.advance(started.config.response_send_timeout + 0.1)
+
+    # Failed at its bound: the handler waited for no settlement, and
+    # cleanup began at once with its own budget.
     assert ws.cancellations == 1
-    assert not ws.done  # the cancelled send may settle within a cleanup wait
-    await session.advance(settle_bound)
-
-    # Failed at its bound; the handler did not wait for it any longer.
     assert ws.done
     assert lease.names() == ["abort", "release"]
     (record,) = started.registry.records.values()
@@ -765,6 +762,80 @@ async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
     assert ws.stalled == 1
+
+
+class TestLateSend:
+    @pytest.fixture
+    def riva_options(self):
+        return {"response_send_timeout": 5}
+
+    # @spec ING-LIFE-051
+    async def test_a_send_completing_after_its_bound_has_failed(
+        self, realtime, first_update, fake_factory, test_app, started
+    ):
+        ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+        session = await _connected(realtime, ws)
+        ws.block = True
+        await session.update(first_update())
+        await session.settle()
+        assert ws.stalled == 1
+        lease = _lease(fake_factory)
+
+        # The bound passes and the acknowledgement then completes, all
+        # before the handler resumes.
+        clock = started.clock
+        clock.set(clock.monotonic() + 5.1)
+        ws.unblocked.set()
+        await session.settle()
+
+        assert ws.done, "the handler took the late send as delivered"
+        await session.drain_events()
+        assert UPDATED in session.types(), "the send did complete, late"
+        assert lease.names() == ["abort", "release"]
+        assert ws.stalled == 1  # nothing further, the close included
+        assert session.close_code is None
+        assert len(started.registry.records) == 0
+        assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-051, ING-EP-059, ING-EP-043
+async def test_after_stop_a_resisting_send_neither_waits_nor_leaks(
+    realtime, first_update, fake_factory, test_app, started, app_state
+):
+    ws = StubbornSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1
+    lease = _lease(fake_factory)
+    before = asyncio.all_tasks()
+
+    from support.app import stop_plugins
+
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await session.settle()
+
+        # No clock time passed: every send bound counted as passed.
+        assert ws.done, "the handler waited after stop"
+        # The terminal error got its one attempt; its close never started.
+        assert ws.stalled == 2
+        assert json.loads(ws.parked[1]["text"])["type"] == ERROR
+        assert "abort" not in lease.names()
+        assert lease.state == "torn_down"
+        await session.advance(1.1)  # ``stop``'s one bounded wait
+        assert stopper.done()
+        # Every task started since ``stop`` is done or was cancelled.
+        leftover = [
+            task for task in asyncio.all_tasks() - before if not task.done()
+        ]
+        assert all(task.cancelling() for task in leftover), leftover
+    finally:
+        ws.settled.set()
+        await session.settle()
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
 
 
 # @spec ING-LIFE-051

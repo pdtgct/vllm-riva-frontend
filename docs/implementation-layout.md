@@ -88,15 +88,20 @@ entry names its ground: a design section, a spec, a core file or the public clie
   terminal send starts, runs to its first suspension and is cancelled if not complete, adding no
   wait, so a status the transport takes at once (the ING-ERR-059 abort row at `D`,
   `request_timeout` after the RPC deadline) is still made. Writes (hypotheses, the final) are
-  ordinary sends. A send that exceeds its bound has failed even if the transport later completes
-  it or suppresses the cancellation: it is cancelled, and the wait for it to settle is bounded
-  like a cleanup wait (the owner's cleanup deadline while its cleanup runs, otherwise
-  `session_cleanup_timeout` from the cancellation; clipped to `D`; an expired bound still gives it
-  one loop turn). The send's task is a child of the stream's record (`record=`); one still
-  unsettled at that bound joins `record.unsettled_sends` and holds the record until it settles or
-  `stop` cancels it, and the handler does not wait for it. A refusal has no record: its send is
-  kept by `registry.keep(task)` instead. Ground: ING-LIFE-051; session design, Bounds ("Sends");
-  ING-EP-060.
+  ordinary sends. Once `stop` has marked the plugin torn down, every bound counts as passed: an
+  ordinary send does not start and a terminal one gets only that attempt. A send not complete
+  when its bound passes has failed, even if the transport completes it or suppresses the
+  cancellation before the waiting coroutine resumes: each time it resumes, the clock is checked
+  before the send's outcome is taken (only a terminal send's one attempt succeeds by being done
+  at its first suspension). A failed send is cancelled and given one loop turn; the handler never
+  waits for it to settle. Its task is a child of the stream's record (`record=`), and before that
+  turn it is put in `record.unsettled_sends`, which holds the record until it settles or `stop`
+  cancels it, so a cancellation of the handler during the turn cannot orphan it; one that settles
+  in the turn leaves the set again. The same applies when the handler is cancelled while a send
+  waits. Owner cleanup then starts at once under its one `session_cleanup_timeout` budget. A
+  refusal has no record: its send is kept by `registry.keep(task)` from its start. A waiting
+  send's deadline is a sleeper task held like the send, so `stop`, which cancels both, wakes the
+  wait. Ground: ING-LIFE-051; session design, Bounds ("Sends"); ING-EP-059, ING-EP-060.
 - A send past its bound, or a failed write, takes the transport-failure path: the owner is failed
   with phase `transport` (cleanup as for a disconnect, ING-LIFE-038), nothing more is written,
   and the handler ends with no status (it raises `CancelledError`; a refusal with no owner just
@@ -236,9 +241,9 @@ entry names its ground: a design section, a spec, a core file or the public clie
   the streaming surfaces) makes the handler's `surfaces.release_owner`, not the end of the
   `StreamOwner`'s cleanup, remove the record; `unsettled_sends` are the stream's sends cancelled at
   their bound and not yet settled, which hold the record (Servicer, "Record lifetime"). `keep(task)`
-  holds a task that belongs to no record (a refusal's unsettled send) until it ends. `cancel_all()`
-  cancels tasks, continuations, children and kept tasks and returns them. Ground: ING-EP-059,
-  ING-EP-060, ING-FILE-071.
+  holds a task that belongs to no record (a refusal's send, from its start) until it ends.
+  `cancel_all()` cancels tasks, continuations (file and stream), children (a stream's unsettled
+  sends among them) and kept tasks, and returns them. Ground: ING-EP-059, ING-EP-060, ING-FILE-071.
 - `StartupError(failures)` is the exception `init_state` and `start` raise; `ConfigError` is a
   subclass of it raised by `parse_config`, so a configuration failure propagates from `init_state`
   as a `StartupError` whose `failures` list every option. `parse_config` derives
