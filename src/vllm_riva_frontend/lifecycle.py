@@ -1,702 +1,1105 @@
-"""Application-plugin installation, readiness, and owner drainage."""
+"""The endpoint plugin vLLM core sees: startup, owners, shutdown and faults.
+
+``RivaFrontendPlugin`` implements the lifecycle core defines for endpoint
+plugins (``attach_router``, ``init_state``, ``start``, ``ready``, ``drain``,
+``stop``) and adds none. It owns the order of the startup checks, the
+registry of transport owner tasks, the ingress cap, the relation between its
+bounds and the engine's stream deadlines, shutdown and fault escalation.
+
+The surface modules (``grpc``, ``nim_ws``, ``files``) and the session seam
+(``lease``) are imported inside the lifecycle methods: they read this
+module's registry types, so a module-level import would be circular.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import json
-import time
-from collections.abc import Callable
-from contextlib import suppress
-from importlib import metadata as importlib_metadata
-from types import SimpleNamespace
-from typing import Any, Protocol, cast
+import contextlib
+import dataclasses
+import importlib.metadata
+import inspect
+import logging
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
 
-import grpc
+from fastapi.responses import JSONResponse
 from grpc_health.v1 import health_pb2
-from packaging.version import InvalidVersion, Version
+from starlette.routing import Match
 
-from vllm_riva_frontend.admission import (
-    AdmissionLease,
-    LoadShedGate,
-)
+from vllm_riva_frontend.admission import FILE_KINDS, IngressCap, OwnerKind
+from vllm_riva_frontend.clock import Clock, RealClock
 from vllm_riva_frontend.config import (
-    DeploymentMetadata,
+    PLUGIN_KEY,
+    Capacity,
+    ConfigError,
+    DeploymentProvenance,
     FrontendConfig,
+    StartupError,
+    StreamDeadlines,
     build_deployment_provenance,
-    load_plugin_config,
+    check_bounds,
+    derive_file_caps,
+    parse_config,
+    read_capacity,
+    read_stream_deadlines,
 )
-from vllm_riva_frontend.grpc import (
-    RIVA_SERVICE_NAME,
-    build_servicer,
-    register_aio_services,
-)
-from vllm_riva_frontend.lease import DirectLeaseOwner, SessionFactory
-from vllm_riva_frontend.nim_http import (
-    HttpTranscriptionConfig,
-    MultipartLimits,
-    NimHttpTranscriptionEndpoint,
-)
-from vllm_riva_frontend.nim_ws import (
-    bootstrap_session,
-    dispatch_nim_realtime,
-)
-from vllm_riva_frontend.operational import (
-    OPERATIONAL_PATHS,
-    operational_response,
-)
+from vllm_riva_frontend.errors import ErrorCatalog, FrontendError, catalog
+from vllm_riva_frontend.operational import operational_router
 
-_OWNED_HTTP_METHODS = {
-    "/v1/audio/transcriptions": frozenset({"POST"}),
-    "/v1/realtime/transcription_sessions": frozenset({"POST"}),
-    **{path: frozenset({"GET"}) for path in OPERATIONAL_PATHS},
-}
-#: Host lines this package is qualified against, newest last.  A set of
-#: exercised lines rather than a range: each entry names a line whose plugin
-#: boundary this suite covers, so an unreleased future line fails closed
-#: instead of being assumed compatible.  The package imports no host symbol —
-#: coupling is the entry-point contract and the protocols in this module — so
-#: adding a line is a statement about qualification, not about linking.
-_SUPPORTED_HOST_MAJOR_MINOR = ((0, 24), (0, 25))
+__all__ = [
+    "FaultCollector",
+    "ListenerMonitor",
+    "OwnerRecord",
+    "OwnerRegistry",
+    "RivaFrontendPlugin",
+    "ShutdownTrigger",
+    "StartupError",
+    "engine_reserve",
+    "settle_point",
+]
 
+logger = logging.getLogger(__name__)
 
-class PluginApplication(Protocol):
-    """Host application facts used by the selected plugin."""
+#: Core's complete-file route, which the frontend's file route replaces.
+FILE_ROUTE_PATH = "/v1/audio/transcriptions"
+#: Framing allowance of the multipart body above core's upload limit.
+UPLOAD_FRAMING_BYTES = 262_144
+#: The fault collector's period; a protocol constant, not an option.
+COLLECTOR_PERIOD = 1.0
+#: The one bounded wait of ``stop``, so cancellation is delivered.
+STOP_WAIT = 1.0
+#: How long one listener-termination wait lasts before it is renewed.
+_MONITOR_POLL = 3600.0
 
-    routes: list[object]
-    state: object
+#: The owner kinds the shutdown trigger finalizes; files are cancelled.
+STREAM_KINDS = frozenset({OwnerKind.stream, OwnerKind.realtime})
+
+_SERVING = health_pb2.HealthCheckResponse.SERVING
+_NOT_SERVING = health_pb2.HealthCheckResponse.NOT_SERVING
 
 
-class PluginAdmission(Protocol):
-    """Host-owned readiness boundary used by all inference surfaces."""
-
-    def try_acquire(self) -> AdmissionLease | None:
-        """Atomically register new work or reject after admission closes."""
+# ----------------------------------------------------------- the formulas
 
 
-class PluginContext(Protocol):
-    """Structural view of the generic vLLM-Omni plugin context."""
+# @spec ING-EP-010
+def engine_reserve(timeout: float) -> float:
+    """Return the time left to core to shut the engine down after ``drain``.
 
-    plugin_name: str
-    app: PluginApplication
-    engine_client: object
-    config: str | None
-    admission: PluginAdmission
-    install_asgi_wrapper: Callable[[Callable[[Any], Any]], None]
+    The larger of 5 s and a tenth of the shutdown budget.
+    """
+    return max(5.0, timeout / 10)
 
 
-class OwnerToken:
-    """Idempotent token for one lifecycle-visible inference owner."""
+# @spec ING-EP-036
+def settle_point(now: float, deadline: float) -> float:
+    """Return when owners stop finishing on their own: shortly before ``D``.
 
-    def __init__(
-        self,
-        registry: CompatibilityOwnerRegistry,
-        task: asyncio.Task[Any],
-    ) -> None:
-        """Bind one task to its process-wide compatibility registry."""
-        self._registry = registry
-        self._task = task
-        self._released = False
-
-    async def release(self) -> None:
-        """Stop tracking the owner after its lease cleanup has settled."""
-        if self._released:
-            return
-        async with self._registry._lock:
-            if not self._released:
-                self._released = True
-                self._registry._owners.discard(self._task)
+    ``D`` less the smaller of 5 s and a quarter of the time left to it.
+    """
+    return deadline - min(5.0, max(0.0, deadline - now) / 4)
 
 
-class CompatibilityOwnerRegistry:
-    """Track the actual ASGI/gRPC tasks which own compatibility leases."""
+@dataclass(frozen=True)
+class ShutdownTrigger:
+    """What ``drain`` raises for each stream owner at the settle point.
 
+    ``deadline`` is ``D``, an absolute ``clock.monotonic()`` value: the
+    owner finalizes its stream by it, or aborts.
+    """
+
+    deadline: float
+
+
+# -------------------------------------------------------- owner registry
+
+
+@dataclass(eq=False)
+class OwnerRecord:
+    """One registered transport owner: its task and what it holds.
+
+    ``continuation`` is a file request's cleanup continuation, which keeps
+    the record after the route or RPC has answered; ``children`` are tasks
+    the owner adds directly. ``owner`` is the object that observes the
+    shutdown trigger (a stream's ``StreamOwner``), when one is attached.
+    """
+
+    kind: OwnerKind
+    task: asyncio.Task[Any]
+    continuation: asyncio.Task[Any] | None = None
+    children: set[asyncio.Task[Any]] = field(default_factory=set)
+    owner: Any = None
+
+
+def _shutdown_observer(record: OwnerRecord) -> Any:
+    """The object on ``record`` that observes the shutdown trigger."""
+    if callable(getattr(record.owner, "observe_shutdown", None)):
+        return record.owner
+    for value in vars(record).values():
+        if callable(getattr(value, "observe_shutdown", None)):
+            return value
+    return None
+
+
+class OwnerRegistry:
+    """The registry of transport owner tasks; one record per owner.
+
+    Besides the records, it carries what an owner needs from the plugin
+    without holding the plugin: ``torn_down`` (owners then call the lease's
+    synchronous ``teardown`` only), ``drain_deadline`` and
+    ``shutdown_trigger`` while draining, and ``escalate`` for a failure that
+    escalates to a requested shutdown.
+    """
+
+    # @spec ING-EP-060
     def __init__(self) -> None:
-        """Create an empty task registry for one plugin lifetime."""
-        self._owners: set[asyncio.Task[Any]] = set()
-        self._lock = asyncio.Lock()
+        """Create an empty registry."""
+        self._records: dict[int, OwnerRecord] = {}
+        self._waiters: set[asyncio.Future[None]] = set()
+        self.torn_down = False
+        self.drain_deadline: float | None = None
+        self.shutdown_trigger: ShutdownTrigger | None = None
+        self.on_fault: Callable[[BaseException], None] | None = None
 
     @property
-    def active(self) -> int:
-        """Return the number of owner tasks still awaiting terminal cleanup."""
-        return len(self._owners)
+    def records(self) -> Mapping[int, OwnerRecord]:
+        """The live records, read-only."""
+        return MappingProxyType(self._records)
 
-    # @spec ING-LIFE-012, ING-VEH-017
-    async def register(self, kind: str | None = None) -> OwnerToken:
-        """Register the current task before validation or body consumption."""
-        del kind
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("compatibility owner requires an asyncio task")
-        async with self._lock:
-            if task in self._owners:
-                raise RuntimeError(
-                    "one task cannot own two compatibility sessions"
-                )
-            self._owners.add(task)
-        return OwnerToken(self, task)
+    # @spec ING-EP-060, ING-ADM-013
+    def register(
+        self, kind: OwnerKind | str, task: asyncio.Task[Any]
+    ) -> OwnerRecord:
+        """Register ``task`` as an owner of ``kind`` and return its record."""
+        record = OwnerRecord(OwnerKind(kind), task)
+        self._records[id(record)] = record
+        self._notify()
+        return record
 
-    # @spec ING-VEH-017, ING-LIFE-013, ING-LIFE-014
-    async def drain(self, *, grace: float, cleanup_timeout: float) -> None:
-        """Gracefully wait, then cancel and await bounded owner cleanup."""
-        deadline = time.monotonic() + grace
-        graceful_window = max(0.0, grace - cleanup_timeout)
-        async with self._lock:
-            owners = set(self._owners)
-        if owners and graceful_window:
-            _, owners = await asyncio.wait(owners, timeout=graceful_window)
-        for owner in owners:
-            owner.cancel()
-        remaining = max(0.0, deadline - time.monotonic())
-        if owners and remaining:
-            _, owners = await asyncio.wait(owners, timeout=remaining)
-        await asyncio.sleep(0)
-        async with self._lock:
-            unresolved = set(self._owners)
-        if owners or unresolved:
-            raise RuntimeError(
-                "compatibility owners exceeded plugin_shutdown_grace"
-            )
+    def unregister(self, record: OwnerRecord) -> None:
+        """Remove ``record``; removing it again does nothing."""
+        if self._records.get(id(record)) is record:
+            del self._records[id(record)]
+            self._notify()
 
-
-def _resolve_host_version() -> str:
-    """Resolve the installed vLLM-Omni version without depending on it."""
-    try:
-        return importlib_metadata.version("vllm-omni")
-    except importlib_metadata.PackageNotFoundError:
-        module = importlib.import_module("vllm_omni")
-        version = getattr(module, "__version__", None)
-        if not isinstance(version, str):
-            raise RuntimeError(
-                "cannot resolve installed vLLM-Omni version"
-            ) from None
-        return version
-
-
-def _validate_supported_version(version: str) -> None:
-    """Fail before bind unless the host is one of the qualified lines.
-
-    A build carrying a PEP 440 dev, pre-release, or local segment — an
-    editable setuptools-scm '0.1.dev2155+g...' checkout, or a
-    '0.24.0.dev0+cu130' nightly — is an intentional unreleased host and is
-    allowed through; its base version is not a reliable line indicator.
-    Only a clean release version is held to the qualified major.minor set.
-    """
-    try:
-        parsed = Version(version)
-    except InvalidVersion as error:
-        raise ValueError(
-            f"invalid installed vLLM-Omni version: {version}"
-        ) from error
-    if parsed.is_devrelease or parsed.is_prerelease or parsed.local is not None:
-        return
-    if parsed.release[:2] not in _SUPPORTED_HOST_MAJOR_MINOR:
-        raise ValueError(
-            f"vllm-riva-frontend supports vLLM-Omni "
-            f"{_supported_host_lines()}; found {version}"
-        )
-
-
-def _supported_host_lines() -> str:
-    """Render the qualified lines the way an operator reads them."""
-    return ", ".join(
-        f"{major}.{minor}.x" for major, minor in _SUPPORTED_HOST_MAJOR_MINOR
-    )
-
-
-# @spec ING-VEH-012, ING-VEH-014, PORT-RTC-003
-def _create_nemotron_session_factory(
-    engine_client: object,
-    *,
-    app_state: object = None,
-) -> SessionFactory:
-    """Acquire the model-specific session factory from the selected host.
-
-    Observation inheritance (host PORT-OBS-003): when the host has a
-    streaming observer installed in its serving app state, this plugin
-    is the "model-aware downstream participant" the host's factory
-    docstring names — it wires observation by constructing the internal
-    ``NemotronSessionFactory(engine=..., observer=...)`` with the HOST'S
-    installed observer, resolved via the host's own
-    ``resolve_installed_observer`` seam. The plugin never constructs,
-    registers, or duplicates any metric family itself (ENV-MOD-004);
-    it only reuses the one observer the host installed. On a host
-    without the observation seam, or with no observer installed, the
-    pinned public constructor is used unchanged and sessions are simply
-    unobserved — exactly the pre-observability behavior.
-    """
-    module = importlib.import_module("vllm_omni.entrypoints.nemotron_session")
-
-    observer: object = None
-    if app_state is not None:
-        try:
-            install_module = importlib.import_module(
-                "vllm_omni.metrics.streaming_install"
-            )
-        except ModuleNotFoundError:
-            install_module = None
-        if install_module is not None:
-            resolve = getattr(
-                install_module, "resolve_installed_observer", None
-            )
-            if callable(resolve):
-                observer = resolve(app_state)
-
-    if observer is not None:
-        internal = getattr(module, "NemotronSessionFactory", None)
-        if callable(internal):
-            factory = internal(engine=engine_client, observer=observer)
-            if not callable(getattr(factory, "open", None)):
-                raise TypeError(
-                    "Nemotron session factory must expose async open"
-                )
-            return cast(SessionFactory, factory)
-
-    constructor = getattr(module, "create_nemotron_session_factory", None)
-    if not callable(constructor):
-        raise TypeError(
-            "vLLM-Omni does not expose create_nemotron_session_factory"
-        )
-    factory = constructor(engine_client)
-    if not callable(getattr(factory, "open", None)):
-        raise TypeError("Nemotron session factory must expose async open")
-    return cast(SessionFactory, factory)
-
-
-# @spec ING-VEH-013
-def _served_model(context: PluginContext) -> str:
-    """Resolve the host registry's primary public model identity."""
-    app = getattr(context, "app", None)
-    state = getattr(app, "state", None)
-    registry = getattr(state, "openai_serving_models", None)
-    model_name = getattr(registry, "model_name", None)
-    if not callable(model_name):
-        raise ValueError(
-            "riva_frontend requires the host served model registry"
-        )
-    try:
-        model = model_name()
-    except Exception as error:
-        raise ValueError(
-            "riva_frontend served model registry lookup failed"
-        ) from error
-    if not isinstance(model, str) or not model:
-        raise ValueError(
-            "riva_frontend served model registry returned an invalid name"
-        )
-    return model
-
-
-def _supported_locales(context: PluginContext) -> frozenset[str]:
-    """Derive exact accepted locales from the loaded prompt dictionary."""
-    engine_config = getattr(context.engine_client, "model_config", None)
-    hf_config = getattr(engine_config, "hf_config", None)
-    prompts = getattr(hf_config, "prompt_dictionary", None)
-    if not isinstance(prompts, dict) or not prompts:
-        raise ValueError("riva_frontend requires a non-empty prompt_dictionary")
-    if not all(isinstance(locale, str) and locale for locale in prompts):
-        raise ValueError("prompt_dictionary locales must be non-empty strings")
-    if "auto" not in prompts:
-        raise ValueError(
-            "prompt_dictionary must expose the default 'auto' locale"
-        )
-    return frozenset(prompts)
-
-
-def _validate_context(context: PluginContext) -> None:
-    """Validate the generic host seam and values before any listener bind."""
-    if context.plugin_name != "riva_frontend":
-        raise ValueError("unexpected application-plugin entry-point name")
-    if not callable(getattr(context, "install_asgi_wrapper", None)):
-        raise TypeError("plugin context must expose install_asgi_wrapper")
-    if not callable(getattr(context.admission, "try_acquire", None)):
-        raise TypeError("host admission must expose try_acquire")
-
-
-def _validate_route_collisions(app: object) -> None:
-    """Reject method/path ownership collisions before listener creation."""
-    routes = getattr(app, "routes", ())
-    for route in routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if path not in _OWNED_HTTP_METHODS or methods is None:
-            continue
-        if _OWNED_HTTP_METHODS[path].intersection(methods):
-            raise ValueError(f"application-plugin route collision: {path}")
-
-
-async def _send_json(
-    send: Callable[[dict[str, object]], Any],
-    *,
-    status: int,
-    body: object,
-) -> None:
-    """Write one complete JSON response over raw ASGI."""
-    encoded = json.dumps(body).encode("utf-8")
-    await send(
-        {
-            "type": "http.response.start",
-            "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(encoded)).encode("ascii")),
-            ],
-        }
-    )
-    await send(
-        {
-            "type": "http.response.body",
-            "body": encoded,
-            "more_body": False,
-        }
-    )
-
-
-class RivaFrontendMiddleware:
-    """Own only the approved RFC-2 ASGI paths and pass everything else."""
-
-    def __init__(self, app: object, *, lifetime: PluginLifetime) -> None:
-        """Bind the wrapped host app and its one selected plugin lifetime."""
-        self._app = app
-        self._lifetime = lifetime
-        self._ws = dispatch_nim_realtime(
-            app=app,  # type: ignore[arg-type]
-            factory=lifetime.session_factory,
-            config=lifetime.adapter_config,
-            admission=lifetime.context.admission,
-            gate=lifetime.load_shed,
-            owner_factory=lifetime._make_owner,
-        )
-
-    # @spec ING-NIMWS-001, ING-HTTP-001, ING-SHIM-001, ING-SHIM-006
-    async def __call__(
-        self,
-        scope: dict[str, object],
-        receive: Callable[[], Any],
-        send: Callable[[dict[str, object]], Any],
+    def attach_continuation(
+        self, record: OwnerRecord, task: asyncio.Task[Any]
     ) -> None:
-        """Dispatch exact compatibility scopes without shadowing the host."""
-        if scope.get("type") == "http":
-            path = scope.get("path")
-            method = scope.get("method")
-            if path == "/v1/audio/transcriptions" and method == "POST":
-                await self._lifetime.http_endpoint(
-                    scope,
-                    receive,
-                    send,  # type: ignore[arg-type]
-                )
-                return
+        """Keep ``record`` under ``task``, its cleanup continuation."""
+        record.continuation = task
+        self._notify()
+
+    def attach_owner(self, record: OwnerRecord, owner: Any) -> None:
+        """Attach the object that observes the shutdown trigger.
+
+        If the trigger has already been raised, it is delivered at once.
+        """
+        record.owner = owner
+        if self.shutdown_trigger is not None:
+            self._deliver(record, self.shutdown_trigger)
+
+    def escalate(self, error: BaseException) -> None:
+        """Report a failure that escalates (an ``engine_dead`` reason)."""
+        if self.on_fault is not None:
+            self.on_fault(error)
+
+    def cancel_all(self) -> list[asyncio.Task[Any]]:
+        """Cancel every owner, continuation and child; return them all."""
+        tasks: list[asyncio.Task[Any]] = []
+        for record in list(self._records.values()):
+            tasks.append(record.task)
+            if record.continuation is not None:
+                tasks.append(record.continuation)
+            tasks.extend(record.children)
+        current = asyncio.current_task()
+        for task in tasks:
+            if task is not current:
+                task.cancel()
+        return tasks
+
+    def cancel_owners(self) -> list[asyncio.Task[Any]]:
+        """Cancel the owner tasks only; their cleanup continues."""
+        current = asyncio.current_task()
+        tasks = [record.task for record in self._records.values()]
+        for task in tasks:
+            if task is not current:
+                task.cancel()
+        return tasks
+
+    # @spec ING-EP-037, ING-EP-038
+    def deliver_shutdown(self, trigger: ShutdownTrigger) -> None:
+        """Raise the shutdown trigger for every owner.
+
+        A stream owner observes it and runs its own shutdown finalization; a
+        stream task with no observer yet and every file request are
+        cancelled and take their cancellation path.
+        """
+        self.shutdown_trigger = trigger
+        for record in list(self._records.values()):
+            if record.task.done():
+                continue
+            if record.kind in FILE_KINDS:
+                record.task.cancel()
+            else:
+                self._deliver(record, trigger)
+
+    def _deliver(self, record: OwnerRecord, trigger: ShutdownTrigger) -> None:
+        if record.task.done():
+            return
+        observer = _shutdown_observer(record)
+        if observer is None:
+            record.task.cancel()
+            return
+        try:
+            outcome = observer.observe_shutdown(trigger)
+        except Exception:
+            logger.exception("%s: an owner refused the trigger", PLUGIN_KEY)
+            record.task.cancel()
+            return
+        if inspect.isawaitable(outcome):
+            # Kept under the owner's record, so it is no detached task.
+            record.children.add(asyncio.ensure_future(outcome))
+
+    def pending(self) -> set[asyncio.Task[Any]]:
+        """The owner tasks and continuations that have not finished."""
+        tasks: set[asyncio.Task[Any]] = set()
+        for record in self._records.values():
+            tasks.add(record.task)
+            if record.continuation is not None:
+                tasks.add(record.continuation)
+        return {task for task in tasks if not task.done()}
+
+    def settled(self, kinds: Iterable[OwnerKind] | None = None) -> bool:
+        """Whether every owner (of ``kinds``) and continuation has finished."""
+        wanted = None if kinds is None else frozenset(kinds)
+        for record in self._records.values():
+            if wanted is not None and record.kind not in wanted:
+                continue
+            if not record.task.done():
+                return False
             if (
-                path == "/v1/realtime/transcription_sessions"
-                and method == "POST"
+                record.continuation is not None
+                and not record.continuation.done()
             ):
-                await _send_json(
-                    send,
-                    status=200,
-                    body=bootstrap_session(self._lifetime.model_name),
-                )
-                return
-            if path in OPERATIONAL_PATHS and method == "GET":
-                response = operational_response(
-                    str(path),
-                    ready=self._lifetime.ready,
-                    live=self._lifetime.live,
-                    release=self._lifetime.release,
-                    model=self._lifetime.model_name,
-                    provenance=self._lifetime.provenance,
-                )
-                assert response is not None
-                status, body = response
-                await _send_json(send, status=status, body=body)
-                return
-        await self._ws(scope, receive, send)
+                return False
+        return True
+
+    def changed(self) -> asyncio.Future[None]:
+        """Return a future resolved at the next register or unregister."""
+        future: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._waiters.add(future)
+        future.add_done_callback(self._waiters.discard)
+        return future
+
+    def _notify(self) -> None:
+        for future in list(self._waiters):
+            if not future.done():
+                future.set_result(None)
 
 
-class PluginLifetime:
-    """One selected plugin nested inside the host engine lifetime."""
+# ----------------------------------------------------- supervision tasks
+
+
+class FaultCollector:
+    """Collects the factory's cleanup faults while the plugin serves.
+
+    Every ``period`` it calls ``factory.drain`` with an immediate deadline,
+    under the lock the shutdown ``drain`` also takes, so two callers never
+    take the same faults.
+    """
 
     def __init__(
         self,
-        context: PluginContext,
+        factory: Any,
+        period: float = COLLECTOR_PERIOD,
+        on_fault: Callable[[BaseException], None] | None = None,
         *,
-        config_loader: Callable[
-            [str | None], tuple[FrontendConfig, DeploymentMetadata]
-        ] = load_plugin_config,
-        version_resolver: Callable[[], str] = _resolve_host_version,
-        server_factory: Callable[..., Any] = grpc.aio.server,
-        service_registrar: Callable[..., Any] = register_aio_services,
+        clock: Clock | None = None,
+        lock: asyncio.Lock | None = None,
     ) -> None:
-        """Capture host context and injectable startup seams."""
-        self.context = context
-        self._config_loader = config_loader
-        self._version_resolver = version_resolver
-        self._server_factory = server_factory
-        self._service_registrar = service_registrar
-        self._config: FrontendConfig | None = None
-        self._metadata: DeploymentMetadata | None = None
-        self._server: Any | None = None
-        self._server_watch: asyncio.Task[None] | None = None
-        self._health: Any | None = None
-        self._ready_event = asyncio.Event()
-        self._failure: asyncio.Future[BaseException] | None = None
-        self._entered = False
-        self._quiesced = False
-        self.ready = False
-        self.live = True
-        self.release = "0.0.0"
-        self.model_name = "unknown"
-        self.locales: frozenset[str] = frozenset()
-        self._cleanup_faults: list[BaseException] = []
-        self.load_shed: LoadShedGate
-        self.owners = CompatibilityOwnerRegistry()
-        self.http_endpoint: NimHttpTranscriptionEndpoint
-        self.adapter_config: object
-        self.session_factory: SessionFactory
+        """Bind the factory, the period, the fault handler and the clock."""
+        self._factory = factory
+        self._period = period
+        self._on_fault = on_fault
+        self._clock = clock if clock is not None else RealClock()
+        self._lock = lock if lock is not None else asyncio.Lock()
 
-    @property
-    def provenance(self) -> dict[str, str]:
-        """Return only this deployment's factual public identifiers."""
-        if self._metadata is None or self._config is None:
-            return {}
-        return build_deployment_provenance(
-            self._metadata,
-            resampler_identifier=self._config.resampler_identifier,
-        )
+    # @spec ING-EP-015
+    async def run(self) -> None:
+        """Collect until cancelled."""
+        while True:
+            await self._clock.sleep(self._period)
+            try:
+                async with self._lock:
+                    faults = await self._factory.drain(self._clock.monotonic())
+            except Exception as error:  # a failing drain is a fault itself
+                faults = [error]
+            for fault in faults or ():
+                if self._on_fault is not None:
+                    self._on_fault(fault)
 
-    @property
-    def shutdown_grace(self) -> float:
-        """Return the configured finite owner/HTTP shutdown barrier."""
-        if self._config is None:
-            raise RuntimeError(
-                "plugin must enter before reading shutdown grace"
-            )
-        return self._config.plugin_shutdown_grace
 
-    async def _set_health(self, status: int) -> None:
-        """Set aggregate and Riva-service health without leading admission."""
-        assert self._health is not None
-        await self._health.set("", status)
-        await self._health.set(RIVA_SERVICE_NAME, status)
+class ListenerMonitor:
+    """Watches the gRPC server and reports its exit."""
 
-    def _make_owner(
-        self, factory: SessionFactory, *, cleanup_timeout: float
-    ) -> DirectLeaseOwner:
-        """Create one owner wired to process-health escalation."""
-        return DirectLeaseOwner(
-            factory,
-            cleanup_timeout=cleanup_timeout,
-            fault_reporter=self._record_cleanup_fault,
-        )
+    def __init__(
+        self,
+        server: Any,
+        on_exit: Callable[[BaseException | None], None],
+    ) -> None:
+        """Bind the server and the exit handler."""
+        self._server = server
+        self._on_exit = on_exit
 
-    def _record_cleanup_fault(self, error: BaseException) -> None:
-        """Latch the first failure for host supervision and withdraw health."""
-        self._cleanup_faults.append(error)
-        self.ready = False
-        self.live = False
-        if self._failure is not None and not self._failure.done():
-            self._failure.set_result(error)
+    # @spec ING-EP-016
+    async def run(self) -> None:
+        """Wait for the server's termination, then report it."""
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self._withdraw_health_after_failure())
-
-    async def _withdraw_health_after_failure(self) -> None:
-        """Withdraw participant health; the host supervisor owns shutdown."""
-        if self._health is not None:
-            with suppress(BaseException):
-                await self._set_health(
-                    health_pb2.HealthCheckResponse.NOT_SERVING
-                )
-
-    async def _watch_server_termination(self) -> None:
-        """Latch an unexpected auxiliary-listener exit for the host."""
-        assert self._server is not None
-        try:
-            await self._server.wait_for_termination()
+            # With a timeout the server shields its termination future;
+            # without one, cancelling this monitor would cancel that future
+            # and break the server's own ``stop``.
+            while await self._server.wait_for_termination(
+                timeout=_MONITOR_POLL
+            ):
+                pass
         except asyncio.CancelledError:
             raise
-        except BaseException as error:
-            if not self._quiesced:
-                self._record_cleanup_fault(error)
+        except Exception as error:
+            self._on_exit(error)
             return
-        if not self._quiesced:
-            self._record_cleanup_fault(
-                RuntimeError("Riva gRPC listener terminated unexpectedly")
-            )
+        self._on_exit(None)
 
-    def _configure_http(self) -> HttpTranscriptionConfig:
-        assert self._config is not None
-        return HttpTranscriptionConfig(
-            limits=MultipartLimits(
-                encoded_audio_bytes=(
-                    self._config.unary_max_encoded_audio_bytes
-                ),
-                envelope_bytes=(self._config.http_multipart_envelope_max_bytes),
-                content_type_bytes=(self._config.http_content_type_max_bytes),
-                boundary_bytes=(self._config.http_multipart_boundary_max_bytes),
-                part_count=self._config.http_multipart_max_parts,
-                part_header_bytes=(
-                    self._config.http_multipart_max_header_bytes
-                ),
-                text_field_bytes=self._config.http_text_field_max_bytes,
-            ),
-            max_riff_header_bytes=self._config.max_riff_header_bytes,
-            max_decoded_duration_seconds=(
-                self._config.unary_max_decoded_duration_seconds
-            ),
-            pre_submit_max_samples=self._config.pre_submit_max_samples,
-            request_timeout=self._config.http_request_timeout,
-            finalization_timeout=(self._config.session_finalization_timeout),
-            cleanup_timeout=self._config.session_cleanup_timeout,
-        )
 
-    # @spec ING-VEH-010, ING-VEH-012, ING-VEH-014, ING-GRPC-011
-    async def __aenter__(self) -> PluginLifetime:
-        """Validate, install ASGI handling, and bind gRPC not-serving."""
-        self._failure = asyncio.get_running_loop().create_future()
-        self._config, self._metadata = self._config_loader(self.context.config)
-        try:
-            self.release = importlib_metadata.version("vllm-riva-frontend")
-        except importlib_metadata.PackageNotFoundError:
-            self.release = "unknown"
-        _validate_supported_version(self._version_resolver())
-        _validate_context(self.context)
-        _validate_route_collisions(self.context.app)
-        self.model_name = _served_model(self.context)
-        self.locales = _supported_locales(self.context)
-        self.session_factory = _create_nemotron_session_factory(
-            self.context.engine_client,
-            app_state=getattr(
-                getattr(self.context, "app", None), "state", None
-            ),
-        )
-        self.load_shed = LoadShedGate(
-            self._config.load_shed_max_sessions,
-            owner_register=self.owners.register,
-        )
-        self.adapter_config = SimpleNamespace(
-            **vars(self._config),
-            model_name=self.model_name,
-            locales=self.locales,
-            provenance=self.provenance,
-        )
-        self.http_endpoint = NimHttpTranscriptionEndpoint(
-            factory=self.session_factory,
-            load_shed=self.load_shed,
-            config=self._configure_http(),
-            served_model=self.model_name,
-            locales=self.locales,
-            admission=self.context.admission,
-            owner_factory=self._make_owner,
-        )
-        self.context.install_asgi_wrapper(
-            lambda app: RivaFrontendMiddleware(app, lifetime=self)
-        )
-        options: list[tuple[str, int]] = [
-            (
-                "grpc.max_receive_message_length",
-                self._config.grpc_receive_max_bytes,
-            )
-        ]
-        if self._config.grpc_keepalive_seconds is not None:
-            options.append(
-                (
-                    "grpc.keepalive_time_ms",
-                    int(self._config.grpc_keepalive_seconds * 1000),
-                )
-            )
-        self._server = self._server_factory(options=options)
-        servicer = build_servicer(
-            factory=self.session_factory,
-            config=self._config,
-            model_name=self.model_name,
-            locales=self.locales,
-            load_shed=self.load_shed,
-            admission=self.context.admission,
-            owner_factory=self._make_owner,
-        )
-        try:
-            self._health = self._service_registrar(
-                server=self._server, servicer=servicer
-            )
-            await self._set_health(health_pb2.HealthCheckResponse.NOT_SERVING)
-            if self._server.add_insecure_port(self._config.grpc_bind) == 0:
-                raise RuntimeError(
-                    f"could not bind gRPC listener: {self._config.grpc_bind}"
-                )
-            await self._server.start()
-        except BaseException:
-            if self._server is not None:
-                with suppress(BaseException):
-                    await self._server.stop(0)
-            raise
-        self._entered = True
-        self._ready_event.set()
-        self._server_watch = asyncio.create_task(
-            self._watch_server_termination()
-        )
-        return self
+# ------------------------------------------------------------ the plugin
 
-    # @spec ING-VEH-018, ING-GRPC-011
-    async def wait_ready(self) -> None:
-        """Attest that every owned listener is bound and ready for admission."""
-        if not self._entered:
-            raise RuntimeError("plugin must enter before wait_ready")
-        await self._ready_event.wait()
 
-    # @spec ING-VEH-017, ING-VEH-018, ING-GRPC-011
-    async def wait_failed(self) -> None:
-        """Raise the first latched post-entry participant failure."""
-        if not self._entered or self._failure is None:
-            raise RuntimeError("plugin must enter before wait_failed")
-        error = await asyncio.shield(self._failure)
-        raise error
+def _serves(app: Any, path: str, method: str) -> bool:
+    """Whether ``app`` already has a route for ``method path``."""
+    return any(
+        getattr(route, "path", None) == path
+        and method in (getattr(route, "methods", None) or ())
+        for route in app.routes
+    )
 
-    # @spec ING-VEH-016, ING-GRPC-011, ING-SHIM-001
-    async def mark_serving(self) -> None:
-        """Publish compatibility readiness after the host transition."""
-        if not self._entered or self._health is None:
-            raise RuntimeError("plugin must enter before mark_serving")
-        await self._set_health(health_pb2.HealthCheckResponse.SERVING)
-        self.ready = True
 
-    # @spec ING-VEH-017, ING-GRPC-011, ING-SHIM-001
-    async def quiesce_and_drain(self) -> None:
-        """Become non-ready, drain every owner, then stop gRPC."""
-        if self._quiesced:
-            return
-        self._quiesced = True
-        self.ready = False
-        assert self._config is not None
-        try:
-            if self._health is not None:
-                await self._set_health(
-                    health_pb2.HealthCheckResponse.NOT_SERVING
-                )
-            await self.load_shed.close()
-            await self.owners.drain(
-                grace=self._config.plugin_shutdown_grace,
-                cleanup_timeout=self._config.session_cleanup_timeout,
-            )
-            if self._cleanup_faults:
-                raise RuntimeError(
-                    "terminal cleanup fault requires provider teardown"
-                ) from self._cleanup_faults[0]
-        except BaseException:
-            self.live = False
-            raise
-        finally:
-            if self._server is not None:
-                await self._server.stop(0)
-            if self._server_watch is not None:
-                with suppress(asyncio.CancelledError):
-                    await self._server_watch
+def _routing_target(app: Any, path: str, method: str) -> Any:
+    """The route ``app`` dispatches ``method path`` to, or ``None``."""
+    scope = {
+        "type": "http",
+        "path": path,
+        "root_path": "",
+        "method": method,
+        "headers": [],
+        "query_string": b"",
+    }
+    for route in app.router.routes:
+        match, _ = route.matches(scope)
+        if match is Match.FULL:
+            return route
+    return None
 
-    async def __aexit__(
-        self, exc_type: object, exc: object, traceback: object
+
+# @spec ING-VEH-026
+def _served_identity(state: Any) -> str:
+    """Call the serving-model registry once for the served identity."""
+    registry = getattr(state, "openai_serving_models", None)
+    if registry is None:
+        raise StartupError(
+            [f"{PLUGIN_KEY}: state.openai_serving_models is missing"]
+        )
+    accessor = getattr(registry, "model_name", None)
+    if not callable(accessor):
+        raise StartupError(
+            [f"{PLUGIN_KEY}: openai_serving_models.model_name is not callable"]
+        )
+    try:
+        name = accessor()
+    except Exception as error:
+        raise StartupError(
+            [f"{PLUGIN_KEY}: the served-model lookup failed: {error!r}"]
+        ) from error
+    if not isinstance(name, str) or not name:
+        raise StartupError(
+            [f"{PLUGIN_KEY}: the served-model registry returned {name!r}"]
+        )
+    return name
+
+
+# @spec ING-EP-028, ING-EP-029, ING-EP-030
+def _engine_capacity(vllm_config: Any) -> Capacity:
+    """Refuse data parallelism, then read slots and the active limit."""
+    failures: list[str] = []
+    parallel = getattr(
+        getattr(vllm_config, "parallel_config", None), "data_parallel_size", 1
+    )
+    if parallel not in (None, 1):
+        failures.append(
+            "vllm_config.parallel_config.data_parallel_size is "
+            f"{parallel!r}: {PLUGIN_KEY} needs data parallel size 1, as the "
+            "slot count and active limit are per engine"
+        )
+    capacity: Capacity | None = None
+    try:
+        capacity = read_capacity(vllm_config)
+    except StartupError as error:
+        failures.extend(error.failures)
+    if failures:
+        raise StartupError(failures)
+    assert capacity is not None
+    return capacity
+
+
+def _core_upload_limit_bytes() -> int:
+    """Core's upload limit (``VLLM_MAX_AUDIO_CLIP_FILESIZE_MB``) in bytes."""
+    import vllm.envs as envs
+
+    return int(envs.VLLM_MAX_AUDIO_CLIP_FILESIZE_MB * 1024 * 1024)
+
+
+def _core_decode_limit(service: Any) -> float:
+    """Core's decode-duration limit, as the transcription service holds it."""
+    limit = getattr(service, "max_audio_decode_duration_s", None)
+    if isinstance(limit, (int, float)) and not isinstance(limit, bool):
+        return float(limit)
+    import vllm.envs as envs
+
+    return float(envs.VLLM_MAX_AUDIO_DECODE_DURATION_S)
+
+
+# @spec ING-EP-020, ING-VEH-005, ING-VEH-008
+class RivaFrontendPlugin:
+    """The Riva frontend as one vLLM endpoint plugin.
+
+    Public attributes after ``init_state``: ``config``, ``served_model``,
+    ``deadlines``, ``capacity``, ``files_enabled``, ``factory``,
+    ``registry``, ``ingress``, ``file_gate``, ``catalog``, ``servicer``,
+    ``provenance``, ``transcription`` (core's service or ``None``),
+    ``state`` and ``engine_client``. After ``start``: ``server``,
+    ``health``, ``fault_collector`` and ``listener_monitor``. Throughout:
+    ``clock``, ``draining``, ``drain_deadline``, ``torn_down`` and
+    ``fault``.
+    """
+
+    name = "riva_frontend"
+    required_tasks: tuple[str, ...] = ("realtime",)
+    owns_non_http_listener = True
+
+    # @spec ING-EP-006
+    def __init__(
+        self,
+        *,
+        clock: Clock | None = None,
+        entry_points: Callable[..., Iterable[Any]] | None = None,
     ) -> None:
-        """Idempotently stop plugin resources before engine-context exit."""
-        del exc_type, exc, traceback
-        if self._entered and not self._quiesced:
-            await self.quiesce_and_drain()
+        """Bind the clock and the session-factory discovery seam."""
+        self.clock: Clock = clock if clock is not None else RealClock()
+        self._entry_points: Callable[..., Iterable[Any]] = (
+            entry_points
+            if entry_points is not None
+            else importlib.metadata.entry_points
+        )
+        self._app: Any = None
+        self._handlers: dict[tuple[str, str], Callable[..., Any]] = {}
+        self.state: Any = None
+        self.engine_client: Any = None
+        self.config: FrontendConfig | None = None
+        self.served_model: str | None = None
+        self.deadlines: StreamDeadlines | None = None
+        self.capacity: Capacity | None = None
+        self.files_enabled = False
+        self.transcription: Any = None
+        self.provenance: DeploymentProvenance | None = None
+        self.factory: Any = None
+        self.registry: OwnerRegistry | None = None
+        self.ingress: IngressCap | None = None
+        self.file_gate: Any = None
+        self.catalog: ErrorCatalog | None = None
+        self.servicer: Any = None
+        self.server: Any = None
+        self.health: Any = None
+        self.fault_collector: asyncio.Task[None] | None = None
+        self.listener_monitor: asyncio.Task[None] | None = None
+        self.draining = False
+        self.drain_deadline: float | None = None
+        self.torn_down = False
+        self.fault: BaseException | None = None
+        self._serving = False
+        self._listener_closing = False
+        self._shutdown_requested = False
+        # Serializes factory.drain between the collector and drain.
+        self._factory_lock = asyncio.Lock()
+
+    @property
+    def admission_open(self) -> bool:
+        """Whether the ingress cap admits owners."""
+        return self.ingress is not None and self.ingress.is_open
+
+    # ------------------------------------------------------ attach_router
+
+    # @spec ING-EP-007, ING-EP-004, ING-SHIM-008, ING-FILE-003
+    # @spec ING-SHIM-013, ING-SHIM-014
+    def attach_router(self, app: Any) -> None:
+        """Add the bootstrap, operational and file routes and the dispatcher.
+
+        The operational and bootstrap paths are added as new routes, so an
+        existing route on one of them fails startup here. The file route is
+        added only when core's ``POST /v1/audio/transcriptions`` exists, and
+        replaces it. The dispatcher is middleware: core adds its own
+        middleware after the plugin hooks, so core's authentication wraps
+        the dispatcher and ``--api-key`` applies to the claimed scopes.
+        """
+        from vllm_riva_frontend.files import file_route
+        from vllm_riva_frontend.nim_ws import BOOTSTRAP_PATH, RealtimeDispatcher
+
+        router = operational_router(self)
+        router.add_api_route(
+            BOOTSTRAP_PATH,
+            self._bootstrap_endpoint(),
+            methods=["POST"],
+            response_model=None,
+        )
+        collisions = [
+            f"{PLUGIN_KEY}: {method} {route.path} is already served; the "
+            "frontend adds this path as new"
+            for route in router.routes
+            for method in sorted(getattr(route, "methods", None) or ())
+            if _serves(app, route.path, method)
+        ]
+        if collisions:
+            raise StartupError(collisions)
+        if _serves(app, FILE_ROUTE_PATH, "POST"):
+            router.add_api_route(
+                FILE_ROUTE_PATH,
+                file_route(self),
+                methods=["POST"],
+                response_model=None,
+            )
+        app.include_router(router)
+        self._handlers = {
+            (route.path, method): route.endpoint
+            for route in router.routes
+            for method in getattr(route, "methods", None) or ()
+        }
+        app.add_middleware(RealtimeDispatcher, plugin=self)
+        self._app = app
+
+    # @spec ING-LIFE-045
+    def _bootstrap_endpoint(self) -> Callable[[], Any]:
+        """The ``POST /v1/realtime/transcription_sessions`` handler."""
+
+        async def realtime_transcription_sessions() -> JSONResponse:
+            from vllm_riva_frontend.nim_ws import bootstrap_session
+
+            if self.served_model is None or self.factory is None:
+                error = FrontendError(
+                    "service_unavailable", "the frontend is not initialized"
+                )
+                return JSONResponse(error.http_body(503), status_code=503)
+            return JSONResponse(
+                bootstrap_session(
+                    self.served_model, self.factory.default_locale
+                )
+            )
+
+        return realtime_transcription_sessions
+
+    # ---------------------------------------------------------- init_state
+
+    # @spec ING-EP-003, ING-EP-023, ING-EP-024, ING-EP-025, ING-EP-021
+    # @spec ING-EP-031, ING-EP-027, ING-ADM-014, ING-VEH-026
+    async def init_state(
+        self, engine_client: Any, state: Any, args: Any
+    ) -> None:
+        """Run the startup checks in order, then build the plugin's parts.
+
+        Order: configuration, served identity, engine stream deadlines,
+        capacity, complete-file service, the build (including the route
+        table), and the session factory last. Each step raises one
+        ``StartupError`` naming everything that failed within it. A failure
+        after the factory exists tears the factory down first. No listener
+        is bound and no task is started.
+        """
+        del args  # never an identity or option source
+        self.state = state
+        if engine_client is None:
+            raise StartupError([f"{PLUGIN_KEY} needs an engine client"])
+        self.engine_client = engine_client
+        vllm_config = engine_client.vllm_config
+        additional = getattr(vllm_config, "additional_config", None)
+        if not isinstance(additional, Mapping):
+            additional = {}
+
+        config = parse_config(additional)
+        self.served_model = _served_identity(state)
+
+        deadlines = read_stream_deadlines(additional)
+        bounds = check_bounds(config, deadlines)
+        if bounds:
+            raise StartupError(bounds)
+        self.deadlines = deadlines
+
+        self.capacity = _engine_capacity(vllm_config)
+
+        service = getattr(state, "openai_serving_transcription", None)
+        config = self._size_file_service(config, service)
+        self.config = config
+        self.transcription = service
+        self.provenance = build_deployment_provenance(config)
+
+        self._build(config)
+        self._check_route_table()
+
+        self.factory = self._discover_factory(engine_client, config)
+        try:
+            self._check_cadence()
+            from vllm_riva_frontend.grpc import RivaServicer
+
+            self.servicer = RivaServicer(self)
+        except BaseException:
+            self._teardown_factory()
+            raise
+
+        if getattr(vllm_config, "shutdown_timeout", None) == 0:
+            logger.warning(
+                "%s: --shutdown-timeout is 0, so no drain will run; "
+                "shutdown is stop alone, which cancels open streams",
+                PLUGIN_KEY,
+            )
+
+    # @spec ING-FILE-006, ING-FILE-009, ING-FILE-015, ING-FILE-016
+    # @spec ING-FILE-018, ING-FILE-046, ING-FILE-047, ING-FILE-054
+    def _size_file_service(
+        self, config: FrontendConfig, service: Any
+    ) -> FrontendConfig:
+        """Size the file gate and sub-cap and check core's file limits."""
+        if service is None:
+            self.files_enabled = False
+            return dataclasses.replace(
+                config, max_concurrent_files=0, max_file_owners=0
+            )
+        assert self.capacity is not None
+        failures: list[str] = []
+        concurrent, owners, enabled = 0, 0, False
+        try:
+            concurrent, owners, enabled = derive_file_caps(
+                config, self.capacity, True
+            )
+        except ConfigError as error:
+            failures.extend(error.failures)
+        upload_limit = _core_upload_limit_bytes()
+        envelope = config.http_multipart_envelope_max_bytes
+        if envelope < upload_limit + UPLOAD_FRAMING_BYTES:
+            failures.append(
+                f"{PLUGIN_KEY}.http_multipart_envelope_max_bytes ({envelope}) "
+                f"must be at least core's upload limit ({upload_limit} bytes, "
+                f"VLLM_MAX_AUDIO_CLIP_FILESIZE_MB) plus "
+                f"{UPLOAD_FRAMING_BYTES} bytes of framing"
+            )
+        decode_limit = _core_decode_limit(service)
+        duration = config.unary_max_decoded_duration_seconds
+        if duration > decode_limit:
+            failures.append(
+                f"{PLUGIN_KEY}.unary_max_decoded_duration_seconds ({duration}) "
+                f"must be at most core's decode-duration limit ({decode_limit} "
+                "s, VLLM_MAX_AUDIO_DECODE_DURATION_S)"
+            )
+        if failures:
+            raise StartupError(failures)
+        if not enabled:
+            logger.warning(
+                "%s: complete files are disabled: the smaller of the "
+                "state-slot count (%d) and the active-request limit (%d) is "
+                "below 2 and max_concurrent_files is not configured",
+                PLUGIN_KEY,
+                self.capacity.slots,
+                self.capacity.active_limit,
+            )
+        self._warn_inherited_sampling(service)
+        self.files_enabled = enabled
+        return dataclasses.replace(
+            config, max_concurrent_files=concurrent, max_file_owners=owners
+        )
+
+    @staticmethod
+    def _warn_inherited_sampling(service: Any) -> None:
+        """Warn when the served model's generation settings set a guarded key.
+
+        Complete files decode greedily, so an inherited sampling setting is
+        ignored; the operator's configuration is not inspected per request.
+        """
+        from vllm_riva_frontend.files import FORWARDED_SAMPLING_FIELDS
+
+        settings = getattr(service, "default_sampling_params", None)
+        if not isinstance(settings, Mapping):
+            return
+        guarded = sorted(set(settings) & set(FORWARDED_SAMPLING_FIELDS))
+        if guarded:
+            logger.warning(
+                "%s: the served model's generation settings set %s; complete "
+                "files decode greedily and ignore them",
+                PLUGIN_KEY,
+                ", ".join(guarded),
+            )
+
+    def _build(self, config: FrontendConfig) -> None:
+        """Build the registry, ingress cap, file gate and error catalog."""
+        registry = OwnerRegistry()
+        registry.on_fault = self.escalate
+        self.registry = registry
+        assert config.max_file_owners is not None
+        self.ingress = IngressCap(
+            max_sessions=config.load_shed_max_sessions,
+            max_file_owners=config.max_file_owners,
+            serving=self._core_serving,
+        )
+        self.file_gate = None
+        if self.files_enabled:
+            from vllm_riva_frontend.files import FileGate
+
+            assert config.max_concurrent_files is not None
+            self.file_gate = FileGate(
+                config.max_concurrent_files, clock=self.clock
+            )
+        self.catalog = catalog()
+
+    def _core_serving(self) -> bool:
+        """Whether core has not set ``state.draining``."""
+        return not getattr(self.state, "draining", False)
+
+    def _check_route_table(self) -> None:
+        """Fail unless core's final table routes each path to this plugin."""
+        if self._app is None:
+            raise StartupError(
+                [f"{PLUGIN_KEY}: init_state ran before attach_router"]
+            )
+        failures = [
+            f"{PLUGIN_KEY}: {method} {path} no longer reaches the frontend's "
+            "handler; another endpoint plugin overrides it"
+            for (path, method), endpoint in self._handlers.items()
+            if getattr(
+                _routing_target(self._app, path, method), "endpoint", None
+            )
+            is not endpoint
+        ]
+        if failures:
+            raise StartupError(failures)
+
+    def _discover_factory(
+        self, engine_client: Any, config: FrontendConfig
+    ) -> Any:
+        """Discover the one session factory (session leaf)."""
+        from vllm_riva_frontend.lease import discover_session_factory
+
+        try:
+            return discover_session_factory(
+                engine_client,
+                selected=config.session_factory,
+                entry_points=self._entry_points,
+            )
+        except StartupError:
+            raise
+        except Exception as error:
+            raise StartupError(
+                [f"{PLUGIN_KEY}: session factory discovery failed: {error}"]
+            ) from error
+
+    # @spec ING-CORE-014
+    def _check_cadence(self) -> None:
+        from vllm_riva_frontend.lease import STREAM_CADENCE
+
+        served = getattr(self.factory, "served_cadences", ())
+        if STREAM_CADENCE not in served:
+            raise StartupError(
+                [
+                    f"{PLUGIN_KEY}: the session factory does not serve the "
+                    f"streaming cadence {STREAM_CADENCE} (it serves "
+                    f"{sorted(served)})"
+                ]
+            )
+
+    def _teardown_factory(self) -> set[Any]:
+        """Call ``factory.teardown_all()``; return the tasks it cancelled."""
+        if self.factory is None:
+            return set()
+        try:
+            tasks = self.factory.teardown_all()
+        except Exception:
+            logger.exception("%s: factory teardown failed", PLUGIN_KEY)
+            return set()
+        return set(tasks or ())
+
+    # --------------------------------------------------------------- start
+
+    # @spec ING-EP-005, ING-EP-035, ING-EP-008, ING-EP-055, ING-VEH-002
+    async def start(self, state: Any) -> None:
+        """Bind and start the gRPC listener, then open admission last.
+
+        Health stays ``NOT_SERVING`` until admission opens. A failure tears
+        down what was built (supervisors, listener, factory) and re-raises.
+        """
+        del state
+        if self.servicer is None or self.config is None:
+            raise StartupError([f"{PLUGIN_KEY}: start before init_state"])
+        from vllm_riva_frontend.grpc import build_server
+
+        config = self.config
+        try:
+            self.server, self.health = build_server(config, self.servicer)
+            await self._set_health(_NOT_SERVING)
+            try:
+                bound = self.server.add_insecure_port(config.grpc_bind)
+            except RuntimeError as error:
+                raise StartupError(
+                    [f"{PLUGIN_KEY}.grpc_bind: cannot bind {config.grpc_bind}"]
+                ) from error
+            if not bound:
+                raise StartupError(
+                    [f"{PLUGIN_KEY}.grpc_bind: cannot bind {config.grpc_bind}"]
+                )
+            await self.server.start()
+            assert self.registry is not None and self.ingress is not None
+            collector = FaultCollector(
+                self.factory,
+                COLLECTOR_PERIOD,
+                self.escalate,
+                clock=self.clock,
+                lock=self._factory_lock,
+            )
+            self.fault_collector = asyncio.ensure_future(collector.run())
+            monitor = ListenerMonitor(self.server, self._on_listener_exit)
+            self.listener_monitor = asyncio.ensure_future(monitor.run())
+            self.ingress.open()
+            self._serving = True
+            await self._set_health(_SERVING)
+        except BaseException:
+            await self._roll_back_start()
+            raise
+
+    async def _roll_back_start(self) -> None:
+        """Undo a failed ``start``: no listener exit here is a fault."""
+        self._serving = False
+        self._listener_closing = True
+        if self.ingress is not None:
+            self.ingress.close()
+        supervisors = [
+            task
+            for task in (self.fault_collector, self.listener_monitor)
+            if task is not None
+        ]
+        for task in supervisors:
+            task.cancel()
+        try:
+            if self.server is not None:
+                with contextlib.suppress(Exception):
+                    await self.server.stop(0)
+            if supervisors:
+                await asyncio.wait(supervisors)
+        finally:
+            self._teardown_factory()
+
+    async def _set_health(self, status: int) -> None:
+        """Set the server's and the Riva service's health to ``status``."""
+        if self.health is None:
+            return
+        from vllm_riva_frontend.grpc import RIVA_SERVICE_NAME
+
+        for service in ("", RIVA_SERVICE_NAME):
+            outcome = self.health.set(service, status)
+            if inspect.isawaitable(outcome):
+                await outcome
+
+    def _on_listener_exit(self, error: BaseException | None) -> None:
+        """A listener exit not caused by drain, stop or rollback is a fault."""
+        if self._listener_closing:
+            return
+        self.escalate(
+            error
+            if error is not None
+            else RuntimeError("the Riva gRPC listener exited unexpectedly")
+        )
+
+    # --------------------------------------------------------------- ready
+
+    # @spec ING-EP-009
+    def ready(self, state: Any) -> bool:
+        """Whether the listener serves, nothing drains and no fault is recorded.
+
+        Reads attributes only.
+        """
+        return (
+            self._serving
+            and not self.draining
+            and not self.torn_down
+            and self.fault is None
+            and not getattr(state, "draining", False)
+        )
+
+    # -------------------------------------------------------------- faults
+
+    # @spec ING-EP-017, ING-EP-044, ING-EP-045
+    def escalate(self, error: BaseException) -> None:
+        """Record a fault and ask core for an orderly restart.
+
+        The triggers are an ``engine_dead`` failure on the stream path, a
+        fault the collector returns and an unexpected listener exit. The
+        fault makes ``ready`` false; ``state.request_shutdown()`` starts
+        core's graceful shutdown once.
+        """
+        if self.fault is None:
+            self.fault = error
+        logger.error(
+            "%s: fault, requesting an orderly restart: %r", PLUGIN_KEY, error
+        )
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        request = getattr(self.state, "request_shutdown", None)
+        if callable(request):
+            request()
+        else:
+            logger.error("%s: state.request_shutdown is missing", PLUGIN_KEY)
+
+    # --------------------------------------------------------------- drain
+
+    # @spec ING-EP-010, ING-EP-036, ING-EP-037, ING-EP-038, ING-EP-039
+    # @spec ING-EP-040, ING-EP-041, ING-EP-046, ING-EP-015
+    async def drain(self, state: Any, timeout: float) -> None:
+        """Finish or end every owner by ``D``, then stop the listener.
+
+        ``D`` is ``now + timeout - engine_reserve(timeout)``, leaving core
+        time to shut the engine down; every wait here is bounded by it. Owners
+        finish on their own until the settle point, where stream owners get
+        the shutdown trigger and file requests are cancelled. When
+        ``timeout`` is within the reserve, every owner is cancelled at once
+        and the remaining time is core's whole budget. A cancelled ``drain``
+        cancels the owners without awaiting their cleanup.
+        """
+        del state
+        clock = self.clock
+        now = clock.monotonic()
+        graceful = timeout > engine_reserve(timeout)
+        deadline = now + timeout - (engine_reserve(timeout) if graceful else 0)
+        self.draining = True
+        self._serving = False
+        self.drain_deadline = deadline
+        registry = self.registry
+        if registry is not None:
+            registry.drain_deadline = deadline
+        try:
+            await self._set_health(_NOT_SERVING)
+            if self.ingress is not None:
+                self.ingress.close()
+            if self.file_gate is not None:
+                self.file_gate.close()
+            if registry is not None:
+                if graceful:
+                    # The listener keeps answering NOT_SERVING until the
+                    # settle point, owners or not, so health checkers see it.
+                    settle = settle_point(now, deadline)
+                    await clock.sleep(max(0.0, settle - clock.monotonic()))
+                    registry.deliver_shutdown(ShutdownTrigger(deadline))
+                else:
+                    registry.cancel_owners()
+                assert self.config is not None
+                files_by = min(
+                    clock.monotonic() + self.config.session_cleanup_timeout,
+                    deadline,
+                )
+                await self._wait_until(registry.settled, files_by)
+                await self._wait_until(
+                    lambda: registry.settled(STREAM_KINDS), deadline
+                )
+            if self.server is not None:
+                self._listener_closing = True
+                await self.server.stop(max(0.0, deadline - clock.monotonic()))
+            await self._drain_factory(deadline)
+        except asyncio.CancelledError:
+            if registry is not None:
+                registry.cancel_owners()
+            raise
+
+    async def _wait_until(
+        self, done: Callable[[], bool], deadline: float
+    ) -> bool:
+        """Wait until ``done()`` holds or ``deadline``; return whether it held.
+
+        Wakes when an owner task or continuation finishes or the registry
+        changes.
+        """
+        registry = self.registry
+        assert registry is not None
+        while not done():
+            if self.clock.monotonic() >= deadline:
+                return False
+            change = registry.changed()
+            watched: set[asyncio.Future[Any]] = {change, *registry.pending()}
+            try:
+                await self.clock.wait_for(
+                    asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED),
+                    deadline,
+                )
+            except TimeoutError:
+                pass
+            finally:
+                change.cancel()
+        return True
+
+    async def _drain_factory(self, deadline: float) -> None:
+        """Call ``factory.drain(D)`` and log the faults it returns."""
+        if self.factory is None:
+            return
+        async with self._factory_lock:
+            faults = await self.factory.drain(deadline)
+        for fault in faults or ():
+            logger.error(
+                "%s: session cleanup fault at shutdown: %r", PLUGIN_KEY, fault
+            )
+
+    # ---------------------------------------------------------------- stop
+
+    # @spec ING-EP-059, ING-EP-042, ING-EP-043
+    async def stop(self, state: Any) -> None:
+        """Tear everything down promptly, awaiting no engine work.
+
+        Marks the plugin torn down (owners then call the lease's synchronous
+        ``teardown`` only), tears the factory down, cancels every owner,
+        continuation, child and supervisor, stops the listener without grace
+        and waits once, at most 1 s, for the cancellations to be delivered.
+        """
+        del state
+        self.torn_down = True
+        self._serving = False
+        self._listener_closing = True
+        registry = self.registry
+        if registry is not None:
+            registry.torn_down = True
+        if self.ingress is not None:
+            self.ingress.close()
+        if self.file_gate is not None:
+            self.file_gate.close()
+        cancelled: set[Any] = self._teardown_factory()
+        if registry is not None:
+            cancelled.update(registry.cancel_all())
+        for supervisor in (self.fault_collector, self.listener_monitor):
+            if supervisor is not None:
+                supervisor.cancel()
+                cancelled.add(supervisor)
+        if self.server is not None:
+            with contextlib.suppress(Exception):
+                await self.server.stop(None)
+        current = asyncio.current_task()
+        pending = {
+            task
+            for task in cancelled
+            if isinstance(task, asyncio.Future)
+            and task is not current
+            and not task.done()
+        }
+        if pending:
+            with contextlib.suppress(TimeoutError):
+                await self.clock.wait_for(
+                    asyncio.wait(pending), self.clock.monotonic() + STOP_WAIT
+                )

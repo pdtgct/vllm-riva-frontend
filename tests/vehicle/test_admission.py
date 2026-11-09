@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import grpc
 import pytest
@@ -222,6 +223,8 @@ async def test_explicit_file_cap_on_a_tiny_deployment_fails_startup(
 async def test_tiny_deployment_disables_files_with_a_warning(
     clock, fake_factory, helpers, caplog
 ) -> None:
+    # Another import may have raised the root logger's level above WARNING.
+    caplog.set_level(logging.WARNING)
     plugin = helpers.make_frontend(
         clock, factories={"nemotron": fake_factory.constructor}
     )

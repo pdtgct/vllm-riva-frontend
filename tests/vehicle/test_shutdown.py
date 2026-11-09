@@ -41,6 +41,14 @@ def register_dummy(plugin: Any, kind_name: str = "stream", *, stubborn=None):
     return task, record
 
 
+#: A stream idle since a 60 s drain began must still be open at its settle
+#: point (49 s) and at ``D`` (54 s): ``session_idle_timeout`` 59 s outlasts
+#: both and stays below the engine's 60 s parked-idle deadline (ING-EP-014).
+OUTLASTS_DRAIN = pytest.mark.parametrize(
+    "frontend_options", [{"session_idle_timeout": 59}], indirect=True
+)
+
+
 # --------------------------------------------------------------- formulas
 
 
@@ -130,6 +138,7 @@ async def test_owners_finish_normally_before_the_settle_point(
 
 
 # @spec ING-EP-037, ING-EP-039
+@OUTLASTS_DRAIN
 async def test_settle_point_finalizes_remaining_streams_then_drains_factory(
     started, fake_factory, clock, helpers, monkeypatch
 ) -> None:
@@ -169,6 +178,7 @@ async def test_settle_point_finalizes_remaining_streams_then_drains_factory(
 
 
 # @spec ING-EP-037, ING-EP-010
+@OUTLASTS_DRAIN
 async def test_shutdown_finalization_failing_by_d_aborts_with_unavailable(
     started, fake_factory, clock, helpers
 ) -> None:
@@ -196,6 +206,7 @@ async def test_settle_point_cancels_running_file_requests(
     from support.asgi import asgi_http
     from support.fake_session import Block as CallBlock
 
+    from vllm_riva_frontend.admission import OwnerKind
     from vllm_riva_frontend.errors import catalog
 
     plugin, state = started
@@ -216,7 +227,12 @@ async def test_settle_point_cancels_running_file_requests(
     response = await asyncio.wait_for(request, 5.0)
     assert response.status == catalog().http_status("service_unavailable")
     await helpers.drive(clock, task)
-    assert not plugin.registry.records
+    # Core's call never settles: the request's record stays registered under
+    # its running cleanup continuation until stop (ING-EP-038, ING-FILE-071).
+    records = list(plugin.registry.records.values())
+    assert [record.kind for record in records] == [OwnerKind.file_route]
+    assert records[0].continuation is not None
+    assert not records[0].continuation.done()
 
 
 # @spec ING-EP-040

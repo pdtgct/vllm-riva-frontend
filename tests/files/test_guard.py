@@ -253,6 +253,7 @@ def test_allowlist_pins_core_request_fields_and_aliases():
     from vllm.entrypoints.speech_to_text.transcription.protocol import (
         TranscriptionRequest,
     )
+
     from vllm_riva_frontend.files import REQUEST_FIELD_ALLOWLIST
 
     core = set()
@@ -290,6 +291,7 @@ def test_core_forwards_no_request_field_the_guard_does_not_handle():
     from vllm.entrypoints.speech_to_text.transcription.protocol import (
         TranscriptionRequest,
     )
+
     from vllm_riva_frontend.files import FORWARDED_SAMPLING_FIELDS
 
     handled = set(FORWARDED_SAMPLING_FIELDS) | {

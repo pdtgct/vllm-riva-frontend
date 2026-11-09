@@ -244,7 +244,7 @@ class RealtimeClient:
         while self.close_code is None:
             try:
                 message = await self.ws.receive(timeout=0.05)
-            except (asyncio.TimeoutError, TimeoutError, ConnectionError):
+            except (TimeoutError, ConnectionError):
                 break
             event = self._record(message)
             events.append(event)

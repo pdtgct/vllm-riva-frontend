@@ -56,9 +56,8 @@ async def test_gate_caps_in_flight_and_releases_exactly_once(clock):
 
 # @spec ING-FILE-019
 async def test_gate_wait_expiry_is_busy_with_load_shed_authority(clock):
-    from vllm_riva_frontend.files import FileGate
-
     from vllm_riva_frontend.errors import FrontendError
+    from vllm_riva_frontend.files import FileGate
 
     gate = FileGate(1, clock=clock)
     held = await gate.acquire(clock.monotonic() + 30)
@@ -79,9 +78,8 @@ async def test_gate_wait_expiry_is_busy_with_load_shed_authority(clock):
 
 # @spec ING-FILE-053
 async def test_closed_gate_refuses_new_waiters(clock):
-    from vllm_riva_frontend.files import FileGate
-
     from vllm_riva_frontend.errors import FrontendError
+    from vllm_riva_frontend.files import FileGate
 
     gate = FileGate(2, clock=clock)
     gate.close()

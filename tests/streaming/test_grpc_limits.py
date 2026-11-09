@@ -249,7 +249,6 @@ class _Writes:
 # @spec ING-GRPC-010
 async def test_unary_recognize_writes_nothing_to_the_filesystem(clock):
     import vllm_riva_frontend.files  # noqa: F401  (import before recording)
-
     import vllm_riva_frontend.frontend  # noqa: F401
 
     async with serving(clock=clock, options=small_unary_options()) as served:

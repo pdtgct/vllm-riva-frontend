@@ -19,12 +19,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import tomllib
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
-import tomllib
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "src" / "vllm_riva_frontend"

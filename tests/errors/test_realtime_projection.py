@@ -24,11 +24,11 @@ def _lease(fake_factory):
     return fake_factory.leases[-1]
 
 
-async def _done_with_flush_blocked(drv, fake_factory, helpers):
+async def _done_with_flush_blocked(drv, fake_factory, helpers, seconds=0.1):
     lease = _lease(fake_factory)
     block = Block()
     lease.script("flush", block)
-    await drv.send_audio(helpers.speech_bytes())
+    await drv.send_audio(helpers.speech_bytes(seconds))
     await drv.finalize()
     await helpers.until(lambda: "flush" in lease.names())
     return lease, block
@@ -285,7 +285,9 @@ async def test_oversized_message_after_done_stays_request_too_large(
 ) -> None:
     drv = stream("realtime", started)
     await drv.configure()
-    await _done_with_flush_blocked(drv, fake_factory, helpers)
+    # 0.05 s of PCM16 (about 2.2 KB as base64) keeps the setup append under
+    # the 4096-byte envelope cap, so only the late message is oversized.
+    await _done_with_flush_blocked(drv, fake_factory, helpers, seconds=0.05)
     await drv.ws.send_text("x" * 6000)
     outcome = await drv.outcome()
     assert outcome.close == 1009

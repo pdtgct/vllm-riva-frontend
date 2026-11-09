@@ -10,7 +10,6 @@ client console script.
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
@@ -68,10 +67,7 @@ def test_the_package_implements_no_riva_family_client() -> None:
 
 # @spec ING-CLI-004
 def test_the_distribution_ships_no_client_script() -> None:
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:  # pragma: no cover
-        import tomli as tomllib
+    import tomllib
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     scripts = project.get("scripts", {})

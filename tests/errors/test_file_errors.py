@@ -265,6 +265,13 @@ async def test_route_core_execution_timeout_is_504(
         )
         await helpers.until(lambda: len(fake_transcription.calls) == 1)
         await clock.advance(1201)  # file_execution_timeout default: 1200 s
-        response = await asyncio.wait_for(request, 5)
+        # Core's call never settles, so the handler answers when the cleanup
+        # bound expires (ING-FILE-070: session_cleanup_timeout, 30 s).
+        await clock.advance(31)
+        # A bounded poll, not asyncio.wait_for: cancelling the request task
+        # is a transport cancellation the owner absorbs while its cleanup
+        # waits on virtual time, so a cancelling wait would never return.
+        await helpers.until(request.done, what="the 504 answer")
+        response = request.result()
     assert response.status_code == 504
     assert response.json()["error"]["message"].startswith("request_timeout: ")

@@ -322,9 +322,17 @@ def grpc_port() -> int:
 
 
 @pytest.fixture
-def frontend_options(grpc_port: int) -> dict[str, Any]:
-    """The ``riva_frontend`` options of the default engine."""
-    return {"grpc_bind": f"127.0.0.1:{grpc_port}"}
+def frontend_options(
+    grpc_port: int, request: pytest.FixtureRequest
+) -> dict[str, Any]:
+    """The ``riva_frontend`` options of the default engine.
+
+    A test adds options through indirect parametrization.
+    """
+    return {
+        "grpc_bind": f"127.0.0.1:{grpc_port}",
+        **getattr(request, "param", {}),
+    }
 
 
 @pytest.fixture

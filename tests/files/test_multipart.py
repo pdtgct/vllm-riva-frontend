@@ -186,9 +186,8 @@ async def test_disconnect_mid_body_never_becomes_success(clock):
 
 # @spec ING-FILE-038
 async def test_body_read_deadline_answers_request_timeout(clock):
-    from vllm_riva_frontend.multipart import parse_multipart
-
     from vllm_riva_frontend.errors import FrontendError
+    from vllm_riva_frontend.multipart import parse_multipart
 
     stall = asyncio.Event()
     first = SAMPLE[:20]

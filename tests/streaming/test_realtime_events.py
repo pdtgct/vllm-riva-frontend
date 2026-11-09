@@ -47,7 +47,7 @@ DONE = {"type": "input_audio_buffer.done"}
 async def _no_event(client: RealtimeClient, wait: float = 0.05) -> bool:
     try:
         await client.next(timeout=wait)
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         return True
     return False
 
@@ -487,7 +487,10 @@ async def test_a_draining_plugin_refuses_with_service_unavailable(served):
 
 # @spec ING-NIMWS-017
 # @spec ING-ERR-027
-async def test_shutdown_finalization_sends_completed_then_closes_1001(served):
+async def test_shutdown_finalization_sends_completed_then_closes_1001(
+    served_through_drain,
+):
+    served = served_through_drain
     client = RealtimeClient(served.app, served.clock)
     await client.open_session()
     lease = served_lease(served)

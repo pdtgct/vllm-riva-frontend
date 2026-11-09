@@ -5,41 +5,40 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-riva-frontend"
 dynamic = ["version"]
-description = "Downstream Riva and Speech NIM frontend for vLLM-Omni"
+description = "Riva and Speech NIM compatibility frontend for vLLM, as an endpoint plugin"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+# @spec ING-VEH-027 (vLLM's own range)
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
+# @spec ING-EP-002, ING-EP-021 (no vLLM or model-plugin dependency)
 dependencies = [
     "grpcio>=1.60",
     "grpcio-health-checking>=1.60",
     "grpcio-reflection>=1.60",
     "nvidia-riva-client==2.26.0",
     "numpy>=1.26",
-    "packaging>=23",
     "python-multipart>=0.0.9",
-    "pyyaml>=6",
     "scipy>=1.14",
 ]
 
 [project.urls]
 Repository = "https://github.com/pdtgct/vllm-riva-frontend"
 
-[project.scripts]
-vllm-riva-frontend-render = "vllm_riva_frontend.deployment:main"
-
-[project.entry-points."vllm_omni.application_plugins"]
+# @spec ING-EP-001, ING-CLI-004 (one entry point, no client script)
+[project.entry-points."vllm.endpoint_plugins"]
 riva_frontend = "vllm_riva_frontend:plugin"
 
 [dependency-groups]
 dev = [
     "httpx>=0.28",
     "mypy>=1.11",
+    "packaging>=23",
     "pytest>=8",
     "pytest-asyncio>=1.4",
     "pytest-cov>=7",
+    "pyyaml>=6",
     "ruff>=0.15",
     "types-pyyaml>=6",
-    "tomli>=2; python_version < '3.11'",
 ]
 
 [tool.setuptools.packages.find]
@@ -71,9 +70,10 @@ omit = ["tests/*", "vllm_riva_frontend/version.py"]
 [tool.coverage.report]
 precision = 2
 
+# @spec ING-EP-022 (ruff and mypy name the lowest supported version)
 [tool.ruff]
 line-length = 80
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "D", "UP", "B", "SIM"]
@@ -86,7 +86,7 @@ convention = "google"
 "tests/**" = ["D1"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 packages = ["vllm_riva_frontend"]
 

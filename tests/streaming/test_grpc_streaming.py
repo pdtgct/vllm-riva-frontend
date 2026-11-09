@@ -254,7 +254,10 @@ async def _drain_to_settle_point(served):
 
 # @spec ING-GRPC-028
 # @spec ING-ERR-027
-async def test_shutdown_finalization_sends_one_final_then_ok(served):
+async def test_shutdown_finalization_sends_one_final_then_ok(
+    served_through_drain,
+):
+    served = served_through_drain
     call = start_stream(served, [config_request()])
     lease = await opened(served, call)
     call.push(audio_request(AUDIO))
@@ -326,8 +329,9 @@ async def test_finish_failure_on_the_normal_path_emits_no_final(served):
 # @spec ING-GRPC-015
 # @spec ING-ERR-059
 async def test_failed_shutdown_finalization_is_unavailable_with_no_final(
-    served,
+    served_through_drain,
 ):
+    served = served_through_drain
     call = start_stream(served, [config_request()])
     lease = await opened(served, call)
     lease.script("flush", Raise(failed("abnormal_end")))

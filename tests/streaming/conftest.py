@@ -97,6 +97,19 @@ async def served(clock):
         yield result
 
 
+@pytest.fixture
+async def served_through_drain(clock):
+    """``served`` whose idle streams outlast a 60 s drain.
+
+    A stream idle since the drain began must still be open at the settle
+    point (49 s) and at ``D`` (54 s): ``session_idle_timeout`` 59 s outlasts
+    both and stays below the engine's 60 s parked-idle deadline (ING-EP-014).
+    """
+    options = riva_options(session_idle_timeout=59)
+    async with serving(clock=clock, options=options) as result:
+        yield result
+
+
 def opens(served: Served) -> list[dict[str, Any]]:
     """The ``open`` calls the factory saw, as their keyword arguments."""
     return [

@@ -177,9 +177,11 @@ async def test_health_is_not_serving_until_admission_opens_last(
 
     plugin, state = initialized
     seen: list[tuple[str, int, bool, bool]] = []
-    original = health.HealthServicer.set
+    # The listener is a grpc.aio server, so its health service is the aio
+    # HealthServicer, whose set is a coroutine.
+    original = health.aio.HealthServicer.set
 
-    def spy(self, service, status):
+    async def spy(self, service, status):
         seen.append(
             (
                 service,
@@ -189,9 +191,9 @@ async def test_health_is_not_serving_until_admission_opens_last(
                 and getattr(plugin, "fault_collector", None) is not None,
             )
         )
-        return original(self, service, status)
+        return await original(self, service, status)
 
-    monkeypatch.setattr(health.HealthServicer, "set", spy)
+    monkeypatch.setattr(health.aio.HealthServicer, "set", spy)
     await plugin.start(state)
 
     assert seen, "start sets the health status"
