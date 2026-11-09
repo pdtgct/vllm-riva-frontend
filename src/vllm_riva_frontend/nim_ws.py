@@ -663,6 +663,7 @@ class RealtimeAdapter:
         self._send = send
         self._owner: Any = None
         self._record: Any = None
+        self._watch: surfaces.ShutdownWatch | None = None
         self._gone = False
         self._closed = False
         self._item_id = _hex_id("item")
@@ -717,10 +718,10 @@ class RealtimeAdapter:
                 record=record,
                 catalog=plugin.catalog,
             )
+            self._watch = surfaces.watch_shutdown(registry, record, self._owner)
             await self._serve()
         finally:
-            surfaces.unregister(registry, record)
-            admitted.release()
+            surfaces.release_owner(registry, record, admitted)
 
     async def _refuse(self, error: errors.FrontendError) -> None:
         """Accept, send the one ``error``, close 1013: no owner, no read."""
@@ -789,50 +790,48 @@ class RealtimeAdapter:
     async def _abandon(self) -> None:
         """The transport is gone: clean up and send nothing more."""
         self._gone = True
-        await surfaces.settle(
+        await surfaces.settle_shielded(
+            self._plugin,
+            self._record,
             self._owner,
             errors.FrontendError("internal", "the transport is gone"),
             "transport",
         )
 
     async def _cancelled(self) -> None:
-        """The plugin cancelled this owner: the shutdown abort row."""
+        """The plugin cancelled this owner: the shutdown abort row.
+
+        Cleanup is joined through any further cancellation, so the record
+        and admission outlive it (unless ``stop`` tore the plugin down).
+        """
         shutdown = errors.FrontendError(
             "service_unavailable", "the server is shutting down"
         )
-        cleanup = surfaces.child(
-            self._record, surfaces.settle(self._owner, shutdown, "shutdown")
+        await surfaces.settle_shielded(
+            self._plugin, self._record, self._owner, shutdown, "shutdown"
         )
-        await asyncio.shield(cleanup)
         task = asyncio.current_task()
-        if task is not None:
+        if task is not None and task.cancelling():
             task.uncancel()
         await self._terminate(shutdown, "shutdown")
 
     # ------------------------------------------------------------- sends
 
-    # @spec ING-LIFE-051
     async def _send_bounded(self, message: Message) -> None:
-        """One send or close under ``response_send_timeout``.
+        """One send or close under the send bound (``bounded_send``).
 
-        The bound is clipped to the drain deadline while one is ahead. A send
-        that exceeds it, or fails, ends the connection by the transport
-        path: nothing further is sent, the close included.
+        A send that exceeds it, or fails, ends the connection by the
+        transport path: nothing further is sent, the close included.
         """
         if self._gone or self._closed:
             raise _Gone
-        clock = self._plugin.clock
-        now = clock.monotonic()
-        deadline = now + float(self._plugin.config.response_send_timeout)
-        owner = self._owner
-        for drain in (
-            getattr(self._plugin, "drain_deadline", None),
-            None if owner is None else owner.drain_deadline,
-        ):
-            if drain is not None and now < drain < deadline:
-                deadline = drain
         try:
-            await clock.wait_for(self._send(message), deadline)
+            await surfaces.bounded_send(
+                self._plugin,
+                self._send(message),
+                owner=self._owner,
+                watch=self._watch,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as failure:

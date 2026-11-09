@@ -418,3 +418,127 @@ async def test_realtime_engine_expired_is_idle_timeout(
     assert error_code(terminal) == "idle_timeout"
     assert session.close_code == 1011
     assert lease.names() == ["feed", "abort", "release"]
+
+
+# ------------------------------------------------------- sends and drain
+
+
+# @spec ING-LIFE-051, ING-LIFE-053
+async def test_a_send_stalled_when_the_drain_begins_ends_by_d(
+    realtime, first_update, fake_factory, test_app, drain_trigger, clock
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1
+    lease = _lease(fake_factory)
+
+    _, deadline = await drain_trigger()
+    assert lease.names() == []
+    # The send's own bound (60 s) is far off; D, set after it began, rules.
+    await session.advance(deadline - clock.monotonic() + 0.01)
+
+    assert lease.names() == ["abort", "release"]
+    await ws.wait_closed()
+    ws.unblocked.set()
+    await session.settle()
+    assert ws.stalled == 1  # no further sends, the close included
+
+
+# @spec ING-LIFE-051, ING-ERR-059
+async def test_a_send_starting_after_d_to_a_stalled_transport_does_not_wait(
+    realtime, first_update, fake_factory, test_app, drain_trigger, clock
+):
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    await session.update(first_update())
+    assert (await session.next()).get("type") == UPDATED
+    lease = _lease(fake_factory)
+    lease.script("flush", Block())
+    _, deadline = await drain_trigger()
+    await session.settle()
+    assert "flush" in lease.names()
+    ws.block = True
+
+    await session.advance(deadline - clock.monotonic() + 0.01)
+    await session.settle()
+
+    # The abort row's error event was offered once, at D, and not waited for.
+    assert ws.done
+    assert ws.stalled == 1
+    assert ws.parked[0]["type"] == "websocket.send"
+    assert lease.names()[-3:] == ["flush", "abort", "release"]
+
+
+# ------------------------------------------------------ cleanup ownership
+
+
+# @spec ING-LIFE-058, ING-EP-060, ING-EP-059
+async def test_a_second_cancellation_waits_for_cleanup(
+    realtime, first_update, fake_factory, started
+):
+    session, _ = await _configured(realtime, first_update)
+    lease = _lease(fake_factory)
+    block = Block()
+    lease.script("abort", block)
+    started.registry.cancel_owners()
+    await block.entered.wait()
+
+    # Later cancellations reach the surface while it waits for cleanup.
+    try:
+        for _ in range(2):
+            started.registry.cancel_owners()
+            await session.settle()
+
+        # The record and the admission outlive the running cleanup.
+        assert not session.done
+        assert len(started.registry.records) == 1
+        assert started.ingress.count == 1
+    finally:
+        block.release()
+    await session.wait_closed()
+    await session.drain_events()
+    terminal = session.terminal
+    assert (
+        terminal is not None and error_code(terminal) == "service_unavailable"
+    )
+    assert session.close_code == 1012
+    assert lease.names()[-2:] == ["abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-058, ING-LIFE-035, ING-EP-060
+async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
+    realtime, first_update, fake_factory, started
+):
+    session, _ = await _configured(realtime, first_update)
+    lease = _lease(fake_factory)
+    lease.script("feed", Raise(failed("expired")))
+    abort = Block(delay_cancel=True)
+    lease.script("abort", abort)
+    await session.append(PIECE)
+    await abort.entered.wait()
+
+    # Past the cleanup budget the session is answered; the abort that
+    # delays its cancellation stays with the record's continuation.
+    try:
+        await session.advance(started.config.session_cleanup_timeout + 0.1)
+        await session.wait_closed()
+        await session.drain_events()
+        assert error_code(session.terminal) == "idle_timeout"
+        assert session.close_code == 1011
+        records = list(started.registry.records.values())
+        assert len(records) == 1, "the record went before its continuation"
+        assert records[0].continuation is not None
+        assert not records[0].continuation.done()
+        assert started.ingress.count == 1
+    finally:
+        abort.release()
+    await session.settle()
+    assert records[0].continuation.done()
+    assert lease.names() == ["feed", "abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0

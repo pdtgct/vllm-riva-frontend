@@ -25,6 +25,7 @@ from types import MappingProxyType
 from typing import Any
 
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from grpc_health.v1 import health_pb2
 from starlette.routing import Match
 
@@ -565,6 +566,7 @@ class RivaFrontendPlugin:
             f"{PLUGIN_KEY}: {method} {route.path} is already served; the "
             "frontend adds this path as new"
             for route in router.routes
+            if isinstance(route, APIRoute)
             for method in sorted(getattr(route, "methods", None) or ())
             if _serves(app, route.path, method)
         ]
@@ -581,6 +583,7 @@ class RivaFrontendPlugin:
         self._handlers = {
             (route.path, method): route.endpoint
             for route in router.routes
+            if isinstance(route, APIRoute)
             for method in getattr(route, "methods", None) or ()
         }
         app.add_middleware(RealtimeDispatcher, plugin=self)

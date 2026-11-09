@@ -3,9 +3,11 @@
 Two ways to exercise the Riva servicer:
 
 * **Direct servicer calls** with ``FakeServicerContext`` and
-  ``RequestStream``: the streaming, files and errors leaf tests. ``abort``
-  raises ``RpcAbort`` carrying the status and details (a real ``grpc.aio``
-  context raises ``AbortError``); ``cancel()`` marks the RPC cancelled and
+  ``RequestStream``: the streaming, files and errors leaf tests. ``write``
+  records each response in ``writes``; ``abort`` raises ``RpcAbort``
+  carrying the status and details (a real ``grpc.aio`` context raises
+  ``AbortError``); while ``block`` is set both park, as against a client
+  that stopped reading; ``cancel()`` marks the RPC cancelled and
   fires the callbacks registered with ``add_done_callback``, which is how the
   servicer observes a client cancellation; ``time_remaining`` counts down
   to the RPC's absolute deadline on the context's clock (the plugin's
@@ -49,6 +51,12 @@ class FakeServicerContext:
     then returns what is left of it, never below zero, so time that passes
     on that clock (in transit, validation, a gate wait, execution) is spent
     from the one deadline. ``deadline`` is that absolute value.
+
+    ``write`` appends each response to ``writes``. While ``block`` is set,
+    every ``write`` and ``abort`` waits on ``unblocked`` (a stalled reader):
+    ``stalled`` counts the calls that waited and ``parked`` keeps what each
+    carried (the response, or the ``RpcAbort``), in order. A call cancelled
+    while parked delivers nothing: no write and no status.
     """
 
     def __init__(
@@ -71,6 +79,11 @@ class FakeServicerContext:
         self.details: str | None = None
         self.trailing_metadata: tuple[tuple[str, str], ...] = ()
         self.initial_metadata: tuple[tuple[str, str], ...] = ()
+        self.writes: list[Any] = []
+        self.block = False
+        self.unblocked = asyncio.Event()
+        self.stalled = 0
+        self.parked: list[Any] = []
 
     # -- what the servicer reads -------------------------------------------
 
@@ -112,12 +125,23 @@ class FakeServicerContext:
     ) -> None:
         self.initial_metadata = tuple(metadata)
 
+    async def write(self, message: Any) -> None:
+        await self._stall(message)
+        self.writes.append(message)
+
     async def abort(self, code: grpc.StatusCode, details: str = "") -> None:
         abort = RpcAbort(code, details)
+        await self._stall(abort)
         self.aborts.append(abort)
         self.code = code
         self.details = details
         raise abort
+
+    async def _stall(self, item: Any) -> None:
+        if self.block:
+            self.stalled += 1
+            self.parked.append(item)
+            await self.unblocked.wait()
 
     # -- what the test drives ------------------------------------------------
 

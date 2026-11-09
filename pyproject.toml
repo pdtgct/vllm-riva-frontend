@@ -104,3 +104,10 @@ module = [
     "scipy.*",
 ]
 ignore_missing_imports = true
+
+# vLLM is the host: its own typing is not this package's to check, and CI
+# has no built vLLM. Its symbols are treated as Any at the import boundary.
+[[tool.mypy.overrides]]
+module = ["vllm", "vllm.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

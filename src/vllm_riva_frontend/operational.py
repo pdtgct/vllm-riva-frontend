@@ -8,7 +8,8 @@ cannot disagree about the plugin.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol, cast
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -120,6 +121,9 @@ def operational_router(plugin: _OperationalPlugin) -> APIRouter:
         strict=True,
     ):
         router.add_api_route(
-            path, endpoint, methods=["GET"], response_model=None
+            path,
+            cast(Callable[..., Any], endpoint),
+            methods=["GET"],
+            response_model=None,
         )
     return router

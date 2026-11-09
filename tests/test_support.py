@@ -456,6 +456,42 @@ async def test_fake_lease_failure_and_cancellation_break_the_lease(
     assert (other.state, other.failure_reason) == ("failed", "cancelled")
 
 
+async def test_fake_lease_block_can_delay_its_cancellation(fake_factory):
+    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    block = Block(delay_cancel=True)
+    lease.script("feed", block)
+    task = asyncio.create_task(
+        lease.feed(np.zeros(1, np.float32), on_accepted=lambda n: None)
+    )
+    await block.entered.wait()
+    task.cancel()
+    await settle()
+    task.cancel()
+    await settle()
+    # Cancelled twice, the call keeps running: the lease is still busy.
+    assert not task.done()
+    assert block.cancellations == 2
+    assert lease.running == "feed"
+    with pytest.raises(RuntimeError):
+        await lease.abort()
+
+    block.release()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lease.running is None
+    assert (lease.state, lease.failure_reason) == ("failed", "cancelled")
+
+    # Never cancelled, it settles by ``then`` when released.
+    other = await fake_factory.open(cadence="560ms", locale="auto")
+    late = Block(delay_cancel=True)
+    other.script("flush", late)
+    flushing = asyncio.create_task(other.flush())
+    await late.entered.wait()
+    late.release(Return("late final"))
+    assert await flushing == "late final"
+    assert late.cancellations == 0
+
+
 async def test_fake_lease_rejects_overlapping_calls(fake_factory):
     lease = await fake_factory.open(cadence="560ms", locale="auto")
     block = Block()
@@ -1202,29 +1238,33 @@ class _FakeServicer:
                     "invalid_audio: bad (fields: audio_content)",
                 )
             index += 1
-            yield riva.rasr.StreamingRecognizeResponse(
+            await context.write(
+                riva.rasr.StreamingRecognizeResponse(
+                    results=[
+                        riva.rasr.StreamingRecognitionResult(
+                            alternatives=[
+                                riva.rasr.SpeechRecognitionAlternative(
+                                    transcript=f"interim {index}"
+                                )
+                            ],
+                            is_final=False,
+                        )
+                    ]
+                )
+            )
+        await context.write(
+            riva.rasr.StreamingRecognizeResponse(
                 results=[
                     riva.rasr.StreamingRecognitionResult(
                         alternatives=[
                             riva.rasr.SpeechRecognitionAlternative(
-                                transcript=f"interim {index}"
+                                transcript="final"
                             )
                         ],
-                        is_final=False,
+                        is_final=True,
                     )
                 ]
             )
-        yield riva.rasr.StreamingRecognizeResponse(
-            results=[
-                riva.rasr.StreamingRecognitionResult(
-                    alternatives=[
-                        riva.rasr.SpeechRecognitionAlternative(
-                            transcript="final"
-                        )
-                    ],
-                    is_final=True,
-                )
-            ]
         )
 
     async def Recognize(self, request, context):  # noqa: N802
@@ -1266,7 +1306,7 @@ def test_riva_message_builders_use_proto_field_names():
     assert riva.catalog_code("") is None
 
 
-async def test_streaming_call_drives_the_async_generator_handler(clock):
+async def test_streaming_call_drives_the_coroutine_handler(clock):
     servicer = _FakeServicer()
     call = riva.StreamingCall(servicer, clock)
     call.configure(language_code="en-US")
@@ -1301,7 +1341,6 @@ async def test_streaming_call_records_aborts_and_handler_errors(clock):
     class _Broken:
         async def StreamingRecognize(self, requests, context):  # noqa: N802
             raise RuntimeError("bug")
-            yield  # pragma: no cover
 
     broken = riva.StreamingCall(_Broken(), clock)
     with pytest.raises(AssertionError, match="handler raised"):
@@ -1320,6 +1359,63 @@ async def test_streaming_call_cancel_fires_the_context_callbacks(clock):
     await call.settle(2)
     await call.advance(1.0)
     assert clock.monotonic() == pytest.approx(1001.0)
+
+
+async def test_fake_servicer_context_write_and_stalled_reader():
+    context = FakeServicerContext()
+    await context.write("one")
+    assert context.writes == ["one"] and context.stalled == 0
+
+    context.block = True
+    write = asyncio.create_task(context.write("two"))
+    abort = asyncio.create_task(
+        context.abort(grpc.StatusCode.UNAVAILABLE, "service_unavailable: x")
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert context.stalled == 2 and context.writes == ["one"]
+    assert context.parked[0] == "two"
+    assert isinstance(context.parked[1], RpcAbort)
+    assert context.aborts == [] and context.code is None
+
+    write.cancel()
+    await asyncio.wait({write})
+    context.unblocked.set()
+    with pytest.raises(RpcAbort):
+        await abort
+    # The cancelled write delivered nothing; the released status did.
+    assert context.writes == ["one"]
+    assert context.code is grpc.StatusCode.UNAVAILABLE
+
+
+async def test_streaming_call_marks_a_handler_ending_cancelled_abandoned(
+    clock,
+):
+    class _Abandoning:
+        async def StreamingRecognize(self, requests, context):  # noqa: N802
+            await context.write(riva.rasr.StreamingRecognizeResponse())
+            raise asyncio.CancelledError
+
+        async def Recognize(self, request, context):  # noqa: N802
+            raise asyncio.CancelledError
+
+    call = riva.StreamingCall(_Abandoning(), clock)
+    await call.wait()
+    assert call.abandoned and call.abort is None and call.error is None
+    assert len(call.responses) == 1
+    assert call.status is grpc.StatusCode.OK and call.code is None
+
+    outcome = await riva.recognize(_Abandoning(), riva.recognize_request(b""))
+    assert outcome.abandoned and outcome.abort is None
+    assert outcome.response is None
+
+    # A cancellation the test makes still propagates.
+    blocked = riva.StreamingCall(_FakeServicer(), clock)
+    await blocked.settle(5)
+    blocked.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked.task
+    assert not blocked.abandoned
 
 
 async def test_recognize_classifies_the_unary_outcome():

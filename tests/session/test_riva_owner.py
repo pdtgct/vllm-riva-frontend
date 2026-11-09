@@ -513,3 +513,217 @@ async def test_engine_expired_projects_idle_timeout(riva, fake_factory):
 
     call.assert_status(grpc.StatusCode.ABORTED, "idle_timeout")
     assert lease.names() == ["feed", "abort", "release"]
+
+
+# ------------------------------------------------------------ sends
+
+PIECE = pcm16_bytes(pcm16_sine(0.1))
+
+
+class TestSendBound:
+    @pytest.fixture
+    def riva_options(self):
+        return {"response_send_timeout": 5}
+
+    # @spec ING-LIFE-051, ING-ADM-016, ING-LIFE-038
+    async def test_a_stalled_write_ends_the_owner_as_a_transport_failure(
+        self, riva, fake_factory, started
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Return(["hello"]))
+        call.context.block = True
+        call.audio(PIECE)
+        await call.until(lambda: call.context.stalled == 1, what="a write")
+
+        try:
+            await call.advance(4.9)
+            assert lease.names() == ["feed"]
+            assert not call.done
+            await call.advance(0.2)
+            await call.wait()
+
+            # Cleaned up as for a disconnect; no status, nothing more written.
+            assert lease.names() == ["feed", "abort", "release"]
+            assert call.abandoned
+            assert call.responses == [] and call.context.aborts == []
+            assert call.context.code is None
+            assert len(started.registry.records) == 0
+            assert started.ingress.count == 0
+        finally:
+            call.context.unblocked.set()
+        await call.settle()
+        assert call.context.stalled == 1
+        assert call.responses == []
+
+    # @spec ING-LIFE-051
+    async def test_a_stalled_status_is_abandoned_at_the_bound(
+        self, riva, fake_factory, started
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Raise(failed("expired")))
+        call.context.block = True
+        call.audio(PIECE)
+        await call.until(lambda: call.context.stalled == 1, what="the status")
+        assert lease.names() == ["feed", "abort", "release"]
+
+        try:
+            await call.advance(4.9)
+            assert not call.done
+            await call.advance(0.2)
+            await call.wait()
+
+            assert call.abandoned
+            assert call.context.aborts == [] and call.context.code is None
+            assert len(started.registry.records) == 0
+            assert started.ingress.count == 0
+        finally:
+            call.context.unblocked.set()
+
+    # @spec ING-LIFE-051, ING-ERR-015
+    async def test_a_stalled_refusal_abandons_the_rpc(self, riva, started):
+        started.ingress.close()  # as ``drain`` closes it
+        refused = riva(start=False)
+        refused.context.block = True
+        refused.start()
+        await refused.until(
+            lambda: refused.context.stalled == 1, what="the refusal"
+        )
+        refusal = refused.context.parked[0]
+        assert refusal.details.startswith("service_unavailable:")
+
+        try:
+            await refused.advance(4.9)
+            assert not refused.done
+            await refused.advance(0.2)
+            await refused.wait()
+
+            assert refused.abandoned and refused.context.aborts == []
+            assert refused.requests.pulls == 0
+            assert len(started.registry.records) == 0
+        finally:
+            refused.context.unblocked.set()
+
+
+# @spec ING-LIFE-051, ING-LIFE-053
+async def test_a_write_stalled_before_the_drain_ends_by_d(
+    riva, fake_factory, started, drain_trigger
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    lease.script("feed", Return(["hello"]))
+    call.context.block = True
+    call.audio(PIECE)
+    await call.until(lambda: call.context.stalled == 1, what="a write")
+
+    _, deadline = await drain_trigger()
+    assert not call.done
+    assert lease.names() == ["feed"]
+    # The write's own bound (60 s) is far off; D, set after it began, rules.
+    await call.advance(deadline - call.clock.monotonic() + 0.01)
+    await call.wait()
+
+    assert call.abandoned and call.context.aborts == []
+    assert lease.names() == ["feed", "abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-051, ING-ERR-059
+async def test_a_status_after_d_to_a_stalled_reader_does_not_wait(
+    riva, fake_factory, started, drain_trigger
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    lease.script("flush", Block())
+    _, deadline = await drain_trigger()
+    await call.until(lambda: "flush" in lease.names(), what="flush")
+    call.context.block = True
+
+    await call.advance(deadline - call.clock.monotonic() + 0.01)
+    await call.settle()
+
+    # The abort row was offered once, at D, and not waited for.
+    assert call.done
+    assert call.abandoned
+    assert call.context.stalled == 1 and call.context.aborts == []
+    assert lease.names()[-3:] == ["flush", "abort", "release"]
+    assert len(started.registry.records) == 0
+
+
+# ------------------------------------------------------ cleanup ownership
+
+
+# @spec ING-LIFE-058, ING-EP-060, ING-EP-059
+async def test_a_second_cancellation_waits_for_cleanup(
+    riva, fake_factory, started
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    block = Block()
+    lease.script("abort", block)
+    started.registry.cancel_owners()
+    await block.entered.wait()
+
+    # Later cancellations reach the surface while it waits for cleanup.
+    try:
+        for _ in range(2):
+            started.registry.cancel_owners()
+            await call.settle()
+
+        # The record and the admission outlive the running cleanup.
+        assert not call.done
+        assert len(started.registry.records) == 1
+        assert started.ingress.count == 1
+    finally:
+        block.release()
+    await call.wait()
+    call.assert_status(grpc.StatusCode.UNAVAILABLE, "service_unavailable")
+    assert lease.names()[-2:] == ["abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-058, ING-LIFE-035, ING-EP-060
+async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
+    riva, fake_factory, started
+):
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    lease.script("feed", Raise(failed("expired")))
+    abort = Block(delay_cancel=True)
+    lease.script("abort", abort)
+    call.audio(PIECE)
+    await abort.entered.wait()
+
+    # Past the cleanup budget the stream is answered; the abort that
+    # delays its cancellation stays with the record's continuation.
+    try:
+        await call.advance(started.config.session_cleanup_timeout + 0.1)
+        await call.wait()
+        call.assert_status(grpc.StatusCode.ABORTED, "idle_timeout")
+        records = list(started.registry.records.values())
+        assert len(records) == 1, "the record went before its continuation"
+        assert records[0].continuation is not None
+        assert not records[0].continuation.done()
+        assert started.ingress.count == 1
+    finally:
+        abort.release()
+    await call.settle()
+    assert records[0].continuation.done()
+    assert lease.names() == ["feed", "abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0

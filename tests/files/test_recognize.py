@@ -533,6 +533,32 @@ async def test_rpc_deadline_during_execution_aborts_without_response(
     await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
 
 
+# @spec ING-FILE-065, ING-ERR-056, ING-FILE-067
+async def test_rpc_deadline_due_with_a_core_failure_wins(files_env):
+    env = await files_env()
+    block = Block(then=Raise(RuntimeError("core failed at the deadline")))
+    env.service.script(block)
+    context = FakeServicerContext(time_remaining=10.0, clock=env.clock)
+    rpc = asyncio.ensure_future(
+        recognize(
+            env.plugin.servicer,
+            recognize_request(pcm16_bytes(pcm16_sine(0.2))),
+            context,
+        )
+    )
+    await asyncio.wait_for(block.entered.wait(), 2)
+    await env.clock.settle()
+    # Core's failure and the RPC deadline's expiry reach the owner together:
+    # the expired deadline is arbitrated before the failure is selected.
+    block.release()
+    env.clock.set(context.deadline)
+    outcome = await asyncio.wait_for(rpc, 5)
+    assert outcome.response is None
+    assert outcome.status is grpc.StatusCode.DEADLINE_EXCEEDED, outcome.details
+    assert outcome.details.startswith("request_timeout:"), outcome.details
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+
+
 # @spec ING-FILE-064
 async def test_execution_bound_expiry_is_request_timeout(files_env):
     env = await files_env()

@@ -425,6 +425,15 @@ async def _pull_one(generator: Any) -> Any:
         return _EXHAUSTED
 
 
+def _exhausted(pull: asyncio.Future[Any]) -> bool:
+    """Whether a finished pull found the end of the event generator."""
+    return (
+        not pull.cancelled()
+        and pull.exception() is None
+        and pull.result() is _EXHAUSTED
+    )
+
+
 def _is_event_stream(result: Any) -> bool:
     return hasattr(result, "__anext__")
 
@@ -656,7 +665,7 @@ def _event_stream_headers() -> tuple[tuple[bytes, bytes], ...]:
 
 # @spec ING-FILE-007, ING-FILE-029, ING-FILE-035, ING-FILE-064, ING-FILE-067
 # @spec ING-FILE-068, ING-FILE-069, ING-FILE-070, ING-FILE-071, ING-FILE-073
-# @spec ING-FILE-074
+# @spec ING-FILE-074, ING-ERR-056
 class FileRequestOwner:
     """The owner of one complete-file request, on either surface.
 
@@ -728,6 +737,7 @@ class FileRequestOwner:
         self._abort_needed = False
         self._suppressed = False
         self._gone_seen = False
+        self._watch_stopped = False
         self._task_cancelled = False
         self._headers_sent = False
         self._broken = False
@@ -838,7 +848,6 @@ class FileRequestOwner:
                 )
                 return
             self._result = result
-            self._boundary()
             return
         if _is_event_stream(result):
             await self._stream()
@@ -925,19 +934,39 @@ class FileRequestOwner:
             deadline=self._execution_deadline,
         )
 
-    def _boundary(self) -> bool:
-        """Observe the client and the RPC deadline at an operation boundary.
+    def _boundary(
+        self, phase: float | None = None, expiry: FileCause | None = None
+    ) -> bool:
+        """Arbitrate the client and expired deadlines at an operation boundary.
 
-        Returns whether a cause is selected.
+        Runs before the operation's own outcome (a permit, core's result or
+        failure, a pull) is consumed. The client's leaving wins; otherwise
+        the earliest expired deadline among the RPC's and the operation's
+        own bound ``phase`` (whose cause is ``expiry``), the phase winning a
+        tie. Returns whether a cause is selected.
         """
         if self._cause is not None:
             return True
         gone = self._gone
-        if gone is not None and gone.done() and not gone.cancelled():
+        if (
+            gone is not None
+            and not self._watch_stopped
+            and gone.done()
+            and not gone.cancelled()
+        ):
             self._client_gone()
             return True
+        now = self._clock.monotonic()
         rpc = self._rpc_deadline
-        if rpc is not None and rpc <= self._clock.monotonic():
+        if (
+            phase is not None
+            and expiry is not None
+            and phase <= now
+            and (rpc is None or phase <= rpc)
+        ):
+            self._select(expiry)
+            return True
+        if rpc is not None and rpc <= now:
             self._select(self._rpc_timeout(rpc))
             return True
         return False
@@ -955,7 +984,7 @@ class FileRequestOwner:
 
     def _watching(self) -> bool:
         gone = self._gone
-        if gone is None or self._gone_seen:
+        if gone is None or self._gone_seen or self._watch_stopped:
             return False
         return not (gone.done() and gone.cancelled())
 
@@ -1058,14 +1087,20 @@ class FileRequestOwner:
             return None
         error = acquire.exception()
         if error is None:
+            # ``run`` arbitrates this boundary with the permit held.
             return typing.cast(Permit, acquire.result())
         if not isinstance(error, FrontendError):
             raise error
-        if error.code == "busy" and rpc is not None and rpc < gate_deadline:
-            # The wait was clipped to the RPC deadline and expired as it.
-            self._select(self._rpc_timeout(rpc))
-        else:
-            self._select(FileCause("failure", error))
+        refusal = FileCause("failure", error)
+        if error.code != "busy":
+            if not self._boundary():
+                self._select(refusal)
+        elif not self._boundary(gate_deadline, refusal):
+            if rpc is not None and rpc < gate_deadline:
+                # The wait was clipped to the RPC deadline and expired as it.
+                self._select(self._rpc_timeout(rpc))
+            else:
+                self._select(refusal)
         return None
 
     async def _await_call(self) -> None:
@@ -1075,6 +1110,12 @@ class FileRequestOwner:
         rpc = self._rpc_deadline
         deadline = execution if rpc is None else min(execution, rpc)
         outcome = await self._wait(call.task, deadline)
+        if outcome not in (_DONE, _TIMEOUT):
+            return  # the client left or the owner was cancelled: recorded
+        # A return or failure that is visible together with the client's
+        # leaving or an expired deadline yields to them.
+        if self._boundary(execution, self._execution_timeout()):
+            return
         if outcome == _DONE:
             task = call.task
             if task.cancelled():
@@ -1177,11 +1218,18 @@ class FileRequestOwner:
             return
         while self._cause is None:
             pull = call.pull()
-            outcome = await self._wait(pull, self._execution_deadline)
+            execution = self._execution_deadline
+            outcome = await self._wait(pull, execution)
+            if outcome not in (_DONE, _TIMEOUT):
+                return  # the client left or the owner was cancelled
+            if outcome == _DONE and _exhausted(pull):
+                # The engine request has ended: a cause selected here
+                # needs no abort.
+                call.exhausted = True
+            if self._boundary(execution, self._execution_timeout()):
+                return
             if outcome == _TIMEOUT:
                 self._select(self._execution_timeout())
-                return
-            if outcome != _DONE:
                 return
             if pull.cancelled():
                 self._select(
@@ -1199,7 +1247,6 @@ class FileRequestOwner:
                 return
             event = pull.result()
             if event is _EXHAUSTED:
-                call.exhausted = True
                 break
             if not await self._send([_body(event)], phase=True):
                 return
@@ -1256,22 +1303,17 @@ class FileRequestOwner:
     # -- conclusion and cleanup ------------------------------------------------
 
     def _cleanup_deadline(self) -> float:
-        bound = self._cause_time + self._config.session_cleanup_timeout
+        bound: float = self._cause_time + self._config.session_cleanup_timeout
         drain = self._drain_deadline()
         return bound if drain is None else min(bound, drain)
 
     async def _conclude(self) -> Any:
-        if self._call is None:
-            # Nothing reached core: no abort and no child to settle.
-            self._stop_watch()
-            await self._respond()
-            _resolve(self._delivered)
-            self._accounting.release()
-            return self._outcome()
+        # Before the permit nothing reached core, but the disconnect watcher
+        # still settles under the same continuation and bound.
         continuation = asyncio.ensure_future(self._cleanup())
         self.continuation = continuation
         self._registry.attach_continuation(self._record, continuation)
-        normal_bound = (
+        normal_bound: float = (
             self._clock.monotonic() + self._config.session_cleanup_timeout
         )
 
@@ -1306,6 +1348,8 @@ class FileRequestOwner:
         return None
 
     def _stop_watch(self) -> None:
+        # From here the watcher's end is the owner's doing, not the client's.
+        self._watch_stopped = True
         if self._gone is not None and not self._gone.done():
             self._gone.cancel()
 
@@ -1332,14 +1376,25 @@ class FileRequestOwner:
         await self._abort()
 
     async def _cleanup(self) -> None:
-        """The cleanup continuation: settle, then release exactly once."""
+        """The cleanup continuation: settle, then release exactly once.
+
+        The children it settles include the disconnect watcher, whose
+        cancellation can outlast the handler's cleanup bound; until it has
+        settled the accounting and the record stay held (``stop`` cancels
+        the continuation).
+        """
         try:
             if self._abort_needed:
                 await self._abort_until_settled()
             self._stop_watch()
             if self._call is not None:
                 await self._call.aclose()
-            pending = {task for task in self._tasks if not task.done()}
+            pending: set[asyncio.Future[Any]] = {
+                task for task in self._tasks if not task.done()
+            }
+            watcher = self._gone
+            if watcher is not None and not watcher.done():
+                pending.add(watcher)
             if pending:
                 await asyncio.wait(pending)
             _resolve(self._settled)

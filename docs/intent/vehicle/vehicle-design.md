@@ -312,7 +312,9 @@ owner runs the legal, serialized finalization sequence for each stream.
 1. Set health to `NOT_SERVING` and close admission: new owners are refused (`state.draining` is
    already set by core).
 2. Let owners finish normally until the settle point, `D - min(5 s, (D - now) / 4)`. Clients that
-   finish their audio get their finals.
+   finish their audio get their finals. This step lasts until the settle point even when no owner
+   remains, so health checkers and load balancers observe `NOT_SERVING` and stop routing to the
+   server before its listener closes.
 3. At the settle point, raise the shutdown trigger with `D` for every remaining stream owner.
    An owner whose lease is open and that has selected neither a client finalization nor an
    abnormal cause selects provisional shutdown mode when it observes the trigger; an owner already

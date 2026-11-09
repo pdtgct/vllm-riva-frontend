@@ -14,7 +14,6 @@ streaming surfaces read client input through the owner's bounded
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
@@ -316,11 +315,39 @@ def _rpc_deadline(clock: Any, context: Any) -> float | None:
     return float(clock.monotonic()) + max(0.0, float(remaining))
 
 
+class _Abandoned(Exception):
+    """A write or the status exceeded its send bound: nothing more is sent."""
+
+
 async def _abort(
-    context: Any, catalog: Any, error: errors.FrontendError
+    plugin: Any,
+    context: Any,
+    error: errors.FrontendError,
+    *,
+    rpc_deadline: float | None,
+    owner: Any = None,
+    watch: surfaces.ShutdownWatch | None = None,
 ) -> NoReturn:
-    await context.abort(catalog.grpc_status(error.code), error.grpc_details())
+    """End the RPC with ``error``'s status under the send bound.
+
+    Raises what ``context.abort`` raises; a status the transport does not
+    take within the bound raises ``_Abandoned`` instead.
+    """
+    status = plugin.catalog.grpc_status(error.code)
+    try:
+        await surfaces.bounded_send(
+            plugin,
+            context.abort(status, error.grpc_details()),
+            owner=owner,
+            rpc_deadline=rpc_deadline,
+            watch=watch,
+        )
+    except TimeoutError:
+        raise _Abandoned from None
     raise RuntimeError("context.abort returned")  # pragma: no cover
+
+
+_TRANSPORT_GONE = errors.FrontendError("internal", "the transport is gone")
 
 
 # ================================================================ servicer
@@ -360,7 +387,8 @@ class _RivaStream:
     """One ``StreamingRecognize`` call over its ``StreamOwner``.
 
     The handler reads the request iterator only between owner operations,
-    one message at a time, through the owner's bounded ``receive``. The
+    one message at a time, through the owner's bounded ``receive``, and
+    writes each response with ``context.write`` under the send bound. The
     client's cancellation reaches the owner at once through the context's
     done callback and ``fail``, which interrupts a running call.
     """
@@ -372,12 +400,14 @@ class _RivaStream:
         record: Any,
         context: Any,
         requests: AsyncIterator[rasr.StreamingRecognizeRequest],
+        watch: surfaces.ShutdownWatch,
     ) -> None:
         self._plugin = plugin
         self._config = plugin.config
         self._owner = owner
         self.record = record
         self._context = context
+        self._watch = watch
         self._requests = requests.__aiter__()
         self._interim = True
         self._hypothesis = ""
@@ -406,8 +436,38 @@ class _RivaStream:
             )
 
     async def close(self) -> None:
-        if self._tasks:
-            await asyncio.wait(self._tasks)
+        await surfaces.join(
+            self._tasks, stopped=lambda: surfaces.torn_down(self._plugin)
+        )
+
+    # ------------------------------------------------------------- writes
+
+    async def _write(self, response: rasr.StreamingRecognizeResponse) -> None:
+        """One response under the send bound; past it, the transport path."""
+        if self.gone:
+            raise _ClientGone
+        try:
+            await surfaces.bounded_send(
+                self._plugin,
+                self._context.write(response),
+                owner=self._owner,
+                rpc_deadline=self._owner.rpc_deadline,
+                watch=self._watch,
+            )
+        except Exception as failure:  # beyond the bound, or the write failed
+            self.gone = True
+            raise _Abandoned from failure
+
+    async def abort(self, error: errors.FrontendError) -> NoReturn:
+        """Project the owner's terminal error as the RPC's status."""
+        await _abort(
+            self._plugin,
+            self._context,
+            error,
+            rpc_deadline=self._owner.rpc_deadline,
+            owner=self._owner,
+            watch=self._watch,
+        )
 
     # -------------------------------------------------------------- reads
 
@@ -447,7 +507,7 @@ class _RivaStream:
     # @spec ING-GRPC-026, ING-GRPC-027, ING-GRPC-028, ING-GRPC-033
     # @spec ING-CORE-021, ING-LIFE-001, ING-LIFE-008, ING-LIFE-024
     # @spec ING-ERR-016, ING-VEH-007
-    async def run(self) -> AsyncIterator[rasr.StreamingRecognizeResponse]:
+    async def run(self) -> None:
         """Configure, stream and finalize; raise the terminal error."""
         owner = self._owner
         first = await self._read()
@@ -490,8 +550,7 @@ class _RivaStream:
                     ),
                     "protocol",
                 )
-            async for response in self._audio(message.audio_content):
-                yield response
+            await self._audio(message.audio_content)
         if self._riff:
             raise await self._terminal(
                 errors.FrontendError(
@@ -502,7 +561,7 @@ class _RivaStream:
                 "protocol",
             )
         text = await self._call(owner.finalize())
-        yield _streaming_response(text, final=True)
+        await self._write(_streaming_response(text, final=True))
 
     async def _configure(
         self, message: rasr.StreamingRecognizeRequest
@@ -545,9 +604,7 @@ class _RivaStream:
         )
 
     # @spec ING-CORE-019
-    async def _audio(
-        self, data: bytes
-    ) -> AsyncIterator[rasr.StreamingRecognizeResponse]:
+    async def _audio(self, data: bytes) -> None:
         """Decode one message in bounded slices and feed each in turn.
 
         Reads stay paused while a slice is fed. After the shutdown trigger
@@ -575,7 +632,7 @@ class _RivaStream:
                     continue
                 self._hypothesis = text
                 if self._interim:
-                    yield _streaming_response(text, final=False)
+                    await self._write(_streaming_response(text, final=False))
             if owner.shutdown_observed:
                 return
 
@@ -618,25 +675,37 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         self,
         request_iterator: AsyncIterator[rasr.StreamingRecognizeRequest],
         context: Any,
-    ) -> AsyncIterator[rasr.StreamingRecognizeResponse]:
+    ) -> None:
         """One stream: admission, its owner, then the wire projection.
 
         Every terminal outcome is the owner's one selected cause, projected
         with ``context.abort``; a client cancellation produces no response,
         and a final is sent only after ``finish`` and ``release`` succeeded.
+        A write or status beyond its send bound ends the call cancelled, for
+        which ``grpc.aio`` sends no status: nothing more reaches the client.
         """
+        try:
+            await self._streaming(request_iterator, context)
+        except _Abandoned:
+            raise asyncio.CancelledError from None
+
+    async def _streaming(
+        self,
+        request_iterator: AsyncIterator[rasr.StreamingRecognizeRequest],
+        context: Any,
+    ) -> None:
         plugin = self._plugin
         clock = plugin.clock
-        catalog = plugin.catalog
         rpc_deadline = _rpc_deadline(clock, context)
         if context.cancelled():
             return
         admitted = plugin.ingress.try_admit(admission.OwnerKind.stream)
         if admitted is None:
             await _abort(
+                plugin,
                 context,
-                catalog,
                 plugin.ingress.refusal(admission.OwnerKind.stream),
+                rpc_deadline=rpc_deadline,
             )
         registry = plugin.registry
         record = registry.register(
@@ -651,58 +720,77 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                 clock=clock,
                 registry=registry,
                 record=record,
-                catalog=catalog,
+                catalog=plugin.catalog,
             )
             owner.rpc_deadline = rpc_deadline
+            watch = surfaces.watch_shutdown(registry, record, owner)
             stream = _RivaStream(
-                plugin, owner, record, context, request_iterator
+                plugin, owner, record, context, request_iterator, watch
             )
             stream.arm()
-            error: errors.FrontendError | None = None
             try:
-                async with contextlib.aclosing(stream.run()) as responses:
-                    async for response in responses:
-                        yield response
-            except errors.FrontendError as raised:
-                error = raised
-            except _ClientGone:
-                error = None
-            except asyncio.CancelledError:
-                error = await self._cancelled(stream, owner, context)
-            except Exception as unexpected:  # a bug here, not the client's
-                error = errors.FrontendError(
-                    "internal", f"unexpected failure: {unexpected!r}"
+                await self._serve(stream, owner, context)
+            except _Abandoned:
+                # Cleaned up as for a disconnect; nothing further is sent.
+                await surfaces.settle_shielded(
+                    plugin, record, owner, _TRANSPORT_GONE, "transport"
                 )
-                await surfaces.settle(owner, error, "transport")
-                error = surfaces.selected_error(owner, error)
-            if error is not None and not stream.gone:
-                await _abort(context, catalog, error)
+                raise
         finally:
-            if stream is not None:
-                await stream.close()
-            surfaces.unregister(registry, record)
-            admitted.release()
+            try:
+                if stream is not None:
+                    await stream.close()
+            finally:
+                surfaces.release_owner(registry, record, admitted)
+
+    async def _serve(
+        self, stream: _RivaStream, owner: Any, context: Any
+    ) -> None:
+        """Run the stream, then project its one terminal error, if any."""
+        plugin = self._plugin
+        error: errors.FrontendError | None = None
+        try:
+            await stream.run()
+        except errors.FrontendError as raised:
+            error = raised
+        except _ClientGone:
+            return
+        except _Abandoned:
+            raise
+        except asyncio.CancelledError:
+            error = await self._cancelled(stream, owner, context)
+        except Exception as unexpected:  # a bug here, not the client's
+            error = errors.FrontendError(
+                "internal", f"unexpected failure: {unexpected!r}"
+            )
+            await surfaces.settle_shielded(
+                plugin, stream.record, owner, error, "transport"
+            )
+            error = surfaces.selected_error(owner, error)
+        if error is not None and not stream.gone:
+            await stream.abort(error)
 
     async def _cancelled(
         self, stream: _RivaStream, owner: Any, context: Any
     ) -> errors.FrontendError | None:
         """The handler's task was cancelled: clean up, then decide the end.
 
-        A client cancellation re-raises with no response. Otherwise the
-        plugin cancelled the owner (``drain`` within the engine reserve, or
+        Cleanup is joined through any further cancellation, so the record
+        and admission outlive it (unless ``stop`` tore the plugin down). A
+        client cancellation re-raises with no response. Otherwise the plugin
+        cancelled the owner (``drain`` within the engine reserve, or
         ``stop``): the stream ends with the shutdown abort row.
         """
         shutdown = errors.FrontendError(
             "service_unavailable", "the server is shutting down"
         )
-        cleanup = surfaces.child(
-            stream.record, surfaces.settle(owner, shutdown, "shutdown")
+        await surfaces.settle_shielded(
+            self._plugin, stream.record, owner, shutdown, "shutdown"
         )
-        await asyncio.shield(cleanup)
         if context.cancelled() or stream.gone:
             raise asyncio.CancelledError
         task = asyncio.current_task()
-        if task is not None:
+        if task is not None and task.cancelling():
             task.uncancel()
         return surfaces.selected_error(owner, shutdown)
 
@@ -715,26 +803,40 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
 
         Every validation, the encoded-size and decoded-duration bounds and
         header inference finish before a file-gate permit is taken; at each
-        boundary a cancellation or an already expired RPC deadline wins.
+        boundary a cancellation or an already expired RPC deadline wins. A
+        status beyond its send bound ends the call cancelled, with none.
         """
+        try:
+            return await self._recognize(request, context)
+        except _Abandoned:
+            raise asyncio.CancelledError from None
+
+    async def _recognize(
+        self, request: rasr.RecognizeRequest, context: Any
+    ) -> rasr.RecognizeResponse:
         plugin = self._plugin
-        catalog = plugin.catalog
         clock = plugin.clock
         deadline = _rpc_deadline(clock, context)
         await self._unary_boundary(context, deadline)
         if not plugin.files_enabled:
             await _abort(
+                plugin,
                 context,
-                catalog,
                 errors.FrontendError(
                     "unsupported_capability",
                     "complete files are not served by this deployment",
                 ),
+                rpc_deadline=deadline,
             )
         kind = admission.OwnerKind.recognize
         admitted = plugin.ingress.try_admit(kind)
         if admitted is None:
-            await _abort(context, catalog, plugin.ingress.refusal(kind))
+            await _abort(
+                plugin,
+                context,
+                plugin.ingress.refusal(kind),
+                rpc_deadline=deadline,
+            )
         registry = plugin.registry
         record = registry.register(kind, asyncio.current_task())
         handed_over = False
@@ -743,7 +845,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                 locale, wav = self._prepare(request)
             except errors.FrontendError as rejected:
                 await self._unary_boundary(context, deadline)
-                await _abort(context, catalog, rejected)
+                await _abort(plugin, context, rejected, rpc_deadline=deadline)
             await self._unary_boundary(context, deadline)
             from vllm_riva_frontend import files  # the files leaf's path
 
@@ -762,7 +864,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                     record=record,
                 )
             except errors.FrontendError as failed:
-                await _abort(context, catalog, failed)
+                await _abort(plugin, context, failed, rpc_deadline=deadline)
         finally:
             if not handed_over:
                 surfaces.unregister(registry, record)
@@ -778,11 +880,12 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
             raise asyncio.CancelledError
         if deadline is not None and self._plugin.clock.monotonic() >= deadline:
             await _abort(
+                self._plugin,
                 context,
-                self._plugin.catalog,
                 errors.FrontendError(
                     "request_timeout", "the RPC deadline expired"
                 ),
+                rpc_deadline=deadline,
             )
 
     def _prepare(self, request: rasr.RecognizeRequest) -> tuple[str, bytes]:

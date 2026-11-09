@@ -304,3 +304,194 @@ async def test_a_failure_after_finish_settles_does_not_turn_into_abort(
     assert owner.cause is not None and owner.cause.code == "internal"
     assert isinstance(finalizing.exception(), FrontendError)
     assert finalizing.exception().code == "internal"
+
+
+# ------------------------------------- bounded cancellation settlement
+#
+# A call that delays its cancellation (``Block(delay_cancel=True)``) must not
+# hold the stream's answer past the cleanup bound (``session_cleanup_timeout``
+# 30 s, clipped to ``D`` while draining). Past it the owner answers with the
+# selected cause; the record's continuation keeps the record, waits for the
+# call before any other lease call and runs the rest of the cleanup.
+
+CLEANUP_BUDGET = 30.0
+
+
+async def _stubborn_feed(make_owner, fake_factory, cause):
+    """An owner whose ``feed`` delays its cancellation, then ``fail``."""
+    owner = make_owner()
+    await _open(owner)
+    lease = _lease(fake_factory)
+    block = Block(delay_cancel=True)
+    lease.script("feed", block)
+    feed = asyncio.create_task(owner.feed(SAMPLES))
+    await block.entered.wait()
+    failing = asyncio.create_task(owner.fail(cause("idle_timeout", "idle")))
+    return owner, lease, block, feed, failing
+
+
+async def _finish(block, *tasks) -> None:
+    """Let a stubborn call settle and the test's tasks end."""
+    block.release()
+    await settle()
+    for task in tasks:
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(task, 2)
+
+
+# @spec ING-LIFE-035, ING-LIFE-037, ING-LIFE-057
+async def test_a_call_delaying_cancellation_is_answered_at_the_cleanup_bound(
+    make_owner, fake_factory, cause, clock
+):
+    from vllm_riva_frontend.errors import FrontendError
+
+    owner, _, block, feed, failing = await _stubborn_feed(
+        make_owner, fake_factory, cause
+    )
+    try:
+        await clock.advance(CLEANUP_BUDGET - 0.1)
+        assert block.cancellations >= 1, "the owner never cancelled the call"
+        assert not failing.done() and not feed.done()
+
+        await clock.advance(0.2)
+        assert failing.done(), "fail waited past the cleanup bound"
+        assert failing.exception() is None
+        # The interrupted ``feed`` raises the one selected cause.
+        assert feed.done()
+        assert isinstance(feed.exception(), FrontendError)
+        assert feed.exception().code == "idle_timeout"
+        assert owner.state == "terminal"
+        assert owner.cause.code == "idle_timeout"
+    finally:
+        await _finish(block, feed, failing)
+
+
+# @spec ING-LIFE-035
+async def test_no_lease_call_starts_while_a_cancelled_call_is_unsettled(
+    make_owner, fake_factory, cause, clock
+):
+    owner, lease, block, feed, failing = await _stubborn_feed(
+        make_owner, fake_factory, cause
+    )
+    try:
+        await clock.advance(CLEANUP_BUDGET + 0.1)
+        assert failing.done()
+        assert lease.names() == ["feed"], "abort overlapped the feed"
+        assert lease.running == "feed"
+    finally:
+        await _finish(block, feed, failing)
+
+    # Settled late, the feed is followed by the rest of the cleanup, in
+    # order; the strict fake raises on any overlap.
+    assert lease.names() == ["feed", "abort", "release"]
+    assert owner.cleanup_errors == []
+    assert lease.state == "released"
+
+
+# @spec ING-LIFE-037, ING-LIFE-035
+async def test_an_expired_abort_delaying_its_cancellation_defers_release(
+    make_owner, owner_parts, fake_factory, clock
+):
+    owner = make_owner()
+    await _open(owner)
+    lease = _lease(fake_factory)
+    lease.script("feed", Raise(failed("expired")))
+    abort = Block(delay_cancel=True)
+    lease.script("abort", abort)
+    feed = asyncio.create_task(owner.feed(SAMPLES))
+    await abort.entered.wait()
+    try:
+        await clock.advance(CLEANUP_BUDGET + 0.1)
+        assert feed.done(), "the stream was not answered at the bound"
+        assert abort.cancellations >= 1
+        assert lease.names() == ["feed", "abort"], "release overlapped abort"
+        assert len(owner_parts["registry"].records) == 1
+    finally:
+        await _finish(abort, feed)
+
+    assert lease.names() == ["feed", "abort", "release"]
+    assert owner.cleanup_errors == []
+    assert len(owner_parts["registry"].records) == 0
+
+
+# @spec ING-LIFE-035, ING-LIFE-058, ING-EP-060
+async def test_the_record_stays_under_its_continuation_until_cleanup_ends(
+    make_owner, owner_parts, fake_factory, cause, clock
+):
+    registry = owner_parts["registry"]
+    owner, lease, block, feed, failing = await _stubborn_feed(
+        make_owner, fake_factory, cause
+    )
+    (record,) = registry.records.values()
+    try:
+        await clock.advance(CLEANUP_BUDGET + 0.1)
+        assert failing.done()
+        assert list(registry.records.values()) == [record]
+        assert record.continuation is not None
+        assert not record.continuation.done()
+        assert not registry.settled()
+        assert record.continuation in registry.pending()
+    finally:
+        await _finish(block, feed, failing)
+
+    assert record.continuation.done()
+    assert len(registry.records) == 0
+    assert lease.names()[-1] == "release"
+
+
+# @spec ING-LIFE-035, ING-EP-043, ING-EP-059
+async def test_stop_cancels_the_continuation_of_an_unsettled_call(
+    make_owner, owner_parts, fake_factory, cause, clock
+):
+    registry = owner_parts["registry"]
+    owner, lease, block, feed, failing = await _stubborn_feed(
+        make_owner, fake_factory, cause
+    )
+    (record,) = registry.records.values()
+    try:
+        await clock.advance(CLEANUP_BUDGET + 0.1)
+        continuation = record.continuation
+        assert continuation is not None and not continuation.done()
+
+        # What ``stop`` does to the registry: mark it torn down, then cancel
+        # every owner, continuation and child.
+        registry.torn_down = True
+        registry.cancel_all()
+        await settle()
+
+        assert continuation.cancelled()
+        assert len(registry.records) == 0
+        assert lease.names() == ["feed", "teardown"]
+    finally:
+        await _finish(block, feed, failing)
+    # The late settlement starts no lease call on a stopped plugin.
+    assert lease.names() == ["feed", "teardown"]
+
+
+# @spec ING-LIFE-035, ING-LIFE-057, ING-LIFE-053
+async def test_settling_a_cancelled_call_is_clipped_to_the_drain_deadline(
+    make_owner, fake_factory, clock
+):
+    from vllm_riva_frontend.errors import FrontendError
+    from vllm_riva_frontend.lifecycle import ShutdownTrigger
+
+    owner = make_owner()
+    await _open(owner)
+    lease = _lease(fake_factory)
+    block = Block(delay_cancel=True)
+    lease.script("feed", block)
+    feed = asyncio.create_task(owner.feed(SAMPLES))
+    await block.entered.wait()
+    owner.observe_shutdown(ShutdownTrigger(clock.monotonic() + 3))
+    try:
+        await clock.advance(2.9)
+        assert not feed.done()
+        # At ``D`` the feed is cancelled, and its settlement gets no wait
+        # beyond ``D``: the stream is answered at once.
+        await clock.advance(0.2)
+        assert feed.done(), "the settlement wait outlived D"
+        assert isinstance(feed.exception(), FrontendError)
+        assert feed.exception().code == "service_unavailable"
+        assert lease.names() == ["feed"]
+    finally:
+        await _finish(block, feed)

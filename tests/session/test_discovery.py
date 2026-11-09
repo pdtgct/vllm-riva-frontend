@@ -101,6 +101,57 @@ def test_a_named_factory_is_the_only_one_used(fake_engine):
     assert factory is second
 
 
+# @spec ING-CORE-012, ING-CORE-017
+def test_a_named_selection_still_constructs_every_factory(fake_engine):
+    first, second = FakeSessionFactory(), FakeSessionFactory()
+    seen: list[tuple[object, object]] = []
+
+    def declining(engine_client, model_config):
+        seen.append((engine_client, model_config))
+        return None
+
+    factory = _discover(
+        fake_engine,
+        fake_entry_points(
+            first=first.constructor, other=declining, second=second.constructor
+        ),
+        selected="second",
+    )
+
+    # The name selects which result is used, not which constructor runs.
+    assert factory is second
+    assert getattr(first, "constructed_with", None) == (
+        fake_engine,
+        fake_engine.model_config,
+    ), "an unselected constructor was not called"
+    assert seen == [(fake_engine, fake_engine.model_config)]
+    # A factory built and not used is torn down; the selected one is kept.
+    assert first.teardown_calls == 1
+    assert second.teardown_calls == 0
+
+
+# @spec ING-CORE-012, ING-CORE-017
+def test_an_unselected_constructor_that_raises_fails_startup(fake_engine):
+    from vllm_riva_frontend.lifecycle import StartupError
+
+    chosen = FakeSessionFactory()
+
+    def broken(engine_client, model_config):
+        raise RuntimeError("engine client has no wait_stream_retired")
+
+    with pytest.raises(StartupError) as info:
+        _discover(
+            fake_engine,
+            fake_entry_points(broken=broken, ok=chosen.constructor),
+            selected="ok",
+        )
+    text = failure_text(info.value)
+    assert "wait_stream_retired" in text
+    assert "broken" in text
+    # Built before the failure, the selected factory leaves no task behind.
+    assert chosen.teardown_calls == 1
+
+
 # @spec ING-CORE-017
 def test_a_named_factory_that_is_absent_or_declines_fails_startup(
     fake_engine,

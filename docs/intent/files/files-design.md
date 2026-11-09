@@ -287,7 +287,10 @@ and the server-load count: accounting is never released while work it covers sti
 the owner runs the continuation to its end before it returns. When the cleanup bound expires first,
 the handler sends its response, if any, and transfers ownership of the remaining cleanup to the
 continuation; the record stays registered, with the permit, slot and count, until the continuation
-finishes, and `stop` cancels the continuation and the children it holds. The stuck permit is
+finishes, and `stop` cancels the continuation and the children it holds. A request cancelled at
+the drain's settle point is the exception: its handler answers `service_unavailable` at once and
+hands the whole cleanup to the continuation, so the client learns of the shutdown while the
+listener is still up. The stuck permit is
 visible rather than hidden. A disconnect before the permit is taken discards only multipart memory,
 with no abort. A cause selected after the service completed normally (the call returned for a
 complete response, the generator exhausted for `stream=true`), including a disconnect during the

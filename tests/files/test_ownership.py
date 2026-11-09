@@ -24,7 +24,7 @@ from support.http import (
     until,
 )
 
-from .helpers import GuardedCall, TrackedStream, is_uuid
+from .helpers import GuardedCall, SlowWatcherCancel, TrackedStream, is_uuid
 
 ABORT_PERIOD = 0.25
 
@@ -416,6 +416,72 @@ async def test_abort_failure_does_not_change_the_selected_response(
     assert_core_error(exchange, 504, "request_timeout")
 
 
+# @spec ING-FILE-067, ING-ERR-056, ING-FILE-064
+@pytest.mark.parametrize(
+    "then",
+    [
+        lambda: Raise(RuntimeError("core failed at the deadline")),
+        lambda: Return(transcription_response("done at the deadline")),
+    ],
+    ids=["failure", "success"],
+)
+async def test_deadline_due_with_core_outcome_wins_at_the_call_boundary(
+    files_env, then
+):
+    env = await files_env()
+    block = Block(then=then())
+    env.service.script(block)
+    exchange = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    await env.clock.settle()
+    # The execution deadline started at the permit; no time has passed.
+    deadline = env.clock.monotonic() + env.plugin.config.file_execution_timeout
+    # Core's outcome and the deadline's expiry reach the owner together:
+    # the expired deadline is arbitrated before the outcome is consumed.
+    block.release()
+    env.clock.set(deadline)
+    await exchange.finish()
+    assert_core_error(exchange, 504, "request_timeout")
+
+
+# @spec ING-FILE-067, ING-ERR-056, ING-FILE-064, ING-FILE-035
+@pytest.mark.parametrize("fails", [True, False], ids=["failure", "event"])
+async def test_deadline_due_with_a_pull_wins_at_the_pull_boundary(
+    files_env, fails
+):
+    env = await files_env()
+    pull = asyncio.Event()
+    stream = TrackedStream(
+        [sse({"n": 0}), sse({"n": 1}), sse({"n": 2})],
+        engine=env.engine,
+        blocks={1: pull},
+        raise_at={1: RuntimeError("pull failed at the deadline")}
+        if fails
+        else None,
+    )
+    env.service.script(Return(stream))
+    exchange = env.request([("stream", "true")]).start()
+    await until(lambda: stream.pulling == 1, what="second pull")
+    await env.clock.settle()
+    deadline = env.clock.monotonic() + env.plugin.config.file_execution_timeout
+    # The pull's outcome (an event or a failure) and the deadline's expiry
+    # reach the owner together.
+    pull.set()
+    env.clock.set(deadline)
+    await exchange.finish()
+    assert len(exchange.starts) == 1 and exchange.status == 200
+    events = [e for e in exchange.body.split(b"\n\n") if e]
+    assert events[0] == sse({"n": 0}).strip().encode()
+    assert events[1].startswith(b"data: "), events
+    error = json.loads(events[1][len(b"data: ") :]).get("error")
+    assert error is not None, f"the pull's outcome was consumed: {events}"
+    assert error["code"] == 504, error
+    assert error["message"].startswith("request_timeout:"), error
+    assert events[2:] == [b"data: [DONE]"], events
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+    assert stream.closed
+
+
 # ---------------------------------------- cleanup bound and continuation
 
 
@@ -491,6 +557,70 @@ async def test_handler_answers_at_the_cleanup_bound_without_settling(
     assert env.plugin.file_gate.in_flight == 1, "expiry taken as settlement"
     block.release()
     await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+
+
+# @spec ING-FILE-070, ING-FILE-071, ING-FILE-074
+async def test_cleanup_holds_accounting_until_the_watcher_settles(files_env):
+    env = await files_env()
+    env.service.script(Raise(RuntimeError("core failed")))
+    exchange = env.request()
+    watcher = SlowWatcherCancel(exchange)
+    exchange.start()
+    await asyncio.wait_for(watcher.cancelled.wait(), 2)
+    await env.clock.settle()
+    # The watcher's cancellation has not settled: nothing is released.
+    (record,) = env.plugin.registry.records.values()
+    assert any(not child.done() for child in record.children)
+    assert env.plugin.file_gate.in_flight == 1, "released before the watcher"
+    assert env.plugin.ingress.file_count == 1
+
+    # At the cleanup bound the handler answers and hands the rest over.
+    await env.clock.advance(env.plugin.config.session_cleanup_timeout + 0.1)
+    await exchange.finish()
+    assert exchange.status is not None
+    assert list(env.plugin.registry.records.values()) == [record]
+    assert record.continuation is not None
+    assert not record.continuation.done()
+    assert env.plugin.file_gate.in_flight == 1
+    assert env.plugin.ingress.file_count == 1
+
+    watcher.release()
+    await until(lambda: not env.plugin.registry.records, what="unregistered")
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.ingress.file_count == 0
+
+
+# @spec ING-FILE-070, ING-FILE-071, ING-EP-059
+async def test_watcher_before_the_permit_is_settled_or_stopped(files_env):
+    env = await files_env(riva_frontend={"max_concurrent_files": 1})
+    block = Block()
+    env.service.script(block)
+    first = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    second = env.request()
+    watcher = SlowWatcherCancel(second)
+    second.start()
+    await until(lambda: env.plugin.file_gate.waiting == 1, what="waiting")
+    await env.clock.advance(env.plugin.config.file_gate_wait_timeout + 0.1)
+    await asyncio.wait_for(watcher.cancelled.wait(), 2)
+    await env.clock.settle()
+    # Refused at the gate, before the permit: the record and the
+    # file-owner slot stay until the watcher has settled.
+    assert len(env.plugin.registry.records) == 2
+    assert env.plugin.ingress.file_count == 2, "released before the watcher"
+
+    await env.clock.advance(env.plugin.config.session_cleanup_timeout + 0.1)
+    await second.finish()
+    assert_core_error(second, 503, "busy")
+    assert len(env.plugin.registry.records) == 2
+    assert env.plugin.ingress.file_count == 2
+
+    # ``stop`` cancels the continuation and the watcher it waits for.
+    await env.served.stop(timeout=5)
+    await until(lambda: not env.plugin.registry.records, what="unregistered")
+    assert env.plugin.ingress.file_count == 0
+    assert env.plugin.file_gate.in_flight == 0
+    await first.finish()
 
 
 # ------------------------------------------------------- load accounting

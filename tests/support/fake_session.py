@@ -14,7 +14,9 @@ be scripted per call with ``script(name, *behaviours)``:
 
 * ``Return(value)``: return ``value`` (``Return()`` returns the default);
 * ``Raise(exc)``: raise ``exc``;
-* ``Block()``: park until the test calls ``release()``, then do ``then``.
+* ``Block()``: park until the test calls ``release()``, then do ``then``;
+  ``Block(delay_cancel=True)`` is a call that delays its cancellation until
+  ``release()``.
 
 ``lease.after(name, callback)`` runs ``callback()`` synchronously when a call
 of ``name`` succeeds, just before it returns, so a test can act at the
@@ -150,16 +152,40 @@ class Block:
     ``entered`` is set when the call has started waiting. A caller cancelled
     while parked propagates the cancellation (and a ``feed`` or ``flush`` then
     fails the lease with ``cancelled``, as the model plugin's does).
+
+    ``delay_cancel=True`` makes a call that delays its cancellation: while
+    parked it absorbs every cancellation (counted in ``cancellations``) and
+    keeps waiting; ``release()`` then settles it, as cancelled if it was
+    cancelled meanwhile and by ``then`` otherwise.
     """
 
     then: Return | Raise = field(default_factory=Return)
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     released: asyncio.Event = field(default_factory=asyncio.Event)
+    delay_cancel: bool = False
+    cancellations: int = 0
 
     def release(self, then: Return | Raise | None = None) -> None:
         if then is not None:
             self.then = then
         self.released.set()
+
+    async def park(self) -> None:
+        """Wait for ``release()`` as the mode says (see the class doc)."""
+        self.entered.set()
+        if not self.delay_cancel:
+            await self.released.wait()
+            return
+        while not self.released.is_set():
+            try:
+                await self.released.wait()
+            except asyncio.CancelledError:
+                self.cancellations += 1
+                task = asyncio.current_task()
+                if task is not None:
+                    task.uncancel()
+        if self.cancellations:
+            raise asyncio.CancelledError
 
 
 Behaviour = Return | Raise | Block
@@ -195,8 +221,7 @@ class _Scripts:
 
 async def _perform(behaviour: Behaviour, default: Any) -> Any:
     if isinstance(behaviour, Block):
-        behaviour.entered.set()
-        await behaviour.released.wait()
+        await behaviour.park()
         behaviour = behaviour.then
     if isinstance(behaviour, Raise):
         raise behaviour.exc

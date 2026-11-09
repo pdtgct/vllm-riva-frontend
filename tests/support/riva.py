@@ -2,10 +2,12 @@
 
 Message builders over the pinned public stubs (``riva.client.proto``) and
 ``StreamingCall``, the one driver of ``StreamingRecognize`` every leaf uses.
-The handler is an async generator (implementation layout, Shapes), so the
-driver iterates it in a task and records what it yielded and how it ended:
-``RpcAbort`` from ``FakeServicerContext.abort`` is the projected gRPC status,
-anything else the handler raises is kept on ``error`` and surfaced by
+The handler is a coroutine that writes each response with ``context.write``
+(implementation layout, Shapes), so the driver awaits it in a task and
+records what it wrote and how it ended: ``RpcAbort`` from
+``FakeServicerContext.abort`` is the projected gRPC status; a handler that
+ends cancelled on its own is ``abandoned`` (``grpc.aio`` sends no status for
+it); anything else the handler raises is kept on ``error`` and surfaced by
 ``wait``.
 """
 
@@ -132,6 +134,12 @@ def transcripts(responses: Iterable[Any], *, final: bool) -> list[str]:
 # ------------------------------------------------------------------ driver
 
 
+def _cancel_requested() -> bool:
+    """Whether the running task was cancelled (not merely ended so)."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 class StreamingCall:
     """One ``StreamingRecognize`` call on a servicer, driven by the test.
 
@@ -144,10 +152,13 @@ class StreamingCall:
     is ``half_close`` then ``wait``.
 
     ``status`` is the abort's status, else the code the handler set, else
-    ``OK``; ``code`` is the catalog code leading ``details``; ``finals`` and
-    ``interims`` are transcripts. ``settle`` and ``advance`` need ``clock``,
-    which is also the clock of the context's RPC deadline (``time_remaining``
-    seconds from the call's construction).
+    ``OK``; ``code`` is the catalog code leading ``details``; ``responses``
+    are what the handler wrote (the context's ``writes``); ``finals`` and
+    ``interims`` are transcripts. ``abandoned`` is set when the handler
+    ended cancelled without the test cancelling it: no status at all.
+    ``settle`` and ``advance`` need ``clock``, which is also the clock of the
+    context's RPC deadline (``time_remaining`` seconds from the call's
+    construction).
     """
 
     def __init__(
@@ -166,8 +177,9 @@ class StreamingCall:
         self.context = FakeServicerContext(
             time_remaining=time_remaining, clock=clock, metadata=metadata
         )
-        self.responses: list[Any] = []
+        self.responses: list[Any] = self.context.writes
         self.abort: RpcAbort | None = None
+        self.abandoned = False
         self.error: BaseException | None = None
         self.task: asyncio.Task[None] | None = None
         if start:
@@ -181,14 +193,13 @@ class StreamingCall:
 
     async def _run(self) -> None:
         try:
-            async for response in self.servicer.StreamingRecognize(
-                self.requests, self.context
-            ):
-                self.responses.append(response)
+            await self.servicer.StreamingRecognize(self.requests, self.context)
         except RpcAbort as exc:
             self.abort = exc
         except asyncio.CancelledError:
-            raise
+            if _cancel_requested():
+                raise
+            self.abandoned = True
         except BaseException as exc:  # kept for ``wait`` to report
             self.error = exc
 
@@ -344,6 +355,8 @@ class RecognizeOutcome:
     abort: RpcAbort | None = None
     error: BaseException | None = None
     context: FakeServicerContext | None = None
+    #: The handler ended cancelled on its own: no response and no status.
+    abandoned: bool = False
 
     @property
     def status(self) -> grpc.StatusCode:
@@ -384,7 +397,9 @@ async def recognize(
     except RpcAbort as abort:
         outcome.abort = abort
     except asyncio.CancelledError:
-        raise
+        if _cancel_requested():
+            raise
+        outcome.abandoned = True
     except BaseException as exc:  # a bug in the handler, for the test
         outcome.error = exc
     return outcome

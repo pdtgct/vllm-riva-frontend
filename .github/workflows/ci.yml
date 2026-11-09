@@ -33,8 +33,26 @@ jobs:
       - name: Resolve dependencies for this interpreter
         run: uv sync --python ${{ matrix.python-version }}
 
+      # The plugin runs inside vLLM's process and the tests import vLLM's
+      # serving modules, so they need the vLLM core tree it targets (RFC 1 and
+      # RFC 2 merged). Its Python sources are importable from a checkout; the
+      # CPU requirements supply what those imports need.
+      - name: Check out vLLM core
+        uses: actions/checkout@v4
+        with:
+          repository: pdtgct/vllm
+          ref: c7cf80ac45e36259eb7c7c43d4f93b4b929d3c1d
+          path: vllm-core
+
+      - name: Install vLLM core's CPU requirements
+        run: >-
+          uv pip install --python .venv
+          -r vllm-core/requirements/cpu.txt
+          --extra-index-url https://download.pytorch.org/whl/cpu
+          --index-strategy unsafe-best-match
+
       - name: Lint
-        run: uv run --python ${{ matrix.python-version }} ruff check .
+        run: uv run --python ${{ matrix.python-version }} ruff check src tests
 
       # Floor lane only: mypy's language level is pinned to the floor in
       # pyproject, and that verdict needs floor-resolved stubs.
@@ -43,4 +61,6 @@ jobs:
         run: uv run --python ${{ matrix.python-version }} mypy
 
       - name: Tests
+        env:
+          PYTHONPATH: vllm-core
         run: uv run --python ${{ matrix.python-version }} pytest -q
