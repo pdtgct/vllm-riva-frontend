@@ -58,6 +58,18 @@ finalized, files settle and the gRPC listener stops before the engine shuts down
 for core. It must exceed the engine's `draining_timeout`; 60 s is the documented value. A zero
 timeout means no drain runs, and the frontend logs a warning at startup.
 
+**Shutdown signal.** Send `SIGTERM` or `SIGINT` to the `vllm serve` API-server process only; in a
+terminal, use `kill -INT <api-server-pid>`. A signal sent to the whole process group, such as
+Ctrl-C, also reaches the engine process, which then shuts down without waiting for the frontend's
+drain: the drain is cancelled and open streams end with an error and no final result.
+
+Kubernetes and `docker stop` signal only the container's main process, so start `vllm serve` as
+that process (exec form); a shell wrapper that runs it without `exec` may not forward the signal.
+Both platforms force-kill after a grace period (by default 30 s for Kubernetes'
+`terminationGracePeriodSeconds` and 10 s for `docker stop --time`), which is below the shutdown
+timeout above. Set the grace period above `--shutdown-timeout`, with room for shutdown overhead
+and any pre-stop hook, or the drain is killed.
+
 **One API server, one engine.** The frontend owns a non-HTTP listener, so core requires a single
 API-server process. Data parallel size above 1 is refused at startup: the model needs parallel
 sizes of 1, and slot count and active limit are read per engine.

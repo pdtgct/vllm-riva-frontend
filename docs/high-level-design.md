@@ -187,9 +187,9 @@ flowchart LR
   attaches its transcription route only for such a model, so `attach_router` replaces the route only
   when core's `POST /v1/audio/transcriptions` is present (`/v1/audio/translations` stays core's,
   and the model refuses translation); without the task, `Recognize` answers
-  `UNIMPLEMENTED`. `GetRivaSpeechRecognitionConfig` lists the model with `type=streaming` and, when
-  complete files are served, with `type=offline`, each with the encodings, rates and locales it
-  accepts. Unsupported request features are refused explicitly, never ignored.
+  `UNIMPLEMENTED`. `GetRivaSpeechRecognitionConfig` lists the model once per served locale with
+  `type=online` and, when complete files are served, again per locale with `type=offline`; each
+  entry names its `language_code` and the encodings and rates it accepts. Unsupported request features are refused explicitly, never ignored.
 
 ## Constraints
 

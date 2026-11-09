@@ -16,44 +16,73 @@ async def _describe(served):
     return result
 
 
-def _value_sets(entry) -> list[set[str]]:
+LOCALES = ["auto", "de-DE", "en-US"]
+
+
+def _assert_entry(entry, locale: str) -> None:
+    assert entry.model_name == SERVED
+    params = dict(entry.parameters)
+    assert params["language_code"] == locale, params
+    assert "language_codes" not in params, params
+    assert params["sample_rates"] == "8000,16000", params
+    assert params["encodings"] == "LINEAR_PCM,MULAW,ALAW", params
+    text = params["notes"].lower()
+    assert "punctuation" in text, params
+    assert "verbatim" in text, params
+
+
+def _pairs(response) -> list[tuple[str, str]]:
     return [
-        {part.strip() for part in value.split(",")}
-        for value in entry.parameters.values()
+        (e.parameters["type"], e.parameters["language_code"])
+        for e in response.model_config
     ]
 
 
-def _assert_entry(entry, locales: set[str]) -> None:
-    assert entry.model_name == SERVED
-    sets = _value_sets(entry)
-    assert {"8000", "16000"} in sets, dict(entry.parameters)
-    assert {"LINEAR_PCM", "MULAW", "ALAW"} in sets, dict(entry.parameters)
-    assert locales in sets, dict(entry.parameters)
-    text = " ".join(entry.parameters.values()).lower()
-    assert "punctuation" in text, dict(entry.parameters)
-    assert "verbatim" in text, dict(entry.parameters)
+def _stock_list_models(response, kind: str) -> dict:
+    """The stock scripts' ``--list-models`` grouping.
+
+    As their public source describes it: keep the entries of one type and
+    group them by locale.
+    """
+    models: dict = {}
+    for config in response.model_config:
+        if config.parameters["type"] == kind:
+            code = config.parameters["language_code"]
+            models.setdefault(code, []).append({"model": [config.model_name]})
+    return dict(sorted(models.items()))
 
 
 # @spec ING-GRPC-014
 # @spec ING-GRPC-006
-async def test_streaming_and_offline_entries_while_files_are_enabled(served):
+async def test_online_and_offline_entries_per_locale_while_files_are_enabled(
+    served,
+):
     assert served.plugin.files_enabled is True
     response = await _describe(served)
-    types = sorted(entry.parameters["type"] for entry in response.model_config)
-    assert types == ["offline", "streaming"]
+    assert _pairs(response) == [("online", c) for c in LOCALES] + [
+        ("offline", c) for c in LOCALES
+    ]
     for entry in response.model_config:
-        _assert_entry(entry, {"en-US", "de-DE", "auto"})
+        _assert_entry(entry, entry.parameters["language_code"])
 
 
 # @spec ING-GRPC-014
-async def test_only_the_streaming_entry_while_files_are_disabled(clock):
+async def test_stock_list_models_lists_the_served_model_per_locale(served):
+    response = await _describe(served)
+    expected = {c: [{"model": [SERVED]}] for c in LOCALES}
+    assert _stock_list_models(response, "online") == expected
+    assert _stock_list_models(response, "offline") == expected
+
+
+# @spec ING-GRPC-014
+async def test_only_online_entries_while_files_are_disabled(clock):
     async with serving(clock=clock, tasks=("realtime",)) as served:
         assert served.plugin.files_enabled is False
         response = await _describe(served)
-        assert [e.parameters["type"] for e in response.model_config] == [
-            "streaming"
-        ]
-        _assert_entry(response.model_config[0], {"en-US", "de-DE", "auto"})
+        assert _pairs(response) == [("online", c) for c in LOCALES]
+        assert _stock_list_models(response, "offline") == {}
+        for entry in response.model_config:
+            _assert_entry(entry, entry.parameters["language_code"])
 
 
 # @spec ING-GRPC-014

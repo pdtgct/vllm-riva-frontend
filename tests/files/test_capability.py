@@ -93,8 +93,8 @@ async def test_files_enabled_flag_decides_recognize_and_offline_listing(
     assert env.plugin.files_enabled is True
     assert env.plugin.file_gate is not None
     types = await _config_types(env.plugin)
-    assert types.count("streaming") == 1
-    assert types.count("offline") == 1
+    assert "online" in types
+    assert "offline" in types
     outcome = await recognize(
         env.plugin.servicer, recognize_request(_pcm()), FakeServicerContext()
     )

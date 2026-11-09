@@ -178,15 +178,21 @@ byte), so conversion cannot create an unbounded second copy.
 
 ### `GetRivaSpeechRecognitionConfig`
 
-The response is static, derived from the session factory and the accept-matrix, and lists the
-served-model identity once per supported type:
+The response is static, derived from the session factory and the accept-matrix. It lists the
+served-model identity once for each pair of type and locale, because the stock Riva client scripts
+(`nvidia-riva/python-clients`, `scripts/asr/transcribe_file.py` and
+`transcribe_file_offline.py`) answer `--list-models` by keeping the entries whose
+`parameters["type"]` is `online` (streaming) or `offline` (complete files) and grouping them by the
+single `parameters["language_code"]` each entry carries:
 
-- an entry with `parameters["type"] = "streaming"`, always;
-- an entry with `parameters["type"] = "offline"`, when the shared files-enabled flag is true (the
-  transcription task is present and the tiny-deployment exception has not disabled files; the
-  stock offline script filters `--list-models` on `type == offline`);
-- in each entry: sample rates `8000,16000`, encodings `LINEAR_PCM,MULAW,ALAW`, and the factory's
-  `locales`; and the model-intrinsic notes for punctuation and verbatim transcripts.
+- for each locale in the factory's `locales`, in code-point order, an entry with
+  `parameters["type"] = "online"`, always;
+- then, for each locale in the same order, an entry with `parameters["type"] = "offline"`, when the
+  shared files-enabled flag is true (the transcription task is present and the tiny-deployment
+  exception has not disabled files);
+- `auto` is listed when it is a member of the factory's `locales`, and is never synthesized;
+- in each entry: `language_code` set to that entry's locale (no plural `language_codes`), sample rates `8000,16000`, encodings
+  `LINEAR_PCM,MULAW,ALAW`, and the model-intrinsic notes for punctuation and verbatim transcripts.
 
 ## Riva Realtime WebSocket
 
@@ -332,6 +338,7 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | One leaf for the gRPC facet | `Recognize`'s wire handling here, its execution path in the files leaf | Split the facet between streaming and files | A facet belongs to exactly one leaf, and the servicer, field table, limits and header inference are shared by both RPCs; the files leaf owns what is specific to complete files |
 | Stubs | `nvidia-riva-client` generated stubs, pinned | Vendored codegen | The canonical client and the servicer then share one proto artifact; one fewer build step |
 | Streaming cadence | `560ms` fixed | Client field (none exists); model default | Server policy; one cadence for both streaming surfaces |
+| Configuration listing shape | One entry per type and locale, types `online` and `offline`, singular `language_code` | One entry per type listing every locale in `language_codes`; type `streaming` | The stock scripts select `online` or `offline` entries and group them by the singular `language_code`; the online filter excludes `streaming`, and a plural `language_codes` leaves the grouping key empty |
 | `verbatim_transcripts`, punctuation | Accepted under either value, documented | Reject the non-default | The canonical tools send a value by default; rejecting a default breaks the stock client |
 | `Recognize` request-level rider | `runtime_config` rejected on streaming requests | Ignore | Riders are request-level options; the honest subset covers them |
 | Receive cap | The dispatcher counts bytes and closes 1009 | Read the ASGI server's limit and fail if smaller; set the server limit | A plugin cannot set the ASGI server's frame limit and the server does not expose it uniformly; counting makes the cap independent of server settings. The server's own limit still bounds what arrives before the count |
@@ -363,7 +370,7 @@ never by golden parity, since the NeMo reference model has no endpointing.
 - Riva protocol: `nvidia-riva/common` (`riva/proto/riva_asr.proto`); generated stubs in
   `nvidia-riva-client` 2.26.0 (`riva/client/proto`).
 - Stock clients: `nvidia-riva/python-clients` (`riva/client/asr.py`, `riva/client/argparse_utils.py`,
-  `riva/client/realtime.py`, `scripts/asr/`).
+  `riva/client/realtime.py`, `scripts/asr/`), checked at commit `5bb8bd6`.
 - Public Speech NIM Realtime and ASR documentation.
 - Model plugin: `pdtgct/vllm-nemotron-asr-streaming-plugin` (`docs/intent/session/`).
 - Session leaf (owner, bounds, finalization), audio leaf (decode), errors leaf (catalog), files

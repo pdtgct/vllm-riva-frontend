@@ -250,22 +250,25 @@ def _encoding_label(value: int) -> str:
 def config_response(plugin: Any) -> rasr.RivaSpeechRecognitionConfigResponse:
     """The static ``GetRivaSpeechRecognitionConfig`` description.
 
-    One entry per supported type for the served identity: ``streaming``
-    always, ``offline`` while complete files are enabled.
+    One entry per type and locale: ``online`` for every locale, then
+    ``offline`` for every locale while complete files are enabled. Each entry
+    carries one ``language_code``, the shape the stock ``--list-models``
+    scripts group by.
     """
-    types = ["streaming"]
+    types = ["online"]
     if plugin.files_enabled:
         types.append("offline")
-    locales = ",".join(sorted(plugin.factory.locales))
+    locales = sorted(plugin.factory.locales)
     response = rasr.RivaSpeechRecognitionConfigResponse()
     for kind in types:
-        entry = response.model_config.add()
-        entry.model_name = plugin.served_model
-        entry.parameters["type"] = kind
-        entry.parameters["sample_rates"] = "8000,16000"
-        entry.parameters["encodings"] = "LINEAR_PCM,MULAW,ALAW"
-        entry.parameters["language_codes"] = locales
-        entry.parameters["notes"] = _MODEL_INTRINSIC_NOTE
+        for locale in locales:
+            entry = response.model_config.add()
+            entry.model_name = plugin.served_model
+            entry.parameters["type"] = kind
+            entry.parameters["language_code"] = locale
+            entry.parameters["sample_rates"] = "8000,16000"
+            entry.parameters["encodings"] = "LINEAR_PCM,MULAW,ALAW"
+            entry.parameters["notes"] = _MODEL_INTRINSIC_NOTE
     return response
 
 
