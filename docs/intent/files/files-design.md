@@ -342,7 +342,9 @@ own route.
    completion limit, and the minimal synthetic request that fixes its engine request ID (see Request
    ID and abort ownership), under the same abort, settlement and accounting rules as the route;
 4. returns one `RecognizeResponse` with one result and one alternative carrying the transcript,
-   only after the service completes normally.
+   only after the service completes normally. The result's `audio_processed` is the duration of the
+   WAV handed core; the alternative carries no `confidence`, because core's service returns text only
+   and the proto makes 0.0 the sentinel for an unset confidence.
 
 It uses no session factory, no full-context algorithm of its own and no second segmenter.
 

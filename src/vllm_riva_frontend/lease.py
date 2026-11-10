@@ -516,6 +516,7 @@ class StreamOwner:
         self._cause: Cause | None = None
         self._frontend: Any = None
         self._outstanding = 0
+        self._fed = 0  # 16 kHz samples the lease accepted, tail included
         self._call: asyncio.Future[Any] | None = None
         self._call_name: str | None = None
         self._cleanup: asyncio.Future[None] | None = None
@@ -578,6 +579,16 @@ class StreamOwner:
     def drain_deadline(self) -> float | None:
         """The drain deadline ``D`` once the trigger was observed."""
         return None if self._trigger is None else self._trigger.deadline
+
+    @property
+    def samples_fed(self) -> int:
+        """The 16 kHz samples handed to ``feed`` whose call succeeded.
+
+        It counts every handoff, the drained resampler tail of finalization
+        included, so after a successful ``finalize`` it is all the audio the
+        model has processed.
+        """
+        return self._fed
 
     @property
     def shutdown_observed(self) -> bool:
@@ -896,6 +907,7 @@ class StreamOwner:
                 credited = False
                 self._outstanding -= count
         await self._raise_on_failure(task)
+        self._fed += count
         result = task.result()
         return [str(text) for text in result] if result else []
 

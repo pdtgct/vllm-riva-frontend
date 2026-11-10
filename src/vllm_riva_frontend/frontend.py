@@ -40,7 +40,9 @@ RESAMPLER_ID = "scipy-poly-v1"
 
 _ENCODINGS = frozenset(cell[0] for cell in ACCEPT_MATRIX)
 _BYTES_PER_SAMPLE = {"LINEAR_PCM": 2, "MULAW": 1, "ALAW": 1}
-_OUTPUT_RATE = 16_000
+#: The rate of every sample the frontend hands on (``feed`` and the WAV).
+OUTPUT_RATE = 16_000
+_OUTPUT_RATE = OUTPUT_RATE
 _SCALE = np.float32(32768.0)
 #: Samples requantized per step; its ``float64`` temporary is 512 KiB.
 _REQUANTIZE_SLICE = 65_536

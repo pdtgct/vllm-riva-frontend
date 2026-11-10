@@ -150,6 +150,42 @@ async def test_recognize_returns_one_result_one_alternative(files_env, text):
     assert len(response.results) == 1
     assert len(response.results[0].alternatives) == 1
     assert response.results[0].alternatives[0].transcript == text
+    result = response.results[0]
+    assert result.audio_processed == pytest.approx(0.2, abs=1 / 16000)
+    alternative = result.alternatives[0]
+    assert "confidence" not in {fd.name for fd, _ in alternative.ListFields()}
+
+
+# @spec ING-FILE-045
+@pytest.mark.parametrize(
+    ("encoding", "rate"),
+    [
+        ("LINEAR_PCM", 16_000),
+        ("LINEAR_PCM", 8_000),
+        ("MULAW", 8_000),
+        ("ALAW", 8_000),
+    ],
+)
+async def test_recognize_audio_processed_is_the_input_duration(
+    files_env, encoding, rate
+):
+    env = await files_env()
+    env.service.script(Return(transcription_response("text")))
+    samples = pcm16_sine(0.2, rate=rate)
+    if encoding == "LINEAR_PCM":
+        audio = pcm16_bytes(samples)
+    else:
+        audio = g711_bytes(samples, encoding.lower())
+    outcome = await recognize(
+        env.plugin.servicer,
+        recognize_request(audio, encoding=encoding, sample_rate_hertz=rate),
+        FakeServicerContext(),
+    )
+    response = outcome.response
+    assert response is not None, outcome.details
+    assert response.results[0].audio_processed == pytest.approx(
+        0.2, abs=1 / 16000
+    )
 
 
 # ------------------------------------------------------------- locale

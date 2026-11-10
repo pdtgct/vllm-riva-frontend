@@ -362,23 +362,34 @@ _TRIGGER = object()  # what a read returns once the shutdown trigger is seen
 
 
 def _streaming_response(
-    text: str, *, final: bool
+    text: str, *, final: bool, audio_processed: float | None = None
 ) -> rasr.StreamingRecognizeResponse:
+    """Project one hypothesis; only the final carries ``audio_processed``.
+
+    The model has processed all audio handed to ``feed`` once ``flush``
+    returns, so the final's value is exact; an interim value would
+    overstate it. ``confidence`` stays at the proto's unset sentinel.
+    """
     result = rasr.StreamingRecognitionResult(
         alternatives=[rasr.SpeechRecognitionAlternative(transcript=text)]
     )
     if final:
         result.is_final = True
+        if audio_processed is not None:
+            result.audio_processed = audio_processed
     return rasr.StreamingRecognizeResponse(results=[result])
 
 
-def _recognize_response(text: str) -> rasr.RecognizeResponse:
+def _recognize_response(
+    text: str, audio_processed: float
+) -> rasr.RecognizeResponse:
     return rasr.RecognizeResponse(
         results=[
             rasr.SpeechRecognitionResult(
                 alternatives=[
                     rasr.SpeechRecognitionAlternative(transcript=text)
-                ]
+                ],
+                audio_processed=audio_processed,
             )
         ]
     )
@@ -568,7 +579,10 @@ class _RivaStream:
                 "protocol",
             )
         text = await self._call(owner.finalize())
-        await self._write(_streaming_response(text, final=True))
+        seconds = owner.samples_fed / frontend.OUTPUT_RATE
+        await self._write(
+            _streaming_response(text, final=True, audio_processed=seconds)
+        )
 
     async def _configure(
         self, message: rasr.StreamingRecognizeRequest
@@ -882,7 +896,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                 admitted.release()
         if isinstance(result, rasr.RecognizeResponse):
             return result
-        return _recognize_response(str(result))
+        return _recognize_response(str(result), files.wav_seconds(wav))
 
     async def _unary_boundary(
         self, context: Any, deadline: float | None
@@ -976,7 +990,7 @@ def _decode_complete(
         encoding=encoding, sample_rate_hz=rate
     )
     count = frontend.duration_from_bytes(encoding, rate, len(audio)) * rate
-    capacity = int(round(count)) * (16_000 // rate) + 64
+    capacity = int(round(count)) * (frontend.OUTPUT_RATE // rate) + 64
     samples = np.empty(capacity, dtype=np.float32)
     filled = 0
 

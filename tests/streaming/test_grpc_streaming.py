@@ -7,10 +7,18 @@ import inspect
 
 import grpc
 import numpy as np
+import pytest
 from riva.client.proto import riva_asr_pb2 as rasr
 from riva.client.proto import riva_asr_pb2_grpc as rasr_grpc
 from support.app import drain_plugin
-from support.audio import float_from_pcm16, pcm16_bytes, pcm16_ramp, pcm16_sine
+from support.audio import (
+    alaw_encode,
+    float_from_pcm16,
+    mulaw_encode,
+    pcm16_bytes,
+    pcm16_ramp,
+    pcm16_sine,
+)
 from support.fake_session import (
     Block,
     FakeSessionFactory,
@@ -198,7 +206,7 @@ async def test_audio_first_is_protocol_order_and_opens_nothing(served):
 
 
 # @spec ING-GRPC-026
-async def test_each_response_has_one_result_one_alternative_and_no_extra_fields(
+async def test_one_result_one_alternative_and_final_audio_processed(
     served,
 ):
     call = start_stream(served, [config_request()])
@@ -214,7 +222,10 @@ async def test_each_response_has_one_result_one_alternative_and_no_extra_fields(
         result = response.results[0]
         assert len(result.alternatives) == 1
         set_fields = {fd.name for fd, _ in result.ListFields()}
-        assert set_fields <= {"alternatives", "is_final"}, set_fields
+        if result.is_final:
+            assert set_fields == {"alternatives", "is_final", "audio_processed"}
+        else:
+            assert set_fields <= {"alternatives"}, set_fields
         alternative = result.alternatives[0]
         alt_fields = {fd.name for fd, _ in alternative.ListFields()}
         assert alt_fields <= {"transcript"}, alt_fields
@@ -222,7 +233,12 @@ async def test_each_response_has_one_result_one_alternative_and_no_extra_fields(
         assert result.stability == 0.0
         assert result.channel_tag == 0
     assert call.interims == ["partial"]
-    assert call.final_responses[0].results[0].is_final is True
+    final = call.final_responses[0].results[0]
+    assert final.is_final is True
+    assert sum(lease.accepted) > 0
+    assert final.audio_processed == pytest.approx(
+        sum(lease.accepted) / 16000, rel=1e-6
+    )
 
 
 # @spec ING-GRPC-027
@@ -442,3 +458,63 @@ async def test_max_session_duration_bounds_a_stream_when_set(clock):
     assert call.details.startswith("request_timeout:"), call.details
     assert "abort" in lease_names(served)
     assert call.finals == []
+
+
+def _format_audio(encoding: str, rate: int) -> bytes:
+    """20 ms of a sine tone in one accepted format."""
+    samples = pcm16_sine(0.02, rate=rate)
+    if encoding == "MULAW":
+        return mulaw_encode(samples).tobytes()
+    if encoding == "ALAW":
+        return alaw_encode(samples).tobytes()
+    return pcm16_bytes(samples)
+
+
+FORMATS = [
+    ("LINEAR_PCM", 16_000),
+    ("LINEAR_PCM", 8_000),
+    ("MULAW", 8_000),
+    ("ALAW", 8_000),
+]
+
+
+# @spec ING-GRPC-026
+@pytest.mark.parametrize(("encoding", "rate"), FORMATS)
+async def test_final_audio_processed_includes_the_resampler_tail(
+    served, encoding, rate
+):
+    call = start_stream(
+        served, [config_request(encoding=encoding, sample_rate_hertz=rate)]
+    )
+    lease = await opened(served, call)
+    call.push(audio_request(_format_audio(encoding, rate)))
+    await until(lambda: lease.accepted, what="feed")
+    call.half_close()
+    await call.wait()
+    assert call.status == grpc.StatusCode.OK, call.details
+    final = call.final_responses[0].results[0]
+    assert final.audio_processed == pytest.approx(
+        sum(lease.accepted) / 16000, rel=1e-6
+    )
+    assert final.audio_processed == pytest.approx(0.02, abs=1 / 16000)
+
+
+# @spec ING-GRPC-026, ING-GRPC-028
+@pytest.mark.parametrize(("encoding", "rate"), FORMATS)
+async def test_shutdown_final_carries_audio_processed(
+    served_through_drain, encoding, rate
+):
+    served = served_through_drain
+    call = start_stream(
+        served, [config_request(encoding=encoding, sample_rate_hertz=rate)]
+    )
+    lease = await opened(served, call)
+    call.push(audio_request(_format_audio(encoding, rate)))
+    await until(lambda: lease.accepted, what="feed")
+    drain = await _drain_to_settle_point(served)
+    await call.wait()
+    assert call.status == grpc.StatusCode.OK, call.details
+    final = call.final_responses[0].results[0]
+    assert final.audio_processed == pytest.approx(0.02, abs=1 / 16000)
+    await served.clock.advance(10)
+    await asyncio.wait_for(drain, 5.0)

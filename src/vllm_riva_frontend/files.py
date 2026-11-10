@@ -30,6 +30,7 @@ import json
 import logging
 import typing
 import uuid
+import wave
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ __all__ = [
     "locale_language",
     "recognize_file",
     "recognize_language",
+    "wav_seconds",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -1796,7 +1798,7 @@ def _recognize_request(wav: bytes, locale: str, service: Any) -> Any:
     )
 
 
-def _recognize_response(result: Any) -> Any:
+def _recognize_response(result: Any, audio_seconds: float) -> Any:
     from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
     if isinstance(result, ErrorResponse):
@@ -1805,8 +1807,16 @@ def _recognize_response(result: Any) -> Any:
     if not isinstance(text, str):
         raise FrontendError("internal", "core's response carries no transcript")
     response = rasr.RecognizeResponse()
-    response.results.add().alternatives.add().transcript = text
+    result_message = response.results.add()
+    result_message.alternatives.add().transcript = text
+    result_message.audio_processed = audio_seconds
     return response
+
+
+def wav_seconds(audio_wav: bytes) -> float:
+    """The duration of the in-memory WAV handed core, from its header."""
+    with wave.open(io.BytesIO(audio_wav), "rb") as reader:
+        return reader.getnframes() / reader.getframerate()
 
 
 def _resolve_locale(plugin: Any, locale: str) -> str:
@@ -1891,7 +1901,7 @@ async def recognize_file(
     )
     cause = owner.cause
     if cause is None:
-        return _recognize_response(result)
+        return _recognize_response(result, wav_seconds(audio_wav))
     if cause.kind == "transport":
         if owner.cancelled_by_task:
             raise asyncio.CancelledError

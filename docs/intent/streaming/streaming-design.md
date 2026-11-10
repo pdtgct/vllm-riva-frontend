@@ -71,8 +71,10 @@ Response messages are `StreamingRecognizeResponse` with one result holding one a
 sent with `is_final=false` when `interim_results` is true. Client half-close maps to `flush`
 (session leaf) and yields exactly one result with `is_final=true`, after `finish` and `release`
 succeed and before the server closes the stream. The same final, then gRPC `OK`, is what a
-shutdown finalization produces at drain (vehicle and session leaves). The frontend emits no other field (no word
-offsets, stability or channel tag). When cancellation, a deadline or an abort during shutdown wins before
+shutdown finalization produces at drain (vehicle and session leaves). The final result also carries `audio_processed`: the seconds of 16 kHz audio handed to `feed`,
+the resampler tail drained at finalization included, all of which the model has processed once `flush` returns. The frontend emits no other
+field (no word offsets, stability, channel tag or confidence), and no `audio_processed` on an interim
+result. When cancellation, a deadline or an abort during shutdown wins before
 the final, the servicer emits no fabricated final response; a cleanup failure never replaces the
 already-selected cancellation or deadline status, and on an otherwise normal path follows the
 session leaf's cleanup rules. Transcript text is the model's output relayed unchanged.
@@ -354,6 +356,7 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | Malformed `intent` queries | Passed to core | Deny with 1008 | The dispatcher claims one exact shape and leaves everything else to core |
 | Bootstrap default locale | The factory's `default_locale` | Always `auto` | The default is the model's to define |
 | End-of-utterance | Deferred with the model plugin | Frontend-side segmentation | Segmentation needs the per-unit mask and decoder reset that only the model plugin has |
+| `audio_processed` and `confidence` | `audio_processed` on the final result only; `confidence` unset | `audio_processed` on interims as the audio fed so far; a confidence derived from the transcript | The proto defines `audio_processed` as the audio processed so far: the frontend knows what it fed, and the model has processed all of it only after `flush`, so an interim value would overstate it; an interim therefore reads 0.0, which the proto, unlike for `confidence`, does not define as unset. The proto makes 0.0 the sentinel for an unset `confidence`, and the session interface returns text only |
 
 ## Open Questions & Future Decisions
 
@@ -364,6 +367,8 @@ never by golden parity, since the NeMo reference model has no endpointing.
    clients need it.
 3. A Realtime `provenance` object in `transcription_session.updated`: its contents are the
    deployment's own identifiers (operations leaf); whether stock clients need it is unconfirmed.
+4. An exact interim `audio_processed`, which needs the session interface to report the samples the
+   model has processed.
 
 ## References
 
