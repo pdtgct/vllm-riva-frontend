@@ -22,7 +22,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --tokenizer-mode nemotron_asr_streaming \
     --max-model-len 76800 \
     --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.2.0", "pin": "unspecified"}}' \
+    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.3.0b1", "pin": "unspecified"}}' \
     --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
 ```
 
