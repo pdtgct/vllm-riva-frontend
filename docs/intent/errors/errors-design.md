@@ -94,6 +94,7 @@ These refusals and errors carry no catalog code:
 | an HTTP request for an unknown path under the namespace (after authentication) | the router's 404 |
 | a WebSocket handshake for a path under the namespace with no WebSocket route (after authentication) | Starlette closes before accept, which the ASGI server answers with HTTP 403 |
 | a gRPC message above the framework cap | gRPC's native `RESOURCE_EXHAUSTED` framing error |
+| an RPC still running when the listener stop's termination (grace expiry of ING-EP-074 or forced stop of ING-EP-093) ends it, its own status not yet sent | the status the gRPC framework sets |
 | core's own errors on the file route | core's shape, unchanged |
 
 They precede or lie outside the dialect whose catalog projection would carry a code: an
@@ -148,6 +149,9 @@ selected cause and does not block a later deadline.
 | --- | --- | --- | --- |
 | refused before admission: ingress cap, draining | `busy`, `service_unavailable` | `RESOURCE_EXHAUSTED`, `UNAVAILABLE` | `error`, 1013 |
 | refused by `open`: engine capacity (the owner ends without a lease) | `busy`, `authority: provider` | `RESOURCE_EXHAUSTED` | `error`, 1013 |
+| refused by `open`: reason `locale` | `unknown_locale` | `INVALID_ARGUMENT` | `error`, no close: the session stays unconfigured and the client may retry with a corrected update within the original `preconfiguration_timeout` |
+| refused by `open`: reason `engine_paused` (the owner ends without a lease) | `service_unavailable` | `UNAVAILABLE` | `error`, 1013 |
+| refused by `open`: reason `cadence` or `request_id_in_use` (the owner ends without a lease) | `internal` | `INTERNAL` | `error`, 1011 |
 | first message wrong; later `streaming_config` | `protocol_order` | `FAILED_PRECONDITION` | `error`, 1008 |
 | configuration plus `open` exceeded its bound | `configuration_timeout` | `DEADLINE_EXCEEDED` | `error`, 1011 |
 | first-audio or idle bound; engine `expired` | `idle_timeout` | `ABORTED` | `error`, 1011 |
@@ -165,7 +169,11 @@ selected cause and does not block a later deadline.
 A client disconnect produces no response. A cleanup failure never changes the row selected by the
 primary cause. During shutdown finalization the shutdown abort row replaces the rows that a
 lease-call timeout, an `internal` failure or `engine_dead` would otherwise select, because the
-session is being shut down.
+session is being shut down. Once the plugin has begun stopping the gRPC listener, the row's
+`UNAVAILABLE` reaches a gRPC client only if its send completes before the listener stop's
+termination (the expiry of the graceful stop's grace period or the forced stop); an RPC that
+termination ends first gets the framework's status, outside the catalog, and tests of a
+listener stop assert the selected cause and the cleanup rather than the status received.
 
 ## Raised exceptions from core's service
 

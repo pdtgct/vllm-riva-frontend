@@ -119,13 +119,18 @@ the vehicle leaf refers to its items by number. The vehicle's factory settlement
 the suite checks them, and each is owed as a statement in the model plugin's session
 specification.
 
-1. **Infinite drain.** `drain` accepts `math.inf` as its deadline and then returns only when every
-   cleanup and holding task that exists when it is called has ended, cancelling no task by the
-   wait. The vehicle calls it after every owner has ended, so no lease call can register a further
-   task during the wait and the call awaits all of them.
+1. **Infinite drain.** `drain` accepts `math.inf` as its deadline and, when called with `math.inf`
+   before `teardown_all`, returns only when every cleanup and holding task that exists when it is
+   called has ended, cancelling no task by the wait. A `drain` with a finite deadline (the current
+   time, or the drain deadline `D`) returns when those tasks have ended or the deadline has passed,
+   whichever comes first, and also cancels no task. The vehicle calls `drain(math.inf)` after every
+   owner has ended, so no lease call can register a further task during the wait and the call awaits
+   all of them.
 2. **Ordered ending.** Each cleanup task and each holding task (the task that holds a session after
    a failed retirement wait) ends only after its session's generation task has ended, and none
-   cancels it.
+   cancels it. A task that `teardown_all` cancels is exempt from this ordering, since it can end
+   before the generation task finishes its cancellation handler; `teardown_all` still returns every
+   task it cancels, and the caller awaits them all.
 3. **Retained faults.** The factory retains, and returns through `drain`'s fault list, exactly
    these faults, even after their session is dropped:
    1. an exception, other than `CancelledError`, of a cleanup task's retirement wait that reports
@@ -157,6 +162,11 @@ specification.
    hands the session over to the factory's cleanup. `SESS-REL-003` covers a cancellation before the
    retirement wait finishes; this obligation adds that no earlier suspension exists.
 7. **Closed means inert.** The factory starts no task after `teardown_all`.
+8. **Repeated settlement.** Once `teardown_all` has been called and every task it returned has
+   ended, every later `drain` returns at once, whatever its deadline, with only the retained
+   faults not yet returned, and every later `teardown_all` returns no task still running and
+   raises nothing, so a `stop` after a completed `drain` settlement ends its factory settlement
+   at once.
 
 The suite checks each obligation, and includes these tests:
 
@@ -185,8 +195,15 @@ the engine client's abort, or without losing or repeating a task's fault.
 
 Obligations 3 and 4 need a change to the model plugin's code: its done-callback retrieves a
 generation task's exception without recording it, its recorded faults are the retirement-wait
-failures alone, and its cleanup drops the session when it ends. The others are true of its code
-today and owe only statements in its specification (vehicle leaf, Dependencies).
+failures alone, and its cleanup drops the session when it ends. Obligation 8 needs no code change:
+once every task `teardown_all` returned has ended, its `drain` finds no unfinished task to await and
+returns its recorded faults at once, clearing them, and a repeated `teardown_all` closes nothing new
+and returns only ended tasks, retrieving their exceptions without raising them, which obligation 8
+permits (`vllm_nemotron_asr_streaming/session/factory.py`, `drain` and `teardown_all`). Obligation 8
+owes a statement in its specification, and the suite's run against the real factory in the model
+plugin repository, on the RFC 1 + RFC 2 build, stays the acceptance gate. Obligations 1, 2 and 5 to
+7 are true of its code today and owe only statements in its specification (vehicle leaf,
+Dependencies).
 
 ## The stream owner
 
@@ -315,7 +332,11 @@ serialized with its other work:
    the wait clipped to the drain deadline; two lease calls never overlap.
 3. It enters `finalizing` for shutdown finalization. After the trigger the
    owner reads no further transport message, and unread traffic is not classified:
-   `session_terminal` applies to client-selected finalization only.
+   `session_terminal` applies to client-selected finalization only. If it holds an already-read,
+   validated audio message whose slices it has not all handed to `feed`, it feeds the remaining
+   slices, each under its operation bound with the wait clipped to the drain deadline, before it
+   drains the resampler; if it cannot, the cause becomes an abort during shutdown (step 5) and no
+   successful final is delivered.
 4. It runs the finalization sequence (step 0 to 3 above) under the time remaining to the drain
    deadline. The final is delivered only after `release` succeeded, then the stream ends as the
    vehicle leaf states (gRPC `OK`; WebSocket close 1001).
@@ -323,8 +344,9 @@ serialized with its other work:
    held expires, or the drain deadline arrives first, the cause becomes an abort during shutdown:
    an open or broken lease takes `abort` then `release`; a lease already flushed takes `release`
    only. The stream ends with the failure of the errors leaf's phase table (`UNAVAILABLE`;
-   WebSocket close 1012). Once the drain deadline has passed, these cleanup calls run under
-   `session_cleanup_timeout` (Cleanup order, below), not under the time remaining to it.
+   WebSocket close 1012). Cleanup that begins once the drain deadline has passed or the vehicle's
+   settlement has begun runs under `session_cleanup_timeout` (Cleanup order, below), not under the
+   time remaining to it; cleanup already running keeps the bound it began with.
 
 **Cause classification.** The owner selects provisional shutdown mode at the instant it observes
 the trigger, before it settles an outstanding call, unless a client-selected finalization is
@@ -336,7 +358,12 @@ after the trigger is observed, including during the settlement of the outstandin
 the row that failure or deadline has outside shutdown. Every deadline keeps its original absolute
 value and identity; only the waits are clipped to the drain deadline.
 
-A client disconnect during shutdown finalization wins as usual and selects the abnormal path.
+A client disconnect during shutdown finalization wins as usual and selects the abnormal path. The
+termination of an RPC that the servicer observes after the plugin began stopping the gRPC listener
+is not a client disconnect: it counts as the plugin's cancellation of the owner, which takes the
+shutdown abort row unless it already selected a cause, and that row's status reaches the client
+only if its send completes before the listener stop's termination (the expiry of the graceful
+stop's grace period or the forced stop).
 
 ### Locale updates and configuration changes (Realtime)
 
@@ -397,12 +424,14 @@ If `finish` settles successfully, the normal engine terminal stands and cleanup 
 `release`; a transport failure arriving afterwards suppresses the wire final but does not turn the
 stream into an abort.
 
-Terminal cleanup runs under one finite positive `session_cleanup_timeout`, shared by its calls; while
-the plugin is draining and the drain deadline has not passed, the bound is instead the time
-remaining to the drain deadline. Cleanup that starts in the vehicle's settlement, after the drain
-deadline or when a drain fails or is cancelled, runs under `session_cleanup_timeout` from its
-start, because the time remaining to the deadline is then zero and would skip `abort` and
-`release`. The owner always reaches `release`, in and out of shutdown: if `abort` consumed the
+Terminal cleanup runs under one finite positive `session_cleanup_timeout`, shared by its calls and
+fixed when cleanup begins; when cleanup begins while a `drain` call runs its graceful work (the
+drain deadline not passed and the settlement not begun), the bound is instead the time remaining to
+the drain deadline. Cleanup that starts in the vehicle's settlement, after the drain deadline or
+when a drain fails or is cancelled, runs under `session_cleanup_timeout` from its start, because the
+time remaining to the deadline is then zero and would skip `abort` and `release`. Neither the
+drain deadline passing nor the settlement's cancellation of the owner extends or restarts a bound
+already running. The owner always reaches `release`, in and out of shutdown: if `abort` consumed the
 budget, the owner cancels `abort` and awaits that call's settlement, then starts `release` and
 cancels it, which hands the session to one tracked cleanup task of the factory (`SESS-REL-003`,
 `SESS-OWN-003`). The rule is stated in what the owner can observe. The owner runs `release` as a
@@ -478,37 +507,43 @@ phases take their codes from the errors leaf's phase table and their cleanup fro
 rules above (a lease already flushed is never aborted). Idle timing
 resumes when the call returns.
 
-Accepted finalization atomically disarms the idle, first-audio and duration bounds and
-applies the finalization and cleanup bounds. Expiry of the first-audio, idle or duration bound
-before accepted finalization selects abnormal termination (`abort`, `release`) and projects the
-code in the table. While the plugin is draining, every wait is clipped to the time remaining to
-the drain deadline, if that is smaller; the bound keeps its own absolute deadline and identity, and
-a wait that ends because it reached the drain deadline expires as the drain deadline (the shutdown
-row), not as its phase. The bounds are checked at startup against the engine deadlines
-(vehicle leaf). Every send and close on a streaming surface, including the refusals that create no
-owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and the drain deadline.
+Accepted finalization atomically disarms the idle, first-audio and duration bounds and applies the
+finalization and cleanup bounds. Expiry of the first-audio, idle or duration bound before accepted
+finalization selects abnormal termination (`abort`, `release`) and projects the code in the table.
+While a `drain` call runs its graceful work (until its settlement begins), every wait is clipped to
+the time remaining to the drain deadline, if that is smaller; the bound keeps its own absolute
+deadline and identity, and a wait that ends because it reached the drain deadline expires as the
+drain deadline (the shutdown row), not as its phase. The bounds are checked at startup against the
+engine deadlines (vehicle leaf). Every send and close on a streaming surface, including the refusals
+that create no owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and the
+drain deadline.
 
 **Sends.** The drain announces its deadline to every send in flight, with or without an owner, so a
 send already waiting re-clips its bound at once. A send whose bound has already passed when it is
 due does not start, and takes the transport-failure path, unless it carries a terminal status (a
 gRPC status or abort; a Realtime `error` event, or the `failed` event that ends the session, and its
-close). A terminal status gets one attempt that adds no wait: it starts, runs to its first
-suspension and is cancelled if it has not completed, so the shutdown and deadline rows of the errors
-leaf reach a client that is still reading. A send that has not completed when its bound passes has
-failed, even if it completes later. The handler cancels it and does not wait for it to settle: a
-send still unsettled after one turn of the event loop stays under the stream's record until it
-settles or `stop`, so cleanup starts at once and spends no second budget. An admission refusal or
-a query refusal creates no record; its own request handler awaits the send inline under its
-bound, and if the send is still unsettled one turn of the event loop after the bound passed, the
-send moves, from that moment of abandonment, to the vehicle's registry as a send without an owner,
-which takes no ingress-cap count. The vehicle's settlement closes that registry before its final
-wait on unsettled sends; a refusal send abandoned after the close is cancelled and awaited by its
-own handler instead, so no refusal send outlives the settlement as detached work (vehicle leaf,
-Owner registry). The vehicle's settlement and `stop` await the sends under records and in the
-registry. Once the plugin is
-torn down, every send bound counts as passed. A send's failure, once established (its bound seen to
-pass, or a terminal attempt found incomplete), is final: a cancellation of the handler while it
-abandons the send changes nothing and no further send follows. A send that the plugin's own
+close; for a refusal that creates no owner, its whole sequence, including the `websocket.accept`
+that precedes the `error` event and close 1013 of ING-NIMWS-028). A terminal status gets one attempt
+that adds no wait: it starts, runs to its first suspension and is cancelled if it has not completed,
+so the shutdown and deadline rows of the errors leaf reach a client that is still reading. The
+attempt covers a whole response, not each message (ING-EP-110): a Realtime terminal event and its
+close, sent in sequence, are one attempt, and so is each refusal's sequence; a terminal send still
+unsettled when its attempt ends stays owned under ING-EP-110's ownership rules, described below. A
+send that has not completed when its bound passes has failed, even if it completes later. The
+handler cancels it and does not wait for it to settle: a send still unsettled after one turn of the
+event loop stays under the stream's record until it settles or `stop`, so cleanup starts at once and
+spends no second budget. An admission refusal or a query refusal creates no record; its own request
+handler awaits the send inline under its bound, and if the send is still unsettled one turn of the
+event loop after the bound passed, the send moves, from that moment of abandonment, to the vehicle's
+registry as a send without an owner, which takes no ingress-cap count. The vehicle's settlement
+closes that registry before its final wait on unsettled sends; a refusal send abandoned after the
+close is cancelled and awaited by its own handler instead, so no refusal send outlives the
+settlement as detached work (vehicle leaf, Owner registry). The vehicle's settlement and `stop`
+await the sends under records and in the registry. Once the plugin is torn down, and for the rest of
+a `drain` call once its drain deadline has passed, its settlement has begun or it skipped its
+graceful steps, every send bound counts as passed. A send's failure, once established (its bound
+seen to pass, or a terminal attempt found incomplete), is final: a cancellation of the handler while
+it abandons the send changes nothing and no further send follows. A send that the plugin's own
 cancellation of the owner interrupts first (the vehicle's settlement of a drain, or `stop`) is not a
 transport failure: the owner takes the shutdown abort row, whose terminal status is sent under its
 bound, or gets the one attempt once that bound has passed. A terminal status or close that this
@@ -558,6 +593,7 @@ every engine-facing task of its sessions, including the cleanup of a session who
 | Cleanup after a flushed lease | `release` only | `abort` then `release` | A flushed lease rejects `abort`, and the stream has already ended at `flush`; `abort` would be a failure that hides the real outcome |
 | Cleanup budget | One bound for the whole cleanup, `release` always reached | A bound per call | A per-call bound lets a slow `abort` multiply the wait; reaching `release` with no budget hands the session to the factory's tracked cleanup, which the vehicle's factory settlement awaits at shutdown |
 | Cleanup-bound expiry | Hand to the factory; no escalation | Escalate | The factory is the owner of an orphaned session and reports real faults (vehicle leaf) |
+| Cleanup during graceful drain | A stream cleanup that begins while a `drain` call runs its graceful work takes the time remaining to the drain deadline in place of `session_cleanup_timeout` (inherited); a file cleanup takes the smaller of `session_cleanup_timeout` and that remaining time | The smaller of the two for both | The harm is bounded by the drain deadline: the drain can last until that deadline anyway (a cleanup already running keeps its bound through the settlement), and admission is already closed. The longer bound lets a slow live `release` deliver its final; the smaller bound would withhold finals a live release could deliver, and would not shorten the drain |
 | Cleanup in the drain settlement | `session_cleanup_timeout` from the start of cleanup; on expiry the same cancelled-`release` hand-over as outside shutdown; the vehicle's factory settlement then awaits the factory's cleanup with `drain(math.inf)` before `teardown_all()` | The time remaining to the drain deadline; the lease's `teardown()` on expiry | After the deadline the remaining time is zero, which would skip `abort` and `release`. `teardown()` cancels an already cancelled generation task again, which can interrupt the engine client's abort, and starts no factory task that `drain` would await; one expiry rule keeps the owner's sequence identical in and out of shutdown |
 | Cleanup in `stop` | The shutdown abort row, as in the drain settlement | The lease's `teardown()` only, after closing the factory | Core does not guarantee that the engine has stopped when `stop` runs, so a `teardown()` after `abort` could interrupt the engine client's abort; `abort` and `release` end the session the same way in every path |
 | Cancelled `open` | Left to the factory; owner calls nothing on a lease it never received | Owner aborts and releases a lease that arrives late | A late lease is the owner's only after `open` returns it; the factory's table already owns the session through the cancellation |

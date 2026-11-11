@@ -169,20 +169,22 @@ owners from the moment core sets it, before or without a `drain` call.
   audio is read; reads and waits are bounded in time; a client disconnect releases what it held.
   This cap bounds frontend memory and work; the file gate (below) separately bounds files in
   inference.
-- **Bounds.** Every lease call runs under a finite frontend bound (configuration, first audio,
-  idle, finalization, cleanup). `init_state` reads the engine's stream deadlines (the
-  `stream_admission` settings: never-fed, parked-idle and draining) and fails startup unless each
-  frontend bound is below the matching engine deadline, so the frontend's bounds are below the engine's
-  and the engine's idle abort (`expired`, reported as an idle timeout) is a backstop. The engine
-  is the authority for sub-unit traffic and the frontend suspends client-idle timing while a
-  lease call is outstanding, so the engine can still end a stream first. During `drain`,
-  every bound on graceful work is the remaining time to one absolute deadline. Cleanup calls that
-  run after the deadline (an owner's `abort` and `release`) run under the frontend's own cleanup
-  bound instead; when that bound expires, the owner cancels the outstanding call and hands the
-  session to the factory's cleanup through a cancelled `release`. The settlement then awaits the
-  factory's cleanup with `factory.drain(math.inf)`, so each handed-over generation task completes
-  its cancellation, including the engine client's abort of its request, and only then closes the
-  factory with `teardown_all()` and awaits every task it returns.
+- **Bounds.** Every lease call runs under a finite frontend bound (configuration, first audio, idle,
+  finalization, cleanup). `init_state` reads the engine's stream deadlines (the `stream_admission`
+  settings: never-fed, parked-idle and draining) and fails startup unless each frontend bound is
+  below the matching engine deadline, so the frontend's bounds are below the engine's and the
+  engine's idle abort (`expired`, reported as an idle timeout) is a backstop. The engine is the
+  authority for sub-unit traffic and the frontend suspends client-idle timing while a lease call is
+  outstanding, so the engine can still end a stream first. During `drain`, every bound on graceful
+  work is capped by the remaining time to one absolute deadline, never enlarged; the one exception
+  is a stream cleanup that begins during graceful drain, which takes that remaining time in place of
+  the frontend's own cleanup bound (session leaf). Cleanup calls that begin after the deadline (an
+  owner's `abort` and `release`) run under the frontend's own cleanup bound instead, and a cleanup
+  already running keeps the deadline it began with; when that bound expires, the owner cancels the
+  outstanding call and hands the session to the factory's cleanup through a cancelled `release`. The
+  settlement then awaits the factory's cleanup with `factory.drain(math.inf)`, so each handed-over
+  generation task completes its cancellation, including the engine client's abort of its request,
+  and only then closes the factory with `teardown_all()` and awaits every task it returns.
 - **`drain(state, timeout)`.** Health `NOT_SERVING`; close admission; let owners finish until a
   settle point; then each remaining stream's owner finalizes it (the client gets its final after
   release) or, if that cannot finish, cleans it up as the session design prescribes (abort an open
@@ -293,10 +295,12 @@ owners from the moment core sets it, before or without a `drain` call.
   checks for them.
 - **Model-plugin change for fault retention.** The session factory's obligations (session leaf)
   include retaining the faults no caller can see and reporting each exactly once through `drain`;
-  the model plugin's factory does not yet do this and needs a code change. Its other obligations
-  are true of its code and owe only specification statements. Until the change lands, settlement
-  still ends and awaits every task, but an exception a generation task raises after its session
-  was handed over may go unreported.
+  the model plugin's factory does not yet establish these and needs a code change, which its seam
+  conformance run accepts. Its other obligations, including answering a `drain` or `teardown_all`
+  after a completed teardown at once, are true of its code and owe only specification statements,
+  with the same conformance run as the acceptance gate. Until the change lands, settlement still
+  ends and awaits every task, but an exception a generation task raises after its session was handed
+  over may go unreported.
 - **Plugins.** `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming` (core loads no endpoint plugin
   when the variable is unset), one API server process (the frontend's `init_state` refuses to
   start when the server runs more than one API server process, since every process would bind the

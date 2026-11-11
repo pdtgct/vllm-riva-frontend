@@ -100,7 +100,9 @@ together; files sent to core's own route are outside it.
   answers `UNIMPLEMENTED`, the route refuses with 501, no `offline` entry is listed). An explicitly configured size that fails the
   check fails startup.
 - Closing admission at drain, or core setting `state.draining`, refuses new waiters; waiters are
-  owners and are cancelled with the rest.
+  owners and are cancelled with the rest. A recorded fault (vehicle leaf, escalation) also closes
+  the gate: an owner admitted before the fault that reaches the gate after it is refused with
+  `service_unavailable`.
 
 ## The request guard
 
@@ -270,8 +272,10 @@ the outer generator, is never treated as ending the engine request.
 **Structured ownership.** The route does not rely on core's `with_cancellation` either: it spawns
 a handler task and a disconnect-listener task and cancels the pending one without awaiting it. The
 route's owner task owns the core call (a child task) and the disconnect watcher (a second child).
-Nothing in the frontend cancels the core call: it ends through the engine aborts below, in `drain`
-and `stop` alike.
+Nothing in the frontend cancels the core call or an outstanding pull of its event generator: each
+ends through the engine aborts below, in `drain` and `stop` alike. After a cause is selected no new
+pull begins; a continuation that takes over inherits an outstanding call or pull, awaits it while
+it repeats the abort, and then sends the final abort and closes the generator.
 
 A file request passes four milestones: the permit; the return of core's service call, once core's
 preprocessing (decode and prompt construction) is done, which for `stream=true` returns an event
@@ -298,10 +302,13 @@ final awaited abort for the ID, before it closes the generator and before any ac
 released. It then cancels the disconnect watcher and, for a returned event generator, closes it with
 `aclose`. Aborting an ID the engine does not know is harmless. The cleanup deadline starts when the
 cause is selected and covers the abort retries, the final abort, the generator's close and the
-children's settlement: `session_cleanup_timeout`, or during drain the smaller of that and the time
-left to the drain deadline; in the settlement after the drain deadline (vehicle leaf),
-`session_cleanup_timeout` again, from the moment the settlement cancels the owner. The bound limits
-the wait, not the settlement, which can outlast it.
+children's settlement: `session_cleanup_timeout`, or, for a cause selected during a drain's
+graceful work, the smaller of that and the time left to the drain deadline. The deadline is fixed
+when it starts: neither the drain deadline passing nor the settlement's cancellation of the owner
+extends or restarts it. An owner that the settlement (vehicle leaf) cancels before it selected a
+cause starts its cleanup deadline at that cancellation, as `session_cleanup_timeout`; this new
+deadline is the one exception to the errors leaf's deadline rule, and no later cancellation
+restarts it. The bound limits the wait, not the settlement, which can outlast it.
 The same contract applies to `Recognize`, whose engine request ID is fixed by its synthetic request.
 
 **Cleanup continuation.** A file request's cleanup is a cleanup continuation registered in the owner
@@ -314,9 +321,12 @@ continuation; the record stays registered, with the permit, slot and count, unti
 finishes. `drain`'s settlement awaits every continuation before `drain` returns, raises or
 re-raises a cancellation, so no continuation can still abort or submit engine work once core shuts
 the engine down; `stop` runs the same settlement and awaits a continuation that remains, with the
-children it holds. A request cancelled at the drain's settle point is the exception: its handler
-answers `service_unavailable` at once and hands the whole cleanup to the continuation, so the
-client learns of the shutdown while the listener is still up. The stuck permit is visible rather
+children it holds. A request the plugin cancels (at the drain's settle point, or in the
+settlement of `drain` or `stop`) is the exception: its handler answers at once, if a response is
+still due, with the response of the cause already selected or, when none was selected,
+`service_unavailable`, delivers nothing after an observed disconnect, and hands the whole cleanup
+to the continuation in every case, so the client learns of the shutdown while the listener is still
+up. The stuck permit is visible rather
 than hidden. A disconnect before the permit is taken discards only multipart memory,
 with no abort. A cause selected after the service completed normally (the call returned for a
 complete response, the generator exhausted for `stream=true`), including a disconnect during the
@@ -340,20 +350,31 @@ delivery pacing: each pull of the generator waits until the previous event has b
 event-stream reader consumes `file_execution_timeout`. Before response headers are sent, any failure is an
 ordinary HTTP error in core's shape. After headers are sent, a failure ends the event stream with
 core's streaming error event shape when it can be serialized, or closes the connection; an HTTP
-status is never sent after headers. On shutdown the route answers `service_unavailable` (503
-before headers; stream termination after, errors leaf). The permit is released after the engine
-request is aborted, the children have settled and the send has finished or failed.
+status is never sent after headers. On shutdown with no cause already selected, the route answers
+`service_unavailable` (503 before headers; stream termination after, errors leaf). The permit is
+released after the engine request is aborted, the children have settled and the send has finished
+or failed.
 
 The route bounds each response send: a reader that stalls longer than `response_send_timeout`
-(default 60 s) is cancelled. While core's service call is still executing, including an event
-stream whose generator is not exhausted, the engine request is aborted; after the service completed
+(default 60 s) is cancelled. While core's service call is still executing, including an event stream
+whose generator is not exhausted, the engine request is aborted; after the service completed
 normally, delivery is suppressed and nothing is aborted. In both cases the permit is released after
-settlement.
+settlement. Once a send bound counts as passed (ING-EP-110), the terminal send gets one attempt that
+covers the whole response, not each ASGI message: before response headers, the response's start and
+body messages, sent in sequence, are one attempt; after headers, the termination of the event stream
+is the terminal send. A terminal send still unsettled when its attempt ends stays owned under the
+request's registry record (ING-FILE-079). A refusal that creates no owner sends its HTTP 503 or 501
+response as one attempt, owned by its handler and the registry as ING-EP-094 and ING-EP-095
+prescribe.
 
 Core's own errors pass through unchanged: a returned `ErrorResponse` is returned as core's route
 returns it, and a raised exception is re-raised from the route handler (the owner carries it out of
 the core-call child), so that core's application exception handlers shape it as they shape core's
-own route.
+own route. Core then owns the delivery of that error response: the re-raise ends the frontend's
+delivery obligation and counts as the end of its response send, while the cleanup continuation
+keeps the record, permit, file-owner slot and load count until the frontend's children and the
+core-call child have settled. A returned `ErrorResponse` stays a response the frontend delivers
+under `response_send_timeout`.
 
 ## `Recognize`
 
@@ -489,6 +510,7 @@ failure.
 | Locale on the route | `language` forwarded unchanged; client `vllm_xargs` allowed with only `locale` | Exact-locale transport as for `Recognize` | OpenAI-style clients send languages, which the model maps; an explicit locale remains reachable through `locale` |
 | Upload limit | Core's `read_upload_with_limit` on the in-memory upload | A frontend limit | The same limit, message and status as core's route |
 | Upload object | In-memory (`BytesIO`) | `UploadFile` backed by a spooled file | Spooling writes large uploads to disk |
+| Re-raised core exceptions | Core's exception handlers deliver the HTTP error response; the re-raise ends the frontend's delivery obligation, and the cleanup continuation keeps the accounting until the frontend's and the core call's children settle; a returned `ErrorResponse` stays frontend-delivered and bounded | The frontend keeps ownership and bounds the response core's handler emits | Bounding the output of core's exception handlers would require wrapping core, which the port must not do; the accounting stays exact because it ends with the children, not with the send |
 | Permit release | When the response body is sent | When the service returns | A streaming response is still using the slot after the service returns |
 | Decode-duration check | Startup check against core's limit | Let core reject | A request the frontend accepts and core rejects has already cost a permit |
 
