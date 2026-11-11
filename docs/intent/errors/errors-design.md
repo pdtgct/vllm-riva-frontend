@@ -86,6 +86,8 @@ These refusals and errors carry no catalog code:
 
 | Case | Response |
 | --- | --- |
+| an HTTP request under `/plugins/riva/` while authentication initialization is unresolved (vehicle leaf, path-scoped authentication; unreachable after a completed startup) | 503 with the body `{"error": "Service Unavailable"}` |
+| a WebSocket handshake under `/plugins/riva/` while authentication initialization is unresolved | refused before accept: 503 with that body where the ASGI server offers the WebSocket denial-response extension, otherwise HTTP 403 with no body |
 | an HTTP request under `/plugins/riva/` without a valid bearer token while authentication is on (vehicle leaf, path-scoped authentication) | core's 401 `{"error": "Unauthorized"}`, the response core's own middleware sends |
 | a WebSocket handshake under `/plugins/riva/` without a valid bearer token while authentication is on | refused before accept (vehicle leaf, WebSocket refusal): core's 401 and body where the ASGI server offers the WebSocket denial-response extension, otherwise HTTP 403 with no body |
 | a Realtime WebSocket query other than exactly `intent=transcription` | handshake rejected with HTTP 403 before accept; no body |

@@ -21,7 +21,10 @@ Principles:
 - **Fail at startup, name the option.** A server that cannot serve correctly does not start; the
   error names the option or check that failed, and a configuration error lists every failing
   option, not only the first.
-- **Every task has an owner until it ends.** The frontend starts no task outside its registry.
+- **Every task has an owner until it ends.** The frontend starts no task outside its registry,
+  apart from the fault collector, the listener monitor and refusal sends. A refusal send runs as a
+  task that its own request handler awaits inline under `response_send_timeout`, so the handler
+  owns it; it enters the registry only when the handler abandons it (Owner registry, ING-EP-095).
   Engine-facing tasks belong to the model plugin's factory. `drain`, `stop` and a failed startup
   await every task they end before they return or raise.
 - **Bounded everywhere.** Every read, wait and lease call has a finite bound, and during shutdown
@@ -55,9 +58,9 @@ Normal runtime dependencies are the Riva stubs (`nvidia-riva-client`, pinned), `
 health and reflection packages, `numpy`, `scipy` (the resampler) and `python-multipart` (the
 file-route parser). The package has no resolver-owned dependency on vLLM, which the host environment
 supplies, and none on the model plugin. It imports vLLM only inside the lifecycle methods, the
-authentication middleware and the file route, where the contract it uses is core's. It adds no vLLM
-version bound: the capability checks in `init_state` decide whether a given build is usable
-(Decisions).
+authentication middleware and the complete-file path (`Recognize` and the frontend's file route),
+where the contract it uses is core's. It adds no vLLM version bound: the capability checks in
+`init_state` decide whether a given build is usable (Decisions).
 
 **Interpreter range.** The plugin is imported into vLLM's own interpreter, so it declares the
 interpreter range vLLM declares (`requires-python` of the pinned core: `>=3.11,<3.15`) and stays
@@ -177,11 +180,14 @@ answers with HTTP 403 and no body. Either way the connection is never accepted, 
 fails closed whatever the server's capabilities.
 
 The middleware is part of the HTTP surface only; the gRPC listener is outside `--api-key`. Until
-`init_state` has resolved the tokens the middleware fails closed, answering 503 under the namespace;
-core serves no request before `init_state` completes, so this state is not reachable in a
-completed startup. The class, its `tokens` argument and `verify_token` are core internals outside
-RFC 2's supported surface; tests pin them against core (the token check, the `tokens` keyword of
-the middleware's registration, and the 401 body).
+`init_state` has resolved the tokens the middleware fails closed under the namespace. An HTTP
+request gets 503 with the body `{"error": "Service Unavailable"}`. A WebSocket handshake is refused
+before accept, by the rule of the WebSocket refusal above: a 503 response with the same body through
+the denial-response extension when the scope offers it, otherwise `websocket.close` before accept
+(HTTP 403). Core serves no request before `init_state` completes, so this state is not reachable in
+a completed startup. The class, its `tokens` argument and `verify_token` are core internals outside
+RFC 2's supported surface; tests pin them against core (the token check, the `tokens` keyword of the
+middleware's registration, and the 401 body).
 
 ### `init_state`: startup checks
 
@@ -345,10 +351,12 @@ registered before the close or handled by its own handler after it. A handler aw
 cancelled send after the close keeps awaiting it if the handler is itself cancelled, and re-raises
 that cancellation only once the send has ended, so the send is never abandoned.
 
-The frontend starts no task outside the registry, apart from two long-lived supervision tasks that
-`start` creates: the fault collector, which settlement ends before the factory settlement in
-`drain` and in `stop`, and the listener monitor, which `drain` leaves running and `stop` ends and
-awaits. The model plugin's factory owns every engine-facing task of its sessions.
+The frontend starts no task outside the registry, apart from three exceptions. Two are long-lived
+supervision tasks that `start` creates: the fault collector, which settlement ends before the
+factory settlement in `drain` and in `stop`, and the listener monitor, which `drain` leaves running
+and `stop` ends and awaits. The third is a refusal send, which its own request handler awaits
+inline and owns until abandonment moves it into the registry (above). The model plugin's factory
+owns every engine-facing task of its sessions.
 
 **Ingress cap.** One finite positive cap (`load_shed_max_sessions`) counts active owners across
 `StreamingRecognize`, `Recognize`, the Realtime WebSocket route and the frontend's file route

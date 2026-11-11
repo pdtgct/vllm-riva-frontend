@@ -169,7 +169,11 @@ The suite checks each obligation, and includes these tests:
   `abort` returns normally, and exactly one fault is returned by a later `drain` and by no later
   `drain`;
 - a cancelled `open`, which requests cancellation twice with no suspension between the requests,
-  and a cancelled `open` whose generation task never started;
+  after its generation task has started: the generation task receives no cancellation after its
+  cancellation handler has begun, a holding or cleanup task covers it, and no factory task is still
+  running after the vehicle's factory settlement;
+- a cancelled `open` whose generation task is cancelled before its first step: the task never runs
+  its body, makes no engine call, and ends within one turn of the event loop;
 - the release hand-over is tested through the frontend's own cancellation mechanism (Cleanup
   order), run against the real factory and the fake: the owner runs `release` as a
   task, lets it reach its first suspension, cancels it and awaits it, and the session is then with
