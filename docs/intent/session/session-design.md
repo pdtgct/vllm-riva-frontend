@@ -52,6 +52,9 @@ the group with `(engine_client, engine_client.model_config)`, unchanged.
   names an entry point, in which case only that constructor's result is used and an absent or
   declining named factory fails startup. Zero or several accepting factories without a selection
   fail startup, listing the entry-point names.
+- Constructors start no task or session; a factory is inert until its first `open`. Every factory
+  a constructor returned belongs to the vehicle, which settles a discarded one when it discards it
+  and every constructed one when startup fails (vehicle leaf, startup checks).
 - A constructor that raises fails startup with its message. That raise is the frontend's only
   engine-capability check: the engine-client protocol does not declare the stream-admission calls,
   so only the factory, which uses them, knows whether the engine has them.
@@ -66,13 +69,13 @@ The frontend uses the following surface and nothing else.
 | factory | `locales: frozenset[str]` | locale validation on every surface |
 | factory | `default_locale: str \| None` | default when the client names none |
 | factory | `open(*, cadence, locale)` | opens a lease; may raise a refusal or failure |
-| factory | `drain(deadline) -> list` | await orphan cleanup until an absolute `time.monotonic()` deadline; returns cleanup faults, clearing them |
-| factory | `teardown_all() -> set[Task]` | terminal close; returns the cancelled tasks |
+| factory | `drain(deadline) -> list` | await orphan cleanup until an absolute `time.monotonic()` deadline (`math.inf` in the vehicle's factory settlement); returns the retained task faults (Factory obligations 3 and 4), each exactly once, clearing them |
+| factory | `teardown_all() -> set[Task]` | terminal close, called after `drain(math.inf)`; cancels and returns every task the factory owns (generation and cleanup tasks), which the vehicle awaits without reading their exceptions |
 | lease | `feed(samples, *, on_accepted) -> list[str]` | one call per piece; returns cumulative transcripts, one per unit whose text changed |
 | lease | `update_locale(locale) -> None` | locale change |
 | lease | `flush() -> str` | final tail; returns the final cumulative transcript or raises |
 | lease | `finish()`, `abort()`, `release()` | terminal calls (`release` returns after the slot has retired) |
-| lease | `teardown()` | synchronous, engine-free; for `stop` |
+| lease | `teardown()` | synchronous, engine-free; not called by the frontend, whose owners end a session through `abort` and `release` in every path, including `stop` |
 
 Errors: an exception from `open` or a lease may carry `session_error` (`"refused"` or `"failed"`)
 and `reason`. The frontend reads both with `getattr` and treats an exception with neither as an
@@ -94,10 +97,92 @@ bootstrap response and a Realtime update (streaming leaf), and the file path (fi
 ## Seam conformance
 
 The repository ships a conformance suite for the seam, run against a fake factory implementing the
-protocol; the model plugin repository runs the same suite against its real factory. It covers
-`drain` (absolute deadline, faults returned once and cleared), `teardown_all` (terminal; `open`
-afterwards fails), the call order the owner relies on, and the error attributes, including a
-reason the frontend does not know.
+protocol; the model plugin repository runs the same suite against its real factory. The fake
+factory models cleanup and holding tasks that outlive the owner that handed the session over, so
+the CPU tests exercise a settlement that must await factory work no owner still holds.
+
+The suite checks what the model plugin's session specification states: `drain` takes an absolute
+deadline, awaits the cleanup tasks until they finish or the deadline passes, and returns the
+recorded cleanup faults once, clearing them (`SESS-OWN-004`); `teardown_all` marks the factory
+closed, cancels every task it owns and returns them (`SESS-OWN-005`), including the generation task
+of a session whose `abort` was cancelled and the cleanup task of a session whose `release` was
+cancelled; once closed, `open` and every lease call other than `teardown` fail (`SESS-OWN-006`);
+a `release` after a cancelled `abort` keeps a tracked task until the generation task ends
+(`SESS-ABORT-002`); a cancelled `release` leaves the session with the factory's cleanup
+(`SESS-REL-003`, `SESS-OWN-003`); the call order the owner relies on; and the error attributes,
+including a reason the frontend does not know.
+
+### Factory obligations
+
+The frontend imposes the following obligations on every factory. This list is the canonical one;
+the vehicle leaf refers to its items by number. The vehicle's factory settlement relies on them,
+the suite checks them, and each is owed as a statement in the model plugin's session
+specification.
+
+1. **Infinite drain.** `drain` accepts `math.inf` as its deadline and then returns only when every
+   cleanup and holding task that exists when it is called has ended, cancelling no task by the
+   wait. The vehicle calls it after every owner has ended, so no lease call can register a further
+   task during the wait and the call awaits all of them.
+2. **Ordered ending.** Each cleanup task and each holding task (the task that holds a session after
+   a failed retirement wait) ends only after its session's generation task has ended, and none
+   cancels it.
+3. **Retained faults.** The factory retains, and returns through `drain`'s fault list, exactly
+   these faults, even after their session is dropped:
+   1. an exception, other than `CancelledError`, of a cleanup task's retirement wait that reports
+      a dead engine or is unexpected;
+   2. an exception, other than `CancelledError`, of a generation task that no `open` or lease call
+      surfaced to its caller: the task ended after its session was handed over to a cleanup or
+      holding task, or its cancellation handler raised while an uncancelled `abort` awaited it
+      (`abort` then returns normally);
+   3. an exception, other than `CancelledError`, of a cleanup or holding task itself.
+
+   Anything surfaced to its caller by `open` or a lease call is excluded: a refusal that `open`
+   raises with `session_error` `"refused"`, and a generation failure projected as a lease `reason`
+   (`engine_dead` among them) or raised with `session_error` `"failed"`. In the model plugin these
+   are, for example, a `StreamAdmissionError` raised as `SessionRefused`, and an `EngineDeadError`
+   projected as reason `engine_dead` or raised as `SessionFailed`. A cleanup or holding task that
+   `teardown_all` cancels as a last resort ends with `CancelledError` and is not retained: the
+   vehicle alone reports it, as a last-resort cancellation fault, and `drain` never returns it.
+4. **Sole reporter.** The factory is the only reporter of its tasks' faults: `drain` returns each
+   retained fault exactly once and clears it, so a fault returned by one caller is never returned
+   to another.
+5. **Cancellation scope.** `open`, `abort`, `release` and the factory's own cleanup and holding
+   tasks deliver no cancellation to a generation task after its cancellation handler has begun.
+   `teardown_all` and the lease's `teardown()` cancel unconditionally by contract (`SESS-OWN-005`,
+   `SESS-TEAR-001`) and are excepted; that no cancellation reaches a generation task in its
+   handler across the whole system follows from the vehicle's settlement order, which calls
+   `teardown_all` only after every handed-over generation task has ended.
+6. **Release hand-over.** `release` does not suspend before its cancellation-safe hand-over
+   coverage is in place, so a cancellation delivered at any suspension after the call has started
+   hands the session over to the factory's cleanup. `SESS-REL-003` covers a cancellation before the
+   retirement wait finishes; this obligation adds that no earlier suspension exists.
+7. **Closed means inert.** The factory starts no task after `teardown_all`.
+
+The suite checks each obligation, and includes these tests:
+
+- an ordinary capacity refusal (`open` raises `SessionRefused`) and an ordinary generation failure
+  (seen by the owner as a lease reason) leave `drain`'s fault list empty;
+- a generation task whose cancellation handler raises while it awaits the engine abort, after its
+  session was handed over, yields exactly one fault, returned by a later `drain` after the cleanup
+  task has ended and dropped the session, and by no later `drain`;
+- a generation task whose cancellation handler raises while an uncancelled `abort` awaits it: the
+  `abort` returns normally, and exactly one fault is returned by a later `drain` and by no later
+  `drain`;
+- a cancelled `open`, which requests cancellation twice with no suspension between the requests,
+  and a cancelled `open` whose generation task never started;
+- the release hand-over is tested through the frontend's own cancellation mechanism (Cleanup
+  order), run against the real factory and the fake: the owner runs `release` as a
+  task, lets it reach its first suspension, cancels it and awaits it, and the session is then with
+  the factory's cleanup. A fake instrumented to cancel at its own retirement wait would not test
+  obligation 6.
+
+A factory that fails these cannot be settled without cancelling a generation task while it awaits
+the engine client's abort, or without losing or repeating a task's fault.
+
+Obligations 3 and 4 need a change to the model plugin's code: its done-callback retrieves a
+generation task's exception without recording it, its recorded faults are the retirement-wait
+failures alone, and its cleanup drops the session when it ends. The others are true of its code
+today and owe only statements in its specification (vehicle leaf, Dependencies).
 
 ## The stream owner
 
@@ -107,7 +192,7 @@ states are:
 | State | Entered when | Meaning |
 | --- | --- | --- |
 | `awaiting_configuration` | registration | only the first message may be read |
-| `configured` | `open` returned a lease after complete validation | the lease exists; the transport is now consumed |
+| `configured` | `open` returned a lease after complete validation | the lease exists; the transport is consumed |
 | `streaming` | first message after configuration | audio is accepted |
 | `finalizing` | finalization accepted: client half-close or `done`, or shutdown finalization | no more audio, updates or finals accepted; later traffic is `session_terminal` |
 | terminal | cleanup done | the owner unregisters |
@@ -178,7 +263,7 @@ all surfaces:
 If `flush` fails, or cancellation, a deadline, a disconnect, an idle timeout or an abort during
 shutdown wins before normal completion, the owner uses only the calls the lease's state allows: an
 open or failed lease takes `abort`, then `release`, and never `finish`; a lease that has already
-been flushed is never aborted (the flushed state allows only `finish`, `release` and `teardown`),
+been flushed is never aborted (the flushed state allows only `finish` and `release`),
 and its cleanup goes to `release`. `finish` and `abort` are mutually exclusive, and `release` never
 precedes the selected terminal cleanup.
 
@@ -234,7 +319,8 @@ serialized with its other work:
    held expires, or the drain deadline arrives first, the cause becomes an abort during shutdown:
    an open or broken lease takes `abort` then `release`; a lease already flushed takes `release`
    only. The stream ends with the failure of the errors leaf's phase table (`UNAVAILABLE`;
-   WebSocket close 1012).
+   WebSocket close 1012). Once the drain deadline has passed, these cleanup calls run under
+   `session_cleanup_timeout` (Cleanup order, below), not under the time remaining to it.
 
 **Cause classification.** The owner selects provisional shutdown mode at the instant it observes
 the trigger, before it settles an outstanding call, unless a client-selected finalization is
@@ -286,10 +372,10 @@ After selecting an abnormal cause (a transport cancellation, disconnect, deadlin
 validation, input or engine cause), the owner cancels and awaits bounded settlement of its current
 `open`, `feed`, `update_locale`, `flush` or `finish`, and only then runs terminal cleanup, shielded
 from further cancellation. Shutdown finalization is the one exception: it settles the current call
-(awaits it under its own deadline, the wait clipped to the drain deadline) instead of cancelling it, because its purpose is a
-complete final; if the call fails or the deadline arrives, the cause becomes an abort during
-shutdown and the abnormal rule applies. Two lease calls never overlap, and every lease call is
-serialized by the owner.
+(awaits it under its own deadline, the wait clipped to the drain deadline) instead of cancelling it,
+because its purpose is a complete final; if the call fails or the deadline arrives, the cause
+becomes an abort during shutdown and the abnormal rule applies. Two lease calls never overlap, and
+every lease call is serialized by the owner.
 
 ### Cleanup order
 
@@ -300,22 +386,49 @@ serialized by the owner.
 | Any other cause, lease `flushed` | `release` only: a flushed lease does not accept `abort` |
 | Cause selected while `open` is pending | cancel `open`; no lease call (the factory owns the cancelled `open`) |
 | `finish` fails or is cancelled after a successful `flush` | `release` only: the stream already ended normally at `flush`, and a flushed lease does not accept `abort` |
-| `stop` (torn-down plugin) | the lease's synchronous `teardown()` only |
+| cleanup bound expires, before or after the drain deadline | an outstanding `release` is cancelled; an outstanding `abort` is cancelled and its settlement awaited, then `release` begins and is cancelled. The owner runs `release` as a task, lets it reach its first suspension, never cancels it before its first step, and awaits the cancelled `release` before the owner or its continuation counts as ended. Either cancelled `release` is the hand-over to the factory's cleanup (`SESS-REL-003`, Factory obligation 6) |
+| `stop` (torn-down plugin) | the shutdown abort row, as in the drain settlement: the rows above by lease state, under `session_cleanup_timeout` |
 
 If `finish` settles successfully, the normal engine terminal stands and cleanup proceeds only to
 `release`; a transport failure arriving afterwards suppresses the wire final but does not turn the
 stream into an abort.
 
 Terminal cleanup runs under one finite positive `session_cleanup_timeout`, shared by its calls; while
-the plugin is draining, the bound is instead the time remaining to the drain deadline. The owner
-always reaches `release`: if `abort` consumed the budget, the owner cancels `abort`, calls
-`release` and cancels it once it has begun, which hands the session to the factory
-(`SESS-REL-003`). The seam conformance suite verifies that a factory's lease accepts `release`
-after a cancelled `abort` and that the cancelled `release` leaves the session with the factory's
-cleanup. When the cleanup bound expires, the
-owner stops waiting and the factory's cleanup owns the session. This is not an escalation (vehicle
-leaf). A cleanup failure whose reason is `engine_dead` is an escalation; any other cleanup failure
-is recorded and never replaces the primary result.
+the plugin is draining and the drain deadline has not passed, the bound is instead the time
+remaining to the drain deadline. Cleanup that starts in the vehicle's settlement, after the drain
+deadline or when a drain fails or is cancelled, runs under `session_cleanup_timeout` from its
+start, because the time remaining to the deadline is then zero and would skip `abort` and
+`release`. The owner always reaches `release`, in and out of shutdown: if `abort` consumed the
+budget, the owner cancels `abort` and awaits that call's settlement, then starts `release` and
+cancels it, which hands the session to one tracked cleanup task of the factory (`SESS-REL-003`,
+`SESS-OWN-003`). The rule is stated in what the owner can observe. The owner runs `release` as a
+task and lets it run to its first suspension before any cancellation, whatever budget is left (the
+current mechanism yields one step of the event loop after creating the task,
+`src/vllm_riva_frontend/lease.py`, `_cleanup_call`). It never cancels a `release` before the call's
+first step: a call cancelled then never runs, so no cleanup task would own the session. Factory
+obligation 6 makes every suspension after the first step a safe point, so the owner needs no signal
+from the factory that a particular wait has been reached. The cleanup task is registered when the
+cancellation is delivered inside the call, so the owner awaits the cancelled `release` before it or
+its continuation counts as ended; the vehicle's factory settlement relies on every hand-over being
+registered by then. The conformance test for this runs the owner's own mechanism against the real
+factory and the fake (Factory obligations). A cancelled `abort` leaves the lease `aborted`, where
+`release` is allowed (`SESS-ABORT-002`). When the cleanup bound expires, the owner stops waiting and the
+factory's cleanup owns the session. This is not an escalation (vehicle leaf). A cleanup failure
+whose reason is `engine_dead` is an escalation; any other cleanup failure is recorded and never
+replaces the primary result.
+
+The hand-over is not by itself the shutdown guarantee. The factory's cleanup task has no deadline of
+its own, and a generation task cancelled by `abort` can still be running when the owner ends. The
+generation task's cancellation belongs to `abort` or to a cancelled `open`, and the task receives no
+cancellation after its cancellation handler has begun. In `drain`, `stop` and a rollback the vehicle
+settles in one order (vehicle leaf, Settlement): owner settlement, then the awaited continuations
+and unsettled sends, then the fault collector's end, then `factory.drain(math.inf)`, which awaits
+every handed-over cleanup task and, through it, the end of its generation task, then
+`teardown_all()` and an await of every task it returns, then one more `factory.drain(now)` for the
+faults of tasks that ended meanwhile. By then every returned task has ended, so `teardown_all`'s
+cancellation has no effect; a task still running is cancelled by it as a last resort and recorded
+by the vehicle as a fault. No engine-facing work of a session
+outlives `drain` or `stop`, whichever path its owner took.
 
 If a primary cancellation, deadline, validation, transport or engine error is selected, a later
 cleanup error is recorded without replacing the primary wire result. On an otherwise normal path, a
@@ -325,14 +438,14 @@ the resource was released; its code, status and close are in the errors leaf's p
 ### Disconnect
 
 A detected disconnect (WebSocket disconnect, TCP FIN or RST, gRPC stream cancellation) selects
-abnormal termination immediately. gRPC observes cancellation through the context's done callback
-at once, even during a lease call. A WebSocket disconnect during an outstanding call is observed
-when that call returns or its per-operation bound expires, whichever is first, because the adapter
-reads the transport only between calls, except for the receive observer of client-selected
-finalization (above), which observes it at once. Once observed: shielded, bounded `abort` and `release`. The session is never left
-to the engine's idle deadlines. An undetected half-open connection falls to the idle bound
-below, the only application-level mechanism available; transport keepalive may turn it into a detected
-drop sooner but is never the activity clock.
+abnormal termination immediately. gRPC observes cancellation through the context's done callback at
+once, even during a lease call. A WebSocket disconnect during an outstanding call is observed when
+that call returns or its per-operation bound expires, whichever is first, because the adapter reads
+the transport only between calls, except for the receive observer of client-selected finalization
+(above), which observes it at once. Once observed: shielded, bounded `abort` and `release`. The
+session is never left to the engine's idle deadlines. An undetected half-open connection falls to
+the idle bound below, the only application-level mechanism available; transport keepalive may turn
+it into a detected drop sooner but is never the activity clock.
 
 ## Bounds
 
@@ -346,7 +459,7 @@ Every lease call and every wait for client input runs under a finite frontend bo
 | `lease_call_timeout` | a `feed` or `update_locale` call starts | never | `service_unavailable` (retryable); the lease is broken (`abort`, `release`) |
 | `max_session_duration` (optional) | successful `open` | never | `request_timeout` |
 | `session_finalization_timeout` | finalization accepted | never | `finalization_timeout` |
-| `session_cleanup_timeout` | terminal cleanup begins, including the settlement of a cancelled call | never | hand-over to the factory (above); an unsettled call and the rest of cleanup stay under the record's continuation |
+| `session_cleanup_timeout` | terminal cleanup begins, including the settlement of a cancelled call | never | hand-over to the factory (above), an unsettled call and the rest of cleanup staying under the record's continuation, which the vehicle's settlement awaits before its factory settlement awaits the factory's cleanup through `drain(math.inf)` and then calls `teardown_all()` |
 | `response_send_timeout` | a send or close starts | never | transport failure: no further sends; cleanup as for a disconnect |
 
 "Accepted audio" is a `feed` call whose `on_accepted` fired, not socket bytes, keepalive or rejected
@@ -375,26 +488,33 @@ owner, is bounded by `response_send_timeout`, clipped to the gRPC deadline and t
 send already waiting re-clips its bound at once. A send whose bound has already passed when it is
 due does not start, and takes the transport-failure path, unless it carries a terminal status (a
 gRPC status or abort; a Realtime `error` event, or the `failed` event that ends the session, and its
-close). A terminal status gets one attempt
-that adds no wait: it starts, runs to its first suspension and is cancelled if it has not
-completed, so the shutdown and deadline rows of the errors leaf reach a client that is still
-reading. A send that has not completed when its bound passes has failed, even if it completes
-later. The handler cancels it and does not wait for it to settle: a send still unsettled after one
-turn of the event loop stays under the stream's record (or, for a refusal that created no record,
-under the registry) until it settles or `stop`, so cleanup starts at once and spends no second
-budget. Once the plugin is torn down, every send bound counts as passed. A send's failure, once
-established (its bound seen to pass, or a terminal attempt found incomplete), is final: a cancellation of the handler while it abandons the send changes nothing and
-no further send follows. A send that the plugin's own cancellation of the owner interrupts first (a
-drain within the engine reserve, or `stop`) is not a transport failure: the owner takes the
-shutdown abort row, whose terminal status is sent under its bound, or gets the one attempt once
-that bound has passed. A terminal status or close that this cancellation itself interrupts ends the
-stream with no further send. The stream's record stays registered until
-its handler, its cleanup continuation and every unsettled send have ended, so the drain and `stop` reach a terminal
-send. After a gRPC send fails, the handler ends without writing a status; the HTTP/2 stream stays
-open until the client cancels, its deadline passes, transport keepalive finds the peer dead or the
-server stops. The owner, its slot and its lease are already released by then.
-When several deadlines apply, the earliest absolute deadline wins (the errors leaf's precedence
-rule).
+close). A terminal status gets one attempt that adds no wait: it starts, runs to its first
+suspension and is cancelled if it has not completed, so the shutdown and deadline rows of the errors
+leaf reach a client that is still reading. A send that has not completed when its bound passes has
+failed, even if it completes later. The handler cancels it and does not wait for it to settle: a
+send still unsettled after one turn of the event loop stays under the stream's record until it
+settles or `stop`, so cleanup starts at once and spends no second budget. An admission refusal or
+a query refusal creates no record; its own request handler awaits the send inline under its
+bound, and if the send is still unsettled one turn of the event loop after the bound passed, the
+send moves, from that moment of abandonment, to the vehicle's registry as a send without an owner,
+which takes no ingress-cap count. The vehicle's settlement closes that registry before its final
+wait on unsettled sends; a refusal send abandoned after the close is cancelled and awaited by its
+own handler instead, so no refusal send outlives the settlement as detached work (vehicle leaf,
+Owner registry). The vehicle's settlement and `stop` await the sends under records and in the
+registry. Once the plugin is
+torn down, every send bound counts as passed. A send's failure, once established (its bound seen to
+pass, or a terminal attempt found incomplete), is final: a cancellation of the handler while it
+abandons the send changes nothing and no further send follows. A send that the plugin's own
+cancellation of the owner interrupts first (the vehicle's settlement of a drain, or `stop`) is not a
+transport failure: the owner takes the shutdown abort row, whose terminal status is sent under its
+bound, or gets the one attempt once that bound has passed. A terminal status or close that this
+cancellation itself interrupts ends the stream with no further send. The stream's record stays
+registered until its handler, its cleanup continuation and every unsettled send have ended, so the
+drain and `stop` reach a terminal send and await it. After a gRPC send fails, the handler ends
+without writing a status; the HTTP/2 stream stays open until the client cancels, its deadline
+passes, transport keepalive finds the peer dead or the server stops. The owner, its slot and its
+lease are already released by then. When several deadlines apply, the earliest absolute deadline
+wins (the errors leaf's precedence rule).
 
 ### Engine idle abort
 
@@ -409,10 +529,16 @@ first.
 
 Every stream owner and every file-request owner that passed the ingress cap registers exactly one
 owner task before reading its first message or request body, and keeps it tracked until its last
-cleanup step (vehicle leaf). A stream owner serializes every lease call and atomically selects
-exactly one terminal cause; normal finalization and abnormal termination never both execute `finish`
-and `abort`. The frontend starts no detached task. The factory owns every engine-facing task of
-its sessions, including the cleanup of a session whose owner is gone.
+cleanup step (vehicle leaf): for a stream, `release` or the hand-over of the session to the factory,
+in `stop` as in `drain`. The vehicle's settlement and `stop` await every owner and its continuation
+and then run the factory settlement (`factory.drain(math.inf)`, which awaits every handed-over
+cleanup task and its generation task without cancelling either, then `teardown_all()` and an await
+of every task it returns; vehicle leaf), so a hand-over to a continuation or to the factory never
+leaves engine-facing work running after `drain` or `stop` returns, and no generation task receives a
+cancellation after its cancellation handler has begun. A stream owner serializes every lease call
+and atomically selects exactly one terminal cause; normal finalization and abnormal termination
+never both execute `finish` and `abort`. The frontend starts no detached task. The factory owns
+every engine-facing task of its sessions, including the cleanup of a session whose owner is gone.
 
 ## Decisions & Alternatives
 
@@ -426,8 +552,10 @@ its sessions, including the cleanup of a session whose owner is gone.
 | Final transcript | Taken from `flush`'s string at one shared point | Per-surface accumulation of `feed` results | A transcript is final only after a normal close; one derivation point cannot diverge between surfaces |
 | Final delivery | Only after `finish` and `release` succeed | After `flush` | A wire terminal that precedes resource cleanup lets a client reconnect into a slot that is still held |
 | Cleanup after a flushed lease | `release` only | `abort` then `release` | A flushed lease rejects `abort`, and the stream has already ended at `flush`; `abort` would be a failure that hides the real outcome |
-| Cleanup budget | One bound for the whole cleanup, `release` always reached | A bound per call | A per-call bound lets a slow `abort` multiply the wait; reaching `release` with no budget hands the session to the factory, which cannot leak it |
+| Cleanup budget | One bound for the whole cleanup, `release` always reached | A bound per call | A per-call bound lets a slow `abort` multiply the wait; reaching `release` with no budget hands the session to the factory's tracked cleanup, which the vehicle's factory settlement awaits at shutdown |
 | Cleanup-bound expiry | Hand to the factory; no escalation | Escalate | The factory is the owner of an orphaned session and reports real faults (vehicle leaf) |
+| Cleanup in the drain settlement | `session_cleanup_timeout` from the start of cleanup; on expiry the same cancelled-`release` hand-over as outside shutdown; the vehicle's factory settlement then awaits the factory's cleanup with `drain(math.inf)` before `teardown_all()` | The time remaining to the drain deadline; the lease's `teardown()` on expiry | After the deadline the remaining time is zero, which would skip `abort` and `release`. `teardown()` cancels an already cancelled generation task again, which can interrupt the engine client's abort, and starts no factory task that `drain` would await; one expiry rule keeps the owner's sequence identical in and out of shutdown |
+| Cleanup in `stop` | The shutdown abort row, as in the drain settlement | The lease's `teardown()` only, after closing the factory | Core does not guarantee that the engine has stopped when `stop` runs, so a `teardown()` after `abort` could interrupt the engine client's abort; `abort` and `release` end the session the same way in every path |
 | Cancelled `open` | Left to the factory; owner calls nothing on a lease it never received | Owner aborts and releases a lease that arrives late | A late lease is the owner's only after `open` returns it; the factory's table already owns the session through the cancellation |
 | First-audio and idle bounds | One timer: first-audio duration until the first accepted audio, then the idle duration | Idle bound from `open` only | A client that never sends audio should be freed quickly, below the engine's never-fed deadline |
 | Idle timing during lease calls | Suspended; each call has its own bound, expiry `service_unavailable` | Keep the idle clock running; project call expiry as `idle_timeout` | Waiting on the engine is not client idleness; a slow engine call is the server's failure and the client may retry |
@@ -448,9 +576,12 @@ its sessions, including the cleanup of a session whose owner is gone.
 1. **Per-utterance finals.** The model plugin binds no endpoint policy and its lease reports no
    segment completions. A stream's one final at the end is the behaviour until both are designed
    together with the frontend; then multi-utterance reuse of a session is revisited.
-2. A cleanup that expires while its `abort` is cancelled mid-flight leaves the factory to retire the
-   session through the cancelled `release`. This cleanup order relies on the model plugin's
-   SESS-ABORT-002: a cancelled `abort` leaves the lease `aborted`, where `release` is allowed.
+2. Outside shutdown, a cleanup that expires while its `abort` is cancelled mid-flight leaves the
+   factory to retire the session through the cancelled `release`; the factory's cleanup task has
+   no deadline of its own, so a stuck engine call holds that session until shutdown, where the
+   factory settlement awaits it and core's repeated-signal exit bounds the wait. This cleanup
+   order relies on the model plugin's `SESS-ABORT-002`: a cancelled `abort` leaves the lease
+   `aborted`, where `release` is allowed.
 
 ## References
 

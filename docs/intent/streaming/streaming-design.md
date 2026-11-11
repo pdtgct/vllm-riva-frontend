@@ -10,7 +10,7 @@ facets: [GRPC, NIMWS, EOU]
 
 This leaf is the wire contract of the two live-stream surfaces and of the Riva gRPC service as a
 whole: the `RivaSpeechRecognition` servicer (`StreamingRecognize`, `Recognize`,
-`GetRivaSpeechRecognitionConfig`) and the Riva Realtime WebSocket (dispatcher, session bootstrap,
+`GetRivaSpeechRecognitionConfig`) and the Riva Realtime WebSocket (its route, session bootstrap,
 events). `Recognize` is described here as a gRPC wire contract (message handling, limits, header
 inference); its execution path is in the files leaf. How a stream is driven (owner, terminal cause,
 bounds) is the session leaf; the error catalog and its projections are the errors leaf; decode is
@@ -70,12 +70,13 @@ Response messages are `StreamingRecognizeResponse` with one result holding one a
 `transcript` is the cumulative hypothesis. A changed cumulative hypothesis returned by `feed` is
 sent with `is_final=false` when `interim_results` is true. Client half-close maps to `flush`
 (session leaf) and yields exactly one result with `is_final=true`, after `finish` and `release`
-succeed and before the server closes the stream. The same final, then gRPC `OK`, is what a
-shutdown finalization produces at drain (vehicle and session leaves). The final result also carries `audio_processed`: the seconds of 16 kHz audio handed to `feed`,
-the resampler tail drained at finalization included, all of which the model has processed once `flush` returns. The frontend emits no other
-field (no word offsets, stability, channel tag or confidence), and no `audio_processed` on an interim
-result. When cancellation, a deadline or an abort during shutdown wins before
-the final, the servicer emits no fabricated final response; a cleanup failure never replaces the
+succeed and before the server closes the stream. The same final, then gRPC `OK`, is what a shutdown
+finalization produces at drain (vehicle and session leaves). The final result also carries
+`audio_processed`: the seconds of 16 kHz audio handed to `feed`, the resampler tail drained at
+finalization included, all of which the model has processed once `flush` returns. The frontend emits
+no other field (no word offsets, stability, channel tag or confidence), and no `audio_processed` on
+an interim result. When cancellation, a deadline or an abort during shutdown wins before the final,
+the servicer emits no fabricated final response; a cleanup failure never replaces the
 already-selected cancellation or deadline status, and on an otherwise normal path follows the
 session leaf's cleanup rules. Transcript text is the model's output relayed unchanged.
 
@@ -198,19 +199,32 @@ single `parameters["language_code"]` each entry carries:
 
 ## Riva Realtime WebSocket
 
-### Dispatcher
+### WebSocket route
 
-A pure-ASGI middleware, added by `attach_router` inside core's middleware (vehicle leaf), claims a
-connection only when the scope type is `websocket`, the path (after `root_path`) is exactly
-`/v1/realtime`, and strict percent and UTF-8 decoding of the query yields the multiset of pairs
-exactly `{("intent", "transcription")}`. Every other scope passes unchanged to core: a missing,
-blank, duplicate, unsupported or additional query, a malformed encoding, other paths, and every
-non-WebSocket scope. The dispatcher does not delete, reorder, replace or interpret core's routes or
-events. A claimed scope is served by the adapter below; core's route never sees it.
+`attach_router` registers a WebSocket route at `/plugins/riva/v1/realtime` (vehicle leaf). Core's
+`/v1/realtime` is a separate route that the frontend does not touch: a client that connects there
+gets core's own realtime dialect.
+
+The route serves a connection only when strict percent and UTF-8 decoding of its query string
+yields the multiset of pairs exactly `{("intent", "transcription")}`, the query the stock client
+sends. Any other query is refused: a missing or blank query, a duplicate, unsupported or additional
+pair, a different value, and a query whose percent encoding or UTF-8 is malformed. The refusal is
+the route handler's first step, before the ingress cap, and it closes the connection before
+accepting it (an ASGI `websocket.close` with code 1008 before `websocket.accept`), so the ASGI
+server rejects the handshake with HTTP 403. A refused connection is never accepted, so it reads no
+client message, sends no event, creates no owner or lease, takes no ingress-cap count and is not
+counted by core's WebSocket gauges, which count accepted connections. The close is a send bounded
+by `response_send_timeout` (session leaf). Authentication (vehicle leaf) runs before the route, so
+a handshake without a valid token is refused before accept whatever its query: with core's 401
+where the ASGI server offers the WebSocket denial-response extension, otherwise with HTTP 403
+(vehicle leaf, WebSocket refusal).
+
+A connection with the served query then meets the ingress cap (Refusal before configuration,
+below) and, when admitted, is served by the adapter below.
 
 ### Receive cap
 
-The dispatcher enforces `ws_receive_max_bytes` on each claimed connection by counting the bytes of
+The route enforces `ws_receive_max_bytes` on each connection it accepts by counting the bytes of
 every received message itself; it does not depend on a server setting. It requires
 `ws_receive_max_bytes` to be at least `ws_event_envelope_max_bytes` (startup check). Two sizes
 apply to a received message:
@@ -221,7 +235,7 @@ apply to a received message:
   decode, one `error` carrying `request_too_large`, then close 1009.
 
 A frame the server's own limit rejects first may produce the server's native close 1009 without
-the stable event; the dispatcher's caps hold whichever limit is lower. The bound on an
+the stable event; the route's caps hold whichever limit is lower. The bound on an
 `input_audio_buffer.append` is the envelope cap: an append above `ws_event_envelope_max_bytes` is
 refused as above (`request_too_large`, close 1009) before any decode, `feed` or allocation, so an
 append the adapter decodes carries at most the samples that the cap's base64 payload can encode.
@@ -231,25 +245,30 @@ separate bound on samples outstanding at `feed`.
 
 ### Bootstrap
 
-`POST /v1/realtime/transcription_sessions` returns the default transcription-session object shaped
-per the public NIM Realtime reference (the stock client posts `{}` and echoes the result back as its
-first update). It carries the served-model identity, `modalities: ["text"]`,
+`POST /plugins/riva/v1/realtime/transcription_sessions` returns the default transcription-session
+object shaped per the public NIM Realtime reference (the stock client posts `{}` and echoes the
+result back as its first update). It carries the served-model identity, `modalities: ["text"]`,
 `input_audio_format: "pcm16"`, `input_audio_params` of 16 kHz mono, `recognition_config` with
 `max_alternatives: 1`, disabled `speaker_diarization` and `word_boosting`, an empty
 `endpointing_config`, `client_secret: null`, and `input_audio_transcription.language` set to the
 factory's `default_locale`. When `default_locale` is `None`, the language is empty and the client
-must name one in its update. The route creates no owner and starts no timer.
+must name one in its update. The route creates no owner and starts no timer. The stock client
+builds this URL and the WebSocket URL by appending `/v1/...` to its `--server` argument, so it
+reaches both with `--server host:port/plugins/riva` (operations leaf).
 
 ### Refusal before configuration
 
-A claimed connection refused by the ingress cap or by a draining plugin is handled in this order:
+A connection with the served query that the ingress cap or a draining plugin (`state.draining`
+set, or admission closed) refuses is handled in this order:
 the adapter accepts the WebSocket, sends one `error` carrying the catalog code (`busy` with its
 `authority`, or `service_unavailable`), and closes (1013 for both; see the errors leaf). It sends no
-`conversation.created`, creates no owner or lease, and reads no client event.
+`conversation.created`, creates no owner or lease, and reads no client event. This refusal is
+distinct from the query refusal above: the connection is accepted so that the client receives the
+catalog code, while a refused query never opens a session dialect (errors leaf).
 
 ### Events
 
-On an admitted claimed connection the adapter sends `conversation.created` before processing client events.
+On an admitted connection the adapter sends `conversation.created` before processing client events.
 Client and server events map directly to the lease:
 
 | Event | Mapping |
@@ -343,7 +362,7 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | Configuration listing shape | One entry per type and locale, types `online` and `offline`, singular `language_code` | One entry per type listing every locale in `language_codes`; type `streaming` | The stock scripts select `online` or `offline` entries and group them by the singular `language_code`; the online filter excludes `streaming`, and a plural `language_codes` leaves the grouping key empty |
 | `verbatim_transcripts`, punctuation | Accepted under either value, documented | Reject the non-default | The canonical tools send a value by default; rejecting a default breaks the stock client |
 | `Recognize` request-level rider | `runtime_config` rejected on streaming requests | Ignore | Riders are request-level options; the honest subset covers them |
-| Receive cap | The dispatcher counts bytes and closes 1009 | Read the ASGI server's limit and fail if smaller; set the server limit | A plugin cannot set the ASGI server's frame limit and the server does not expose it uniformly; counting makes the cap independent of server settings. The server's own limit still bounds what arrives before the count |
+| Receive cap | The route counts bytes and closes 1009 | Read the ASGI server's limit and fail if smaller; set the server limit | A plugin cannot set the ASGI server's frame limit and the server does not expose it uniformly; counting makes the cap independent of server settings. The server's own limit still bounds what arrives before the count |
 | WebSocket `none` format | Deferred-header mode, outside the honoured enum | Honour as an OpenAI enum value | It is a client-specific declaration; keeping it separate keeps the OpenAI enum exact |
 | Incremental deltas | True suffix, one terminal `completed` | Cumulative deltas and interim completions | Deltas carry new text only, so a client concatenating them gets the transcript; one terminal event matches the stock client's `is_last_result` handling |
 | `clear` and resampler state | Discard all audio not yet handed to `feed` and reset the resampler to its initial state | Continuity across `clear` (keep FIR history and delayed samples) | `clear` means discard what is buffered; delayed samples surviving it would reach the engine after the client asked to discard them |
@@ -352,8 +371,9 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | `commit` | Advisory | Force a step | Cadence is the model's; a sub-cadence step would break equivalence with files |
 | Large legal messages | Split into feeds of at most the pre-submit bound, reads paused while feeding | Reject a message above the bound with `buffer_overflow` | A client may legally send a large message; rejecting it would turn framing choices into errors; `buffer_overflow` stays reserved at this layer |
 | RIFF `data` length | 0 and `0xFFFFFFFF` mean to end of stream; an explicit length truncates; later chunks ignored | Trust the declared length; reject unknown length | Writers that stream a WAV cannot know the length; a declared length is a promise about the file |
-| Refusal on WebSocket | Accept, `error`, close 1013, no `conversation.created` | Deny the upgrade; send `conversation.created` first | The client must receive the catalog code, and a session that was never admitted should not be announced |
-| Malformed `intent` queries | Passed to core | Deny with 1008 | The dispatcher claims one exact shape and leaves everything else to core |
+| Admission refusal | Accept, `error`, close 1013, no `conversation.created` | Deny the upgrade; send `conversation.created` first | The client must receive the catalog code, and a session that was never admitted should not be announced |
+| Realtime path | A WebSocket route at `/plugins/riva/v1/realtime` | A dispatcher middleware claiming `/v1/realtime?intent=transcription` ahead of core's route | Core's `/v1/realtime` would behave differently depending on which plugins are loaded; the namespace leaves core's route untouched and the stock client reaches it through `--server` |
+| Any query other than exactly `intent=transcription` | Refused before accept: close before `websocket.accept`, which the ASGI server answers with HTTP 403; no owner or lease | Accept, send `error`, close 1008; an HTTP denial response carrying a catalog body; pass to core's route | No session dialect is open, so there is no event to carry a code, and accepting would count a connection that is never served; a denial body needs the ASGI WebSocket denial-response extension, which not every server offers (the authentication refusal uses it only where present; vehicle leaf), and the stock client does not read a refused handshake's body; a different route is not the client's request |
 | Bootstrap default locale | The factory's `default_locale` | Always `auto` | The default is the model's to define |
 | End-of-utterance | Deferred with the model plugin | Frontend-side segmentation | Segmentation needs the per-unit mask and decoder reset that only the model plugin has |
 | `audio_processed` and `confidence` | `audio_processed` on the final result only; `confidence` unset | `audio_processed` on interims as the audio fed so far; a confidence derived from the transcript | The proto defines `audio_processed` as the audio processed so far: the frontend knows what it fed, and the model has processed all of it only after `flush`, so an interim value would overstate it; an interim therefore reads 0.0, which the proto, unlike for `confidence`, does not define as unset. The proto makes 0.0 the sentinel for an unset `confidence`, and the session interface returns text only |
@@ -379,4 +399,5 @@ never by golden parity, since the NeMo reference model has no endpointing.
 - Public Speech NIM Realtime and ASR documentation.
 - Model plugin: `pdtgct/vllm-nemotron-asr-streaming-plugin` (`docs/intent/session/`).
 - Session leaf (owner, bounds, finalization), audio leaf (decode), errors leaf (catalog), files
-  leaf (`Recognize` execution), vehicle leaf (listener, dispatcher placement).
+  leaf (`Recognize` execution), vehicle leaf (listener, namespace and authentication), operations
+  leaf (stock-client `--server`).

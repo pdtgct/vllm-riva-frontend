@@ -114,11 +114,12 @@ Core's authentication middleware checks `--api-key` only on its own prefixes (`/
 `/inference`, `/cohere`). The path-scoped middleware applies the same keys, through core's own
 token check, to every HTTP and WebSocket request under `/plugins/riva/` (after `root_path`), with
 core's exemption for `OPTIONS`. Core registers its authentication after the plugin hooks, so
-`init_state` resolves the tokens from core's installed middleware and fails startup when the two
-signals disagree: a key is configured but core's authentication is not installed, or it is
-installed but its tokens cannot be read. The class, its `tokens` argument and `verify_token` are
-core internals outside RFC 2's supported surface; the frontend pins them with tests. The gRPC
-listener is outside `--api-key`, as before. The stock Realtime client sends no `Authorization`
+`init_state` resolves the tokens from core's installed middleware. Authentication is off only when
+no key is configured and core's authentication middleware is not installed; it is on only when a
+key is configured and exactly one readable registration of that middleware exists, whose tokens it
+uses; every other combination fails startup. The class, its `tokens` argument and
+`verify_token` are core internals outside RFC 2's supported surface; the frontend pins them with
+tests. The gRPC listener is outside `--api-key`. The stock Realtime client sends no `Authorization`
 header, so under `--api-key` it needs an intermediary that adds one.
 
 | Component | Role |
@@ -148,7 +149,7 @@ owners from the moment core sets it, before or without a `drain` call.
   the frontend's only engine-capability check.
 - **Protocol** (as published by the model plugin's session design): the factory exposes
   `served_cadences`, `locales`, `default_locale` (possibly `None`), `open(cadence, locale)`,
-  `drain(deadline) -> list` of cleanup faults (absolute `time.monotonic()` deadline) and
+  `drain(deadline) -> list` of retained task faults (absolute `time.monotonic()` deadline) and
   `teardown_all() -> set` of tasks; a lease exposes `feed`, `update_locale` (returns `None`), `flush`
   (returns the final transcript), `finish`, `abort`, `release` and synchronous `teardown`.
 - **Cadence and locale.** Streaming surfaces open at `560ms`; `init_state` fails if the factory does
@@ -177,8 +178,11 @@ owners from the moment core sets it, before or without a `drain` call.
   lease call is outstanding, so the engine can still end a stream first. During `drain`,
   every bound on graceful work is the remaining time to one absolute deadline. Cleanup calls that
   run after the deadline (an owner's `abort` and `release`) run under the frontend's own cleanup
-  bound instead; when one of them expires, the owner tears its lease down synchronously and the
-  factory's cleanup of that session is awaited with the rest of the settlement.
+  bound instead; when that bound expires, the owner cancels the outstanding call and hands the
+  session to the factory's cleanup through a cancelled `release`. The settlement then awaits the
+  factory's cleanup with `factory.drain(math.inf)`, so each handed-over generation task completes
+  its cancellation, including the engine client's abort of its request, and only then closes the
+  factory with `teardown_all()` and awaits every task it returns.
 - **`drain(state, timeout)`.** Health `NOT_SERVING`; close admission; let owners finish until a
   settle point; then each remaining stream's owner finalizes it (the client gets its final after
   release) or, if that cannot finish, cleans it up as the session design prescribes (abort an open
@@ -188,37 +192,60 @@ owners from the moment core sets it, before or without a `drain` call.
   engine allowance, and settlement (below) takes precedence over that target.
 - **Settlement.** RFC 2 requires a plugin to settle or abort, and await, all work it owns before
   `drain` returns, raises or is cancelled, and `stop` to settle any background work. So when the
-  deadline passes, or `drain` fails or is cancelled, the frontend aborts every remaining owner
-  (cancelling its task, which aborts an open lease and releases it) and awaits every owner, every
-  task it handed cleanup to, the fault collector (which calls the factory) and the factory's
-  cleanup before `drain` ends, so no frontend task can submit engine work while core shuts the
-  engine down. The deadline bounds the
-  graceful work; the abort-and-await after it is cooperative and has no fixed time limit, as in
-  core, whose repeated-signal exit bounds a hang.
+  deadline passes, or `drain` fails or is cancelled, the frontend settles in one order: owner
+  settlement (cancelling each remaining owner's task, which aborts an open lease and releases it);
+  an await of every owner, every cleanup continuation and every unsettled send, with the registry of
+  unsettled sends closed first, so a refusal send that fails its bound afterwards is cancelled and
+  awaited by its own handler; the end of the fault collector (which calls the factory);
+  `factory.drain(math.inf)`, which awaits every handed-over factory cleanup task and, through it,
+  the end of its generation task, and returns the faults the factory retains, even for a task whose
+  session is gone; `teardown_all()` and an await of every task it returns, all of which have then
+  ended; one more `factory.drain(now)`; and fault reporting. The factory is the sole reporter of its
+  tasks' faults, each exactly once through `drain`; the frontend originates only a fault for a task
+  `teardown_all` finds still running, which it cancels as a last resort. A generation task is
+  cancelled by `abort` or a cancelled `open` and receives no cancellation after its cancellation
+  handler has begun, so the engine client's abort of its request is never interrupted. No frontend
+  or factory task can then submit engine work while core shuts the engine down. The deadline bounds
+  the graceful work; the settlement after it is cooperative and has no fixed time limit, as in core,
+  whose repeated-signal exit bounds a hang.
 - **Startup rollback.** Core calls `stop` only for a plugin whose `start` completed. When
-  `init_state` or `start` fails after the factory or a task exists, the frontend tears the factory
-  down, cancels what it started, and awaits those tasks before re-raising.
-- **`stop(state)`.** Terminal: mark torn down, `factory.teardown_all()`, cancel owners and the
-  frontend's own tasks, stop the listener, then await every cancelled task and every task
-  `teardown_all` returns until each has ended; it starts no engine work of its own and has no fixed
-  time limit.
-- **Faults.** A frontend task collects factory cleanup faults while serving (calling the factory's
-  `drain` with an immediate deadline, serialized with the shutdown `drain`), and a listener monitor
-  watches the gRPC server. An `engine_dead` failure from any call, a collected fault, or an
+  `init_state` or `start` fails after the factory or a task exists, the frontend cancels and awaits
+  the tasks it started, then settles the factory in the same order (`factory.drain(math.inf)`, then
+  `teardown_all()` and an await of what it returns) before re-raising.
+- **`stop(state)`.** Terminal: mark torn down and run the same settlement as `drain`, because core
+  does not guarantee a stopped engine when `stop` runs; because only the factory reports task
+  faults, nothing a `drain` settlement reported is reported again. It starts no engine work of its
+  own beyond its owners' `abort` and `release`, and has no fixed time limit. With core's default
+  zero shutdown budget, core stops the engine before `stop`, so `stop` completes only if `abort`,
+  `release` and the retirement wait end on a stopped engine. A test in the model plugin repository's
+  conformance suite, on the RFC 1 + RFC 2 build with a real engine client (its GPU lane),
+  establishes that they do; the frontend's RFC 2-only CPU lane covers the same order with a fake
+  factory. A hang there is bounded only by a repeated signal or the orchestrator's kill grace.
+- **Faults.** A frontend task collects the factory's retained faults while serving (calling the
+  factory's `drain` with an immediate deadline, serialized with the shutdown `drain`), and a
+  listener monitor watches the gRPC server. The factory retains exactly the faults no caller can
+  still see, each an exception other than a cancellation: a cleanup task's failed retirement wait,
+  a generation task's exception that no `open` or lease call surfaced (the task ended after its
+  session was handed over to a cleanup or holding task, or failed while an uncancelled `abort`
+  awaited it), and an exception of a cleanup or holding task itself. A task cancelled as a last
+  resort at shutdown is reported by the frontend alone. A refusal or failure surfaced to its caller
+  is not retained and therefore causes no collector-driven escalation; `engine_dead` remains a
+  direct escalation trigger. An `engine_dead` failure from any call, a collected fault, or an
   unexpected listener exit withdraws readiness and calls `state.request_shutdown()` (an orderly
-  restart, not a latch). `drain` ends the collector, and `stop` cancels and awaits the monitor and
-  anything still running. `ready` reads attributes only, including `state.draining`, so it reports
-  not ready from the moment core begins draining.
+  restart, not a latch). `drain` and `stop` signal the collector to end (it is never cancelled, so
+  a call in progress is not lost), and `stop` cancels and awaits the listener monitor. `ready`
+  reads attributes only, including `state.draining`, so it reports not ready from the moment core
+  begins draining.
 
 ### Complete files
 
 - **One gate.** A counting gate of `max_concurrent_files` covers `Recognize` and the frontend's HTTP
   route. It caps the frontend's files in flight; it does not reserve capacity for streams (a
-  finished file's slot is held until it retires), and files sent to core's own route are outside
-  it and outside the capacity check below. `init_state` fails unless the cap is below both the
-  state-slot count and the engine's active-request limit; when that capacity is below 2 and no cap is configured, files are
-  disabled with a warning instead (`Recognize` answers `UNIMPLEMENTED`, no `offline` listing, and
-  the frontend's route refuses with 501).
+  finished file's slot is held until it retires), and files sent to core's own route are outside it
+  and outside the capacity check below. `init_state` fails unless the cap is below both the
+  state-slot count and the engine's active-request limit; when that capacity is below 2 and no cap
+  is configured, files are disabled with a warning instead (`Recognize` answers `UNIMPLEMENTED`, no
+  `offline` listing, and the frontend's route refuses with 501).
 - **Guard.** The frontend's route and `Recognize` refuse beam search, completion limits and the
   other fields of the files leaf before taking a gate permit. The model's own refusal of beam search
   and completion limits depends on a pending core change, and the frontend's guard does not depend
@@ -250,7 +277,8 @@ owners from the moment core sets it, before or without a `drain` call.
   translation route); without the task, `Recognize` answers
   `UNIMPLEMENTED`. `GetRivaSpeechRecognitionConfig` lists the model once per served locale with
   `type=online` and, when complete files are served, again per locale with `type=offline`; each
-  entry names its `language_code` and the encodings and rates it accepts. Unsupported request features are refused explicitly, never ignored.
+  entry names its `language_code` and the encodings and rates it accepts. Unsupported request
+  features are refused explicitly, never ignored.
 
 ## Constraints
 
@@ -260,8 +288,15 @@ owners from the moment core sets it, before or without a `drain` call.
   CPU tests run against an RFC 2 build without RFC 1; one check, which pins the frontend's copy of
   the engine's stream-deadline defaults against core, runs in the RFC 1 + RFC 2 build. Serving the
   model needs both. Besides the plugin API, the frontend uses core's transcription service and
-  authentication middleware, which are not stable contracts; it pins both with tests. The engine-client protocol does not declare the
-  stream-admission calls; the model plugin's factory checks for them.
+  authentication middleware, which are not stable contracts; it pins both with tests. The
+  engine-client protocol does not declare the stream-admission calls; the model plugin's factory
+  checks for them.
+- **Model-plugin change for fault retention.** The session factory's obligations (session leaf)
+  include retaining the faults no caller can see and reporting each exactly once through `drain`;
+  the model plugin's factory does not yet do this and needs a code change. Its other obligations
+  are true of its code and owe only specification statements. Until the change lands, settlement
+  still ends and awaits every task, but an exception a generation task raises after its session
+  was handed over may go unreported.
 - **Plugins.** `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming` (core loads no endpoint plugin
   when the variable is unset), one API server process (the frontend's `init_state` refuses to
   start when the server runs more than one API server process, since every process would bind the
@@ -274,7 +309,8 @@ owners from the moment core sets it, before or without a `drain` call.
   startup a generation-config token limit or foreign EOS and applies no input-length limit of its
   own, so `--max-model-len` must cover the longest file either frontend file surface admits
   (vehicle leaf, Deployment). The
-  frontend's guard covers the per-request limits only. A file's host buffer is freed when the engine reports the request finished, for any reason.
+  frontend's guard covers the per-request limits only. A file's host buffer is freed when the
+  engine reports the request finished, for any reason.
 - **Completeness.** A stream's transcript is final only after a normal close. For complete files,
   core's serving returns text for an `error` or `abort` ending, and for a `length` ending at the
   server's `--max-model-len`; an independent core fix will make those failures. Until it lands that
@@ -298,12 +334,12 @@ module. Every spec ID cited in this repository resolves here or in the model plu
 | --- | --- | --- |
 | Integration vehicle | RFC 2 endpoint plugin | vLLM-Omni application plugin: the target is vLLM core; a fork-only seam has no upstream path |
 | HTTP and WebSocket paths | Namespaced under `/plugins/riva/v1/`, as vLLM's security guide recommends for endpoint plugins; core's routes untouched | A dispatcher middleware claiming `/v1/realtime?intent=transcription` and an override of core's `POST /v1/audio/transcriptions`: the frontend would change core's own surfaces, and core's routes would depend on which plugins are loaded |
-| `--api-key` on the namespace | A path-scoped middleware from `attach_router` that takes core's configured tokens and calls core's token check; startup fails when a key is configured but core's authentication cannot be found | Rely on core: its check covers only `/v1`, `/v2`, `/inference` and `/cohere`, so the namespace would be unauthenticated; a copy of the token check: two implementations of a security check; a FastAPI dependency on each route: covers only routes that declare it, not unknown paths under the prefix, and needs separate WebSocket handling; a change to core's prefixes: outside RFC 1 and RFC 2 |
-| Shutdown settlement | Graceful work within the deadline, then abort and await every owned task before `drain` ends; `stop` awaits what it cancels | Return at the deadline with work still cancelling; a fixed wait in `stop`: RFC 2 requires owned work to be settled so that it cannot submit engine requests after the hook returns |
+| `--api-key` on the namespace | A path-scoped middleware from `attach_router` that takes core's configured tokens and calls core's token check; off only with no key configured and no core authentication installed, on only with a configured key and exactly one readable registration, and startup fails otherwise | Rely on core: its check covers only `/v1`, `/v2`, `/inference` and `/cohere`, so the namespace would be unauthenticated; a copy of the token check: two implementations of a security check; a FastAPI dependency on each route: covers only routes that declare it, not unknown paths under the prefix, and needs separate WebSocket handling; a change to core's prefixes: outside RFC 1 and RFC 2 |
+| Shutdown settlement | Graceful work within the deadline, then abort and await every owned task before `drain` ends, awaiting the factory's cleanup before closing it so no generation task is cancelled while it awaits the engine client's abort; `stop` settles in the same order | Return at the deadline with work still cancelling; a fixed wait in `stop`: RFC 2 requires owned work to be settled so that it cannot submit engine requests after the hook returns. Closing the factory with `teardown_all()` before its cleanup has ended: it cancels a generation task again while that task awaits the engine client's abort, and can interrupt the abort |
 | Complete-file HTTP route | A namespaced route with in-memory parsing, gate and guard, calling core's service | Middleware that buffers and replays the body to core's route: core's form parser spools large uploads to disk and the body is parsed twice; no guard: the model's own refusal depends on a pending core change, and without it beam search and completion limits break the model's single-slot file path |
 | `Recognize` | Core's transcription service through the file gate | A stream at a long cadence: a second code path, and the model's file path exists for this |
 | Session seam | Entry-point discovery, structural protocol, error attributes read with `getattr` | Importing the model plugin: couples two packages that release separately |
-| Fault escalation | `request_shutdown()` on `engine_dead` or a collected cleanup fault | A failure latch: a state that outlives its cause |
+| Fault escalation | `request_shutdown()` on `engine_dead` or a collected retained fault | A failure latch: a state that outlives its cause |
 | NIM HTTP module | Its response handling is removed and core's service serves complete files; its bounded in-memory multipart parser and limits are kept for the file route | Keep the whole module beside core's route: two implementations of one capability |
 
 ## Success metrics

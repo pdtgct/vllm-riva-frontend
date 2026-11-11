@@ -8,13 +8,15 @@ facets: [FILE, HTTP]
 
 ## Context and Design Philosophy
 
-Complete-file transcription has two entry points on this server: the Riva `Recognize` RPC and
-`POST /v1/audio/transcriptions`. Both run on the same service, core's transcription serving
-(`OpenAIServingTranscription`), which sends a file to the model as one ordinary request. The model
-plugin makes that request walk the whole file through the streaming transition on its own state
-slot (`FILE-*` of the model plugin). This leaf is what the frontend adds in front of that service:
-the request guard, the in-flight file gate, locale transport, the bounded in-memory body handling
-for the HTTP route, and the `Recognize` adapter.
+Complete-file transcription has two frontend entry points on this server: the Riva `Recognize` RPC
+and the frontend's `POST /plugins/riva/v1/audio/transcriptions`. Both run on the same service,
+core's transcription serving (`OpenAIServingTranscription`), which sends a file to the model as one
+ordinary request. The model plugin makes that request walk the whole file through the streaming
+transition on its own state slot (`FILE-*` of the model plugin). This leaf is what the frontend adds
+in front of that service: the request guard, the in-flight file gate, locale transport, the bounded
+in-memory body handling for the HTTP route, and the `Recognize` adapter. Core's own
+`POST /v1/audio/transcriptions` runs on the same service and stays core's, outside this leaf's ingress
+cap, gate and guard.
 
 Principles:
 
@@ -38,32 +40,43 @@ that fail when core changes them, including: a client-supplied `X-Request-Id` do
 a file is one engine input (the model declares `max_audio_clip_s=None` and no explicit language
 detection, so core issues no chunk or language-detection requests with other IDs).
 
-## Capability and route replacement
+## Capability and route addition
 
 Complete files need the served model's `transcription` task. Core builds
 `state.openai_serving_transcription` and attaches `POST /v1/audio/transcriptions` only for such a
-model, so both the route and the state attribute are the capability signal:
+model, so both core's route and the state attribute are the capability signal:
 
-- `attach_router` replaces core's `POST /v1/audio/transcriptions` with the frontend's file route
-  when core's is present (RFC 2 route override), and replaces nothing when it is absent.
-  `/v1/audio/translations` stays core's; the model refuses translation. The frontend does not mount,
-  replace or shadow it.
+- `attach_router` adds the frontend's file route, `POST /plugins/riva/v1/audio/transcriptions`,
+  when core's `POST /v1/audio/transcriptions` is present, and adds no file route when it is
+  absent. It replaces nothing: core's route stays registered and unchanged. The frontend serves no
+  translation route; `/v1/audio/translations` stays core's (the model refuses translation), and
+  the frontend does not mount, replace or shadow it.
 - `init_state` finds the service at `state.openai_serving_transcription` and derives one **files
   enabled** flag: true when the service is present and the gate sizing allows files (below). That
   one flag decides `Recognize`'s capability and the `type=offline` listing (streaming leaf).
   Without the service, `Recognize` answers `UNIMPLEMENTED`, the file route does not exist (core
   attached none), and no `offline` entry is listed.
 - When the service is present but files are disabled by the tiny-deployment rule (below), the
-  frontend's route stays registered, because `attach_router` already replaced core's; it refuses
-  every request with `unsupported_capability`, projected as HTTP 501, as its first step (before the
-  ingress cap and before reading a body, creating no owner), and
-  `Recognize` answers `UNIMPLEMENTED`.
-- Without the frontend loaded, core's route is unguarded; that configuration is unsupported for
-  this model.
+  frontend's route stays registered, because `attach_router` runs before `init_state` sizes the
+  gate; it refuses every request with `unsupported_capability`, projected as HTTP 501, as its first
+  step (before the ingress cap and before reading a body, creating no owner), and `Recognize`
+  answers `UNIMPLEMENTED`. Core's own route keeps serving: the tiny-deployment rule governs the
+  frontend's file surfaces only.
+
+**Core's route.** Core's `POST /v1/audio/transcriptions` keeps core's behaviour whether or not the
+frontend is loaded. It is outside the frontend's ingress cap, file gate, guard and memory bound,
+and files sent there are outside the capacity relation below, so they can hold state slots and
+active-request capacity that the gate sizing leaves for streams. The model plugin refuses beam
+search and completion limits on that route once core passes those request fields to the model (a
+pending core change). That refusal closes only the beam-search and completion-limit gap: it puts
+none of core's traffic behind the frontend's ingress cap or file gate, so files sent there still
+compete with streams for slots. Operators therefore do not expose core's file route to untrusted
+clients, before and after that change; the deployment guide says so.
 
 ## One gate
 
-One counting gate of `max_concurrent_files` covers `Recognize` and the file route together.
+One counting gate of `max_concurrent_files` covers `Recognize` and the frontend's file route
+together; files sent to core's own route are outside it.
 
 - Waiters wait in the frontend, as owner tasks, not in core's queue. A wait is bounded by
   `file_gate_wait_timeout`; expiry answers `busy` with `authority: load_shed`.
@@ -77,7 +90,8 @@ One counting gate of `max_concurrent_files` covers `Recognize` and the file rout
   `capacity` or `active_limit` refusals remain possible under combined load.
 - `init_state` fails unless `max_concurrent_files` is below both the state-slot count and the
   engine's active-request limit (vehicle leaf, Capacity), so even a full gate leaves slots for
-  streams. That rule needs at least two of each, so smaller servers have files disabled instead (below).
+  streams, as far as the frontend's own files are concerned: traffic on core's route is not
+  counted. That rule needs at least two of each, so smaller servers have files disabled instead (below).
 - Gate waiters, body readers and executing files are file owners and count against the
   sub-cap `max_file_owners` inside the ingress cap (vehicle leaf), so a file backlog never refuses a
   stream. A file arriving at a full sub-cap answers `busy` (`authority: load_shed`).
@@ -85,19 +99,23 @@ One counting gate of `max_concurrent_files` covers `Recognize` and the file rout
   files are disabled at startup with a warning: the files-enabled flag is false (`Recognize`
   answers `UNIMPLEMENTED`, the route refuses with 501, no `offline` entry is listed). An explicitly configured size that fails the
   check fails startup.
-- Closing admission at drain refuses new waiters; waiters are owners and are cancelled with the
-  rest.
+- Closing admission at drain, or core setting `state.draining`, refuses new waiters; waiters are
+  owners and are cancelled with the rest.
 
 ## The request guard
 
-Before taking a permit, the file route and `Recognize` refuse any request that asks for something
-the model's single-slot file path cannot do:
+Before taking a permit, the frontend's file route and `Recognize` refuse any request that asks for
+something the model's single-slot file path cannot do. The model's own refusal of beam search and
+completion limits takes effect only on a core that passes those request fields to the model, a
+pending core change; the frontend's guard does not depend on it and applies on every core.
 
 - `use_beam_search` true. Core's beam path resubmits fresh request ids with `max_tokens=1`, which
   cannot keep one acoustic slot.
-- any completion limit: `max_completion_tokens` present. The model guarantees that a file ends with
-  its end token (not a `length` ending) by checking a worst-case budget against `max_model_len`
-  before submission, and that guarantee needs no smaller limit.
+- any completion limit: `max_completion_tokens` present. A limit ends the file with a `length`
+  finish before its end token, and core returns the partial text of such an ending as success
+  (HLD Completeness), so the client would get a truncated transcript reported as complete. The
+  model needs no limit of its own: `--max-model-len` is sized for the longest file the frontend
+  admits (vehicle leaf, Deployment).
 - any non-default value of a sampling field that core forwards into the engine's sampling
   parameters: `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`,
   `repetition_penalty`, `seed` and `watermarking`. A value equal to core's field default (for
@@ -120,10 +138,12 @@ model's generation settings, is the operator's configuration and is not inspecte
 greedy decode ignores them.
 
 **Accepted but ignored fields.** On the non-beam path core accepts some fields it never forwards
-to the engine: `n` and `length_penalty` (beam search only), `include_stop_str_in_output`, and the
-stream-option fields outside `stream=true`. They are dispositioned: an explicit `n` other than 1,
-`length_penalty` other than 1.0, and `include_stop_str_in_output` true are refused with 400
-`invalid_config_field` before a permit is taken; the same explicit-versus-default rule applies. Fields
+to the engine: `n` and `length_penalty` (beam search only) and `include_stop_str_in_output`. An
+explicit `n` other than 1, `length_penalty` other than 1.0, and `include_stop_str_in_output` true
+are refused with 400 `invalid_config_field` before a permit is taken; the same
+explicit-versus-default rule applies. The stream-option fields (`stream_include_usage`,
+`stream_continuous_usage_stats`) are not in this set: core's request validation rejects either one
+enabled without `stream=true`, so the frontend leaves them to core's validation. Fields
 the model itself refuses (`prompt`, `hotwords`, `to_language`) are not ignored: they pass to core
 and get its 400.
 
@@ -250,7 +270,8 @@ the outer generator, is never treated as ending the engine request.
 **Structured ownership.** The route does not rely on core's `with_cancellation` either: it spawns
 a handler task and a disconnect-listener task and cancels the pending one without awaiting it. The
 route's owner task owns the core call (a child task) and the disconnect watcher (a second child).
-The owner never cancels the core call (only `stop` does, below).
+Nothing in the frontend cancels the core call: it ends through the engine aborts below, in `drain`
+and `stop` alike.
 
 A file request passes four milestones: the permit; the return of core's service call, once core's
 preprocessing (decode and prompt construction) is done, which for `stream=true` returns an event
@@ -278,7 +299,9 @@ released. It then cancels the disconnect watcher and, for a returned event gener
 `aclose`. Aborting an ID the engine does not know is harmless. The cleanup deadline starts when the
 cause is selected and covers the abort retries, the final abort, the generator's close and the
 children's settlement: `session_cleanup_timeout`, or during drain the smaller of that and the time
-left to the drain deadline. The bound limits the wait, not the settlement, which can outlast it.
+left to the drain deadline; in the settlement after the drain deadline (vehicle leaf),
+`session_cleanup_timeout` again, from the moment the settlement cancels the owner. The bound limits
+the wait, not the settlement, which can outlast it.
 The same contract applies to `Recognize`, whose engine request ID is fixed by its synthetic request.
 
 **Cleanup continuation.** A file request's cleanup is a cleanup continuation registered in the owner
@@ -288,11 +311,13 @@ and the server-load count: accounting is never released while work it covers sti
 the owner runs the continuation to its end before it returns. When the cleanup bound expires first,
 the handler sends its response, if any, and transfers ownership of the remaining cleanup to the
 continuation; the record stays registered, with the permit, slot and count, until the continuation
-finishes, and `stop` cancels the continuation and the children it holds. A request cancelled at
-the drain's settle point is the exception: its handler answers `service_unavailable` at once and
-hands the whole cleanup to the continuation, so the client learns of the shutdown while the
-listener is still up. The stuck permit is
-visible rather than hidden. A disconnect before the permit is taken discards only multipart memory,
+finishes. `drain`'s settlement awaits every continuation before `drain` returns, raises or
+re-raises a cancellation, so no continuation can still abort or submit engine work once core shuts
+the engine down; `stop` runs the same settlement and awaits a continuation that remains, with the
+children it holds. A request cancelled at the drain's settle point is the exception: its handler
+answers `service_unavailable` at once and hands the whole cleanup to the continuation, so the
+client learns of the shutdown while the listener is still up. The stuck permit is visible rather
+than hidden. A disconnect before the permit is taken discards only multipart memory,
 with no abort. A cause selected after the service completed normally (the call returned for a
 complete response, the generator exhausted for `stream=true`), including a disconnect during the
 response send, suppresses the response only, with no abort.
@@ -373,12 +398,15 @@ counter, which reports HTTP load; only the route is counted.
 each separately: a returned `ErrorResponse` object, and an exception raised from the call (the
 model's `ValueError` from `get_generation_prompt`, decoder `ValueError`s such as an invalid file or
 an exceeded duration limit, and `VLLMValidationError`). The errors leaf's classification of raised
-exceptions is authoritative. A file that exceeds the model's token budget (the model's `ValueError`, which core returns as 400)
-projects `request_too_large` for `Recognize` (`RESOURCE_EXHAUSTED`); on the route the response stays
-core's own 400. The frontend identifies the refusal by the fixed prefix `file exceeds max_model_len: ` with which
-the model plugin begins that message (its FILE-BUD-003), pinned by tests on both sides. There is no startup relation between the duration
-cap and `max_model_len`: the budget depends on the model's emission bound, which the frontend cannot
-compute, so a file the frontend accepts can still be refused by the model.
+exceptions is authoritative.
+
+**Model length.** The model applies no input-length limit of its own and refuses no file for its
+length. A file whose tokens reach `--max-model-len` ends with a `length` finish; on a core without
+the pending change that turns such an ending into a failure, core returns the partial transcript
+as success, HTTP 200 on the route and a normal `RecognizeResponse` for `Recognize`. The frontend
+cannot compute a file's token count (it depends on the model's emission bound), so it adds no
+startup relation between its duration caps and `max_model_len`; the deployment guide sizes
+`--max-model-len` for the longest file either surface admits (vehicle leaf, Deployment).
 
 **Memory.** Request audio is held in bounded memory; no filesystem write, local spool or retained
 upload artifact is created on success, rejection, cancellation, disconnect, shutdown or failure.
@@ -416,7 +444,8 @@ A complete file's transcript equals the transcript of a factory session fed the 
 cadence core's file path uses, the deployment guide's `num_lookahead_tokens` (ING-EP-058); the factory
 accepts any served cadence, so the comparison opens its session at that cadence. It is not the
 output of the frontend's 560 ms streaming surface, which is a different lookahead arm unless the
-file path's cadence is also 560 ms (it is 1120 ms in the reference deployment). Under matched conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
+file path's cadence is also 560 ms (it is 1120 ms in the reference deployment). Under matched
+conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
 applied to the stream side too (audio leaf); the same cadence, locale, precision and endpointing
 setting (the model plugin's file design states the model's side). The frontend's contribution is
 that the decoded samples it hands to core are exactly the samples the stream side would hand to
@@ -432,10 +461,11 @@ failure.
 | Decision | Chosen | Alternatives Considered | Rationale |
 | --- | --- | --- | --- |
 | Complete files | Core's transcription service through one gate | A stream at a long cadence; a second algorithm | The model's file path exists for this; a second code path would drift from streams |
-| HTTP route | RFC 2 route override with in-memory parsing, gate and guard, calling core's service | Middleware that buffers and replays the body to core's route | Core's form parser spools large uploads to disk and the body would be parsed twice; middleware also cannot refuse before core reads the form |
+| HTTP route | A route of its own, `POST /plugins/riva/v1/audio/transcriptions`, added beside core's, with in-memory parsing, gate and guard, calling core's service | Override core's `POST /v1/audio/transcriptions`; middleware that buffers and replays the body to core's route | An override changes core's own surface, so core's route would behave differently depending on which plugins are loaded; core's form parser spools large uploads to disk and a replayed body would be parsed twice; middleware also cannot refuse before core reads the form |
+| Core's file route | Untouched, outside the frontend's ingress cap, gate and guard; operators do not expose it to untrusted clients, before and after the model's own refusal takes effect | Guard or gate it from the frontend | Guarding core's route means intercepting it, which the namespace decision rules out; its traffic is core's. The model plugin's refusal will cover beam search and completion limits once core passes the request fields, but files on that route still bypass the frontend's gate and compete with streams for slots |
 | File-route response | Core's OpenAI shape | A Speech NIM HTTP shape | The tenet: core's service satisfies the contract; a NIM HTTP response is a non-goal |
 | Parser | Bounded in-memory `MultipartParser` with the frontend's limits as configuration | Core's form parsing; fixed constants | Core's parser can spool; the limits are operator-visible bounds on frontend memory |
-| Request time | `http_body_read_timeout` for the read, `file_execution_timeout` (derived, generous) for core, `response_send_timeout` for each send | Only a read timeout; one total timeout | Every wait of an owner is bounded, so a stalled engine call or reader cannot hold a permit forever; separate bounds keep each generous for its own phase |
+| Request time | `http_body_read_timeout` for the read, `file_execution_timeout` (derived, generous) for core, `response_send_timeout` for each send | Only a read timeout; one total timeout | Every wait of an owner is bounded, so the owner stops waiting to deliver its response within those bounds even when an engine call or reader stalls; the bound ends the waiting, it does not guarantee that the client receives the response; separate bounds keep each generous for its own phase. The bounds limit response waiting, not resource retention: when the handler answers before its children settle, the cleanup continuation keeps the permit, file-owner slot and load count until cooperative settlement ends them, which a stuck engine call can delay without limit (vehicle leaf, `stop(state)`) |
 | Gate wait expiry | `busy` with `authority: load_shed` | `admission_wait_timeout` | The error catalog reserves that code for a bounded wait on an admission queue; the gate is local load control and clients retry it as `busy` |
 | Gate size | Below both the slot count and the active-request limit; files disabled (route stays registered, refuses with 501) when capacity is below 2 and no cap is configured | Equal to the limit | A full gate must leave slots for streams |
 | Ownership of the core call | The route's owner task owns the call and the disconnect watcher; it never cancels the call, aborts the engine ID repeatedly until the call returns, and holds accounting until then | Core's `with_cancellation`; cancelling the call child | The decorator does not await the cancelled child, and cancelling the await leaves core's executor-thread decode holding audio outside the frontend's accounting |
@@ -451,10 +481,10 @@ failure.
 | Request fields | Explicit allowlist; explicit non-default sampling refused; inherited values not inspected | Pass unknown fields to core; refuse inherited values | Extra fields would reach the model unvalidated; inherited values are operator configuration |
 | File owners | Counted in `max_file_owners` inside the ingress cap | A shared cap | A backlog of waiting files must not refuse streams |
 | Equivalence reference | A factory session at the cadence core's file path uses (the deployment guide's `num_lookahead_tokens`, ING-EP-058) | The 560 ms streaming surface | The file runs at that cadence and the factory serves any served cadence, so the comparison is exact |
-| Over-budget file | `request_too_large` for `Recognize`, no startup relation to `max_model_len` | `INVALID_ARGUMENT`; a startup check | The file is too large for the configured model length; the frontend cannot compute the model's budget |
+| Model length | No startup relation between the frontend's duration caps and `max_model_len`; the deployment guide sizes `--max-model-len` for the longest file either surface admits | A startup check; projecting a model refusal of an over-length file | The frontend cannot compute a file's token count, which needs the model's emission bound; the model refuses no file for its length, so there is no refusal to project |
 | `Recognize` accounting | Outside the server-load counter | Count it too | The counter reports HTTP load; the synthetic request exists only to fix the engine request ID |
 | Gate placement | In the frontend, before `generate` | Core's queue | A queued file counts against the active-request limit and refuses streams |
-| Guard | `use_beam_search`, completion limits, non-default sampling fields and foreign `vllm_xargs` keys refused with 400 | Ignore; pass through | Beam search cannot keep one slot; a completion limit invalidates the model's budget guarantee; client extras would reach the model |
+| Guard | `use_beam_search`, completion limits, non-default sampling fields and foreign `vllm_xargs` keys refused with 400 on the frontend's surfaces, independently of the model's own refusal | Ignore; pass through; rely on the model's refusal | Beam search cannot keep one slot; a completion limit ends a file early and core reports the truncated text as success; client extras would reach the model; the model's refusal depends on a pending core change |
 | Locale on `Recognize` | `language_code` is the locale; exact in `vllm_xargs`; `language` set only for a supported language | Pass `language` and let the model map it | A Riva client that names a locale must get that locale; a guessed region changes transcripts silently |
 | Locale on the route | `language` forwarded unchanged; client `vllm_xargs` allowed with only `locale` | Exact-locale transport as for `Recognize` | OpenAI-style clients send languages, which the model maps; an explicit locale remains reachable through `locale` |
 | Upload limit | Core's `read_upload_with_limit` on the in-memory upload | A frontend limit | The same limit, message and status as core's route |
@@ -481,7 +511,8 @@ failure.
   `.../transcription/protocol.py`, `.../base/serving.py`, `.../base/utils.py`,
   `vllm/entrypoints/serve/utils/api_utils.py`, `vllm/envs.py` on `pdtgct/vllm`
   (`endpoint-plugin-lifecycle` and `persistent-state-primitive-v2` merged).
-- RFC 2 route override and compatibility note: `docs/design/endpoint_plugins.md`.
+- RFC 2 endpoint plugins: `docs/design/endpoint_plugins.md`; namespaced plugin routes:
+  `docs/usage/security.md`.
 - Model plugin: `docs/intent/transcription/` (`FILE-*`), `docs/intent/registration/`.
 - `python-multipart` `MultipartParser`.
 - Vehicle leaf (capacity, ingress cap, configuration), session leaf (locale rule), streaming leaf
