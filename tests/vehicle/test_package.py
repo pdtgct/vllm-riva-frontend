@@ -94,7 +94,7 @@ def test_one_endpoint_plugin_entry_point_resolves_to_the_factory() -> None:
     }, "exactly one entry point, riva_frontend in vllm.endpoint_plugins"
 
 
-# @spec ING-EP-001, ING-EP-006
+# @spec ING-EP-001, ING-EP-062
 def test_entry_point_factory_takes_no_arguments_and_returns_the_plugin() -> (
     None
 ):
@@ -111,17 +111,22 @@ def test_entry_point_factory_takes_no_arguments_and_returns_the_plugin() -> (
     assert isinstance(instance, RivaFrontendPlugin)
 
 
-# @spec ING-EP-006
-def test_plugin_declares_name_tasks_and_non_http_listener() -> None:
+# @spec ING-EP-062
+def test_plugin_declares_name_and_required_tasks_only() -> None:
+    """No class declaration asks core for one API server process.
+
+    The one-process requirement is ``init_state``'s check (ING-EP-081);
+    RFC 2's endpoint-plugin protocol has no such declaration.
+    """
     from vllm_riva_frontend.lifecycle import RivaFrontendPlugin
 
     assert RivaFrontendPlugin.name == "riva_frontend"
     assert RivaFrontendPlugin.required_tasks == ("realtime",)
-    assert RivaFrontendPlugin.owns_non_http_listener is True
+    assert not hasattr(RivaFrontendPlugin, "owns_non_http_listener")
+    assert not hasattr(RivaFrontendPlugin(), "owns_non_http_listener")
 
 
-# @spec ING-EP-006
-@pytest.mark.engine
+# @spec ING-EP-062
 def test_plugin_satisfies_cores_endpoint_plugin_protocol() -> None:
     from vllm.plugins.endpoint_plugins.interface import EndpointPlugin
 
@@ -177,7 +182,6 @@ def test_no_dependency_on_vllm_or_the_model_plugin() -> None:
 
 
 # @spec ING-EP-001
-@pytest.mark.engine
 def test_core_tree_carries_no_riva_shaped_code() -> None:
     import vllm
 
@@ -203,7 +207,6 @@ def test_declared_range_is_vllms_requires_python() -> None:
 
 
 # @spec ING-VEH-027
-@pytest.mark.engine
 def test_declared_range_matches_the_pinned_core_tree() -> None:
     import vllm
 
@@ -1386,3 +1389,330 @@ def test_no_per_session_value_is_stored_on_the_shared_factory() -> None:
                     f"{name}:{node.lineno}: assigns onto the shared factory"
                 )
     assert not offenders, "\n".join(offenders)
+
+
+# ------------------------------------------------------- where vLLM is imported
+
+#: The lifecycle methods core calls on the plugin (ING-EP-108).
+LIFECYCLE_METHODS = frozenset(
+    {"attach_router", "init_state", "start", "ready", "drain", "stop"}
+)
+#: The class the lifecycle methods belong to.
+PLUGIN_CLASS = "RivaFrontendPlugin"
+#: The path-scoped authentication middleware: a class named for both.
+AUTH_MIDDLEWARE = re.compile(r"Auth\w*Middleware$")
+#: The complete-file path: the module of the frontend's file route and of
+#: ``Recognize``'s call to core's transcription service, and the
+#: ``Recognize`` servicer method itself.
+COMPLETE_FILE_MODULES = frozenset({"files.py"})
+COMPLETE_FILE_METHODS = frozenset({"Recognize"})
+_DYNAMIC_IMPORTS = frozenset({"import_module", "__import__"})
+
+
+def _is_vllm(module: str | None) -> bool:
+    return module is not None and (
+        module == "vllm" or module.startswith("vllm.")
+    )
+
+
+def _vllm_import(node: ast.AST) -> str | None:
+    """The vLLM module ``node`` imports, or ``None``.
+
+    Covers ``import vllm...``, ``from vllm... import ...`` and a call of
+    ``importlib.import_module`` or ``__import__`` with a literal name.
+    """
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if _is_vllm(alias.name):
+                return alias.name
+    elif isinstance(node, ast.ImportFrom):
+        if node.level == 0 and _is_vllm(node.module):
+            return node.module
+    elif isinstance(node, ast.Call):
+        func = node.func
+        name = (
+            func.attr
+            if isinstance(func, ast.Attribute)
+            else func.id
+            if isinstance(func, ast.Name)
+            else None
+        )
+        if (
+            name in _DYNAMIC_IMPORTS
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and _is_vllm(node.args[0].value)
+        ):
+            return node.args[0].value
+    return None
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _allowed_scope(module: str, scope: list[tuple[str, str]]) -> bool:
+    if module in COMPLETE_FILE_MODULES:
+        return True
+    for index, (kind, name) in enumerate(scope):
+        if kind == "class" and AUTH_MIDDLEWARE.search(name):
+            return True
+        if kind == "def" and name in COMPLETE_FILE_METHODS:
+            return True
+        if (
+            kind == "class"
+            and name == PLUGIN_CLASS
+            and index + 1 < len(scope)
+            and scope[index + 1][0] == "def"
+            and scope[index + 1][1] in LIFECYCLE_METHODS
+        ):
+            return True
+    return False
+
+
+def _misplaced_vllm_imports(module: str, tree: ast.Module) -> list[str]:
+    """Every vLLM import of ``tree`` outside the places ING-EP-108 allows.
+
+    An import under ``if TYPE_CHECKING:`` does not run and is not counted.
+    Each offender is ``module:line: imports X in <scope>``.
+    """
+    offenders: list[str] = []
+
+    def visit(node: ast.AST, scope: list[tuple[str, str]]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If) and _is_type_checking(child.test):
+                for other in child.orelse:
+                    visit_one(other, scope)
+                continue
+            visit_one(child, scope)
+
+    def visit_one(child: ast.AST, scope: list[tuple[str, str]]) -> None:
+        inner = scope
+        if isinstance(child, ast.ClassDef):
+            inner = [*scope, ("class", child.name)]
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inner = [*scope, ("def", child.name)]
+        imported = _vllm_import(child)
+        if imported is not None and not _allowed_scope(module, scope):
+            where = ".".join(name for _, name in scope) or "module level"
+            offenders.append(
+                f"{module}:{child.lineno}: imports {imported} in {where}"
+            )
+        visit(child, inner)
+
+    visit(tree, [])
+    return offenders
+
+
+# @spec ING-EP-108
+def test_vllm_is_imported_only_inside_lifecycle_auth_and_file_path() -> None:
+    """Imports of vLLM sit only where ING-EP-108 allows; report the rest.
+
+    The allowed places are the lifecycle methods, the authentication
+    middleware and the complete-file path.
+    """
+    offenders: list[str] = []
+    for name, tree in _trees().items():
+        offenders.extend(_misplaced_vllm_imports(name, tree))
+    assert not offenders, "\n".join(offenders)
+
+
+_IMPORT_LAYOUT = """
+import importlib
+from typing import TYPE_CHECKING
+
+import vllm.envs
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+
+def helper():
+    from vllm.entrypoints import utils
+    importlib.import_module("vllm.plugins")
+
+
+class RivaFrontendPlugin:
+    async def init_state(self, engine_client, state, args):
+        from vllm.entrypoints.serve.middleware import authenticate
+
+        def nested():
+            import vllm.envs
+
+    def other(self):
+        import vllm
+
+
+class RivaAuthMiddleware:
+    async def __call__(self, scope, receive, send):
+        from vllm.entrypoints.serve.middleware import authenticate
+
+
+class Servicer:
+    async def Recognize(self, request, context):
+        from vllm.entrypoints.speech_to_text import base
+"""
+
+
+# @spec ING-EP-108
+def test_the_vllm_import_check_reports_each_misplaced_import() -> None:
+    offenders = _misplaced_vllm_imports("layout.py", ast.parse(_IMPORT_LAYOUT))
+    assert [o.split(": ", 1)[1] for o in offenders] == [
+        "imports vllm.envs in module level",
+        "imports vllm.entrypoints in helper",
+        "imports vllm.plugins in helper",
+        "imports vllm in RivaFrontendPlugin.other",
+    ], offenders
+    assert _misplaced_vllm_imports("files.py", ast.parse(_IMPORT_LAYOUT)) == []
+
+
+# ------------------------------------------------- which tests need RFC 1
+
+TESTS_ROOT = PROJECT_ROOT / "tests"
+#: The one test that needs RFC 1 (ING-EP-071).
+DEADLINE_PIN = (
+    "vehicle/test_deadlines_capacity.py",
+    "test_copied_defaults_are_pinned_against_the_core_build",
+)
+
+
+def _marker_names(node: ast.AST) -> set[str]:
+    """``X`` of every ``pytest.mark.X`` (or ``mark.X``) under ``node``."""
+    found: set[str] = set()
+    for inner in ast.walk(node):
+        if (
+            isinstance(inner, ast.Attribute)
+            and isinstance(inner.value, ast.Attribute)
+            and inner.value.attr == "mark"
+        ) or (
+            isinstance(inner, ast.Attribute)
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id == "mark"
+        ):
+            found.add(inner.attr)
+    return found
+
+
+def _engine_marked(source: str) -> list[tuple[str, bool]]:
+    """``(owner, also_gpu)`` for each place ``source`` applies ``engine``.
+
+    The owner is ``<module>`` for a module ``pytestmark``, the class or
+    test name for a class ``pytestmark`` or a decorator, and the enclosing
+    test (or ``line N``) for a mark applied anywhere else (a
+    ``pytest.param(..., marks=...)`` or ``add_marker``).
+    """
+    tree = ast.parse(source)
+    found: list[tuple[str, bool]] = []
+    claimed: set[int] = set()
+
+    def note(owner: str, nodes: list[ast.AST]) -> None:
+        names: set[str] = set()
+        for node in nodes:
+            names |= _marker_names(node)
+            claimed.update(id(inner) for inner in ast.walk(node))
+        if "engine" in names:
+            found.append((owner, "gpu" in names))
+
+    def pytestmark(body: list[ast.stmt]) -> list[ast.AST]:
+        return [
+            stmt.value
+            for stmt in body
+            if isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "pytestmark"
+                for t in stmt.targets
+            )
+        ]
+
+    note("<module>", pytestmark(tree.body))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            note(node.name, [*node.decorator_list, *pytestmark(node.body)])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            note(node.name, list(node.decorator_list))
+    for node in ast.walk(tree):
+        if (
+            id(node) not in claimed
+            and isinstance(node, ast.Attribute)
+            and node.attr == "engine"
+            and "engine" in _marker_names(node)
+        ):
+            found.append((f"line {node.lineno}", False))
+    return found
+
+
+# @spec ING-EP-072
+def test_only_the_deadline_pin_needs_rfc1() -> None:
+    """Every CPU test runs on an RFC 2 build without RFC 1.
+
+    ``engine`` (RFC 1 + RFC 2) may mark only the stream-deadline pin of
+    ING-EP-071; a test also marked ``gpu`` is not a CPU test.
+    """
+    offenders: list[str] = []
+    pinned = False
+    for path in sorted(TESTS_ROOT.rglob("*.py")):
+        relative = path.relative_to(TESTS_ROOT).as_posix()
+        for owner, gpu in _engine_marked(path.read_text(encoding="utf-8")):
+            if (relative, owner) == DEADLINE_PIN:
+                pinned = True
+            elif not gpu:
+                offenders.append(f"{relative}: {owner} is marked engine")
+    assert pinned, "the stream-deadline pin runs only on RFC 1 + RFC 2"
+    assert not offenders, "\n".join(offenders)
+
+
+_MARKED = """
+import pytest
+from pytest import mark
+
+pytestmark = pytest.mark.engine
+
+
+class TestGroup:
+    pytestmark = [pytest.mark.engine]
+
+
+@pytest.mark.engine
+def test_decorated():
+    pass
+
+
+@mark.engine
+@mark.gpu
+def test_gpu():
+    pass
+
+
+@pytest.mark.parametrize("x", [pytest.param(1, marks=pytest.mark.engine)])
+def test_param(x):
+    pass
+
+
+def test_unmarked(request):
+    request.node.add_marker(pytest.mark.engine)
+"""
+
+
+# @spec ING-EP-072
+def test_the_engine_mark_scan_finds_every_form() -> None:
+    assert sorted(_engine_marked(_MARKED)) == sorted(
+        [
+            ("<module>", False),
+            ("TestGroup", False),
+            ("test_decorated", False),
+            ("test_gpu", True),
+            ("test_param", False),
+            (f"line {_line_of(_MARKED, 'add_marker')}", False),
+        ]
+    )
+
+
+def _line_of(source: str, needle: str) -> int:
+    return next(
+        number
+        for number, line in enumerate(source.splitlines(), start=1)
+        if needle in line
+    )

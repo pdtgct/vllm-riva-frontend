@@ -1,8 +1,11 @@
 """Shared fixtures and test tiers.
 
-* unmarked: CPU tests over the fakes in ``tests/support``.
-* ``engine``: CPU tests that import the RFC 1 + RFC 2 vLLM tree (on
-  ``PYTHONPATH``). Skipped when it does not import.
+* unmarked: CPU tests over the fakes in ``tests/support``, against the vLLM
+  core tree on ``PYTHONPATH``. They need RFC 2 only (ING-EP-072) and fail,
+  not skip, when it is missing.
+* ``engine``: CPU tests that need RFC 1 as well (the RFC 1 + RFC 2 build);
+  only the stream-deadline pin (ING-EP-071) belongs here. Skipped when RFC
+  1's stream-admission settings do not import.
 * ``real_factory``: the seam conformance suite against the model plugin's
   real factory. Skipped when the model plugin is not installed.
 * ``gpu``: an installed engine on a CUDA device. Skipped without one.
@@ -38,8 +41,15 @@ def _cuda_available() -> bool:
     return bool(torch.cuda.is_available())
 
 
-ENGINE = _importable("vllm.plugins.endpoint_plugins.interface")
+#: RFC 2 is required by every tier; ``engine`` additionally needs RFC 1.
+RFC2 = _importable("vllm.plugins.endpoint_plugins.interface")
+ENGINE = RFC2 and _importable("vllm.v1.core.stream_admission")
 REAL_FACTORY = _importable("vllm_nemotron_asr_streaming.session")
+
+#: Real seconds the ``started`` fixture's teardown gives the plugin's stop
+#: before it fails the test as a settlement hang (generous: a conforming
+#: stop under the fakes ends in well under a second).
+STOP_BOUND = 30.0
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -59,7 +69,9 @@ def pytest_collection_modifyitems(
     cuda: bool | None = None
     for item in items:
         if "engine" in item.keywords and not ENGINE:
-            item.add_marker(pytest.mark.skip(reason="vLLM core not importable"))
+            item.add_marker(
+                pytest.mark.skip(reason="needs the RFC 1 + RFC 2 vLLM build")
+            )
         if "real_factory" in item.keywords and not REAL_FACTORY:
             item.add_marker(
                 pytest.mark.skip(reason="model plugin not installed")
@@ -83,16 +95,30 @@ def clock():
 
 
 @pytest.fixture
-def fake_factory(clock):
+async def fake_factory(clock):
     """A ``FakeSessionFactory`` with the default cadences and locales.
 
     It serves ``560ms`` and ``1120ms`` with locales ``en-US``, ``de-DE``
     and ``auto`` (default ``auto``), on ``clock``, the plugin's clock, so its
     ``drain(deadline)`` waits in the same time the plugin's deadlines use.
+    It models generation, cleanup and holding tasks (``support.fake_session``);
+    whatever is still running at the end of the test is cancelled.
     """
     from support.fake_session import FakeSessionFactory
 
-    return FakeSessionFactory(clock=clock)
+    factory = FakeSessionFactory(clock=clock)
+    try:
+        yield factory
+    finally:
+        await factory.aclose()
+
+
+@pytest.fixture
+def fake_seam(fake_factory, clock):
+    """The seam conformance hooks (``support.seam.FakeSeam``) over it."""
+    from support.seam import FakeSeam
+
+    return FakeSeam(fake_factory, clock)
 
 
 @pytest.fixture
@@ -245,8 +271,12 @@ async def app_state(test_app, fake_engine, fake_models, fake_transcription):
 async def started(app_state, plugin):
     """``plugin`` after core's state init and ``start``; stopped after.
 
-    The teardown never masks the test's own result.
+    The teardown never masks the test's own result, except that a stop
+    which does not finish within ``STOP_BOUND`` seconds of real time fails
+    the test: a settlement that hangs (a scripted call left blocked, a
+    factory task that never ends) is a defect to report, not a stalled run.
     """
+    import asyncio
     import contextlib
 
     from support.app import start_plugins, stop_plugins
@@ -255,5 +285,16 @@ async def started(app_state, plugin):
     try:
         yield plugin
     finally:
+        stop = asyncio.ensure_future(stop_plugins(app_state))
+        done, _ = await asyncio.wait({stop}, timeout=STOP_BOUND)
+        if not done:
+            stop.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait({stop}, timeout=STOP_BOUND)
+            pytest.fail(
+                f"plugin stop did not finish within {STOP_BOUND} s of real"
+                " time: settlement hung",
+                pytrace=False,
+            )
         with contextlib.suppress(Exception):
-            await stop_plugins(app_state)
+            stop.result()

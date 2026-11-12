@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 
 import grpc
@@ -34,7 +35,7 @@ def cap(max_sessions: int = 4, max_file_owners: int = 2):
     return ingress
 
 
-# @spec ING-EP-035, ING-ADM-011
+# @spec ING-EP-080, ING-ADM-011
 def test_a_new_cap_is_closed_until_opened() -> None:
     from vllm_riva_frontend.admission import IngressCap, OwnerKind
 
@@ -48,7 +49,7 @@ def test_a_new_cap_is_closed_until_opened() -> None:
     assert ingress.try_admit(OwnerKind.stream) is not None
 
 
-# @spec ING-ADM-017
+# @spec ING-ADM-018
 def test_four_owner_kinds_count_and_two_are_file_kinds() -> None:
     from vllm_riva_frontend.admission import FILE_KINDS, OwnerKind
 
@@ -66,7 +67,7 @@ def test_four_owner_kinds_count_and_two_are_file_kinds() -> None:
     assert set(FILE_KINDS) == {OwnerKind.recognize, OwnerKind.file_route}
 
 
-# @spec ING-ADM-011, ING-ADM-017
+# @spec ING-ADM-011, ING-ADM-018
 def test_full_cap_refuses_busy_with_load_shed_authority() -> None:
     from vllm_riva_frontend.admission import OwnerKind
 
@@ -281,7 +282,7 @@ async def _fill(plugin, count: int):
     return [plugin.ingress.try_admit(OwnerKind.stream) for _ in range(count)]
 
 
-# @spec ING-ADM-017, ING-ADM-011
+# @spec ING-ADM-018, ING-ADM-011
 async def test_full_cap_refuses_a_stream_before_its_first_read(
     small_cap, fake_factory, helpers
 ) -> None:
@@ -296,7 +297,7 @@ async def test_full_cap_refuses_a_stream_before_its_first_read(
     assert not plugin.registry.records
 
 
-# @spec ING-ADM-017, ING-ADM-011
+# @spec ING-ADM-018, ING-ADM-011
 async def test_full_cap_refuses_recognize_before_decode(
     small_cap, fake_factory, helpers
 ) -> None:
@@ -311,7 +312,7 @@ async def test_full_cap_refuses_recognize_before_decode(
     assert not plugin.registry.records
 
 
-# @spec ING-ADM-017, ING-ADM-011
+# @spec ING-ADM-018, ING-ADM-011
 async def test_full_cap_refuses_the_file_route_before_reading_the_body(
     small_cap, helpers
 ) -> None:
@@ -326,7 +327,7 @@ async def test_full_cap_refuses_the_file_route_before_reading_the_body(
     response = await asgi_http(
         app,
         "POST",
-        "/v1/audio/transcriptions",
+        helpers.file_route(),
         headers=headers,
         body=body,
         hold_body=never,
@@ -338,7 +339,7 @@ async def test_full_cap_refuses_the_file_route_before_reading_the_body(
     assert not plugin.registry.records
 
 
-# @spec ING-ADM-017, ING-ADM-011
+# @spec ING-ADM-018, ING-ADM-011
 async def test_full_cap_refuses_a_realtime_session_without_open(
     small_cap, fake_factory
 ) -> None:
@@ -353,28 +354,240 @@ async def test_full_cap_refuses_a_realtime_session_without_open(
     assert plugin.ingress.count == 3
 
 
-# @spec ING-ADM-017
-async def test_excluded_work_is_served_at_a_full_cap(small_cap) -> None:
-    from riva.client.proto import riva_asr_pb2
-    from support.app import http_client
-    from support.asgi import AsgiWebSocket
-    from support.grpc_harness import FakeServicerContext
+#: A cap of four with room for two file owners: one owner of each kind
+#: fills it.
+FOUR_OWNERS = {
+    "load_shed_max_sessions": 4,
+    "max_concurrent_files": 2,
+    "max_file_owners": 3,
+}
 
-    plugin, app, _, _ = small_cap
-    await _fill(plugin, 3)
-    reply = await plugin.servicer.GetRivaSpeechRecognitionConfig(
-        riva_asr_pb2.RivaSpeechRecognitionConfigRequest(), FakeServicerContext()
+
+# @spec ING-ADM-018
+async def test_cap_counts_four_frontend_owners_and_excludes_core_routes(
+    clock, fake_factory, grpc_port, helpers
+) -> None:
+    from riva.client.proto import riva_asr_pb2
+    from support.app import OPERATIONAL_ROUTES, http_client
+    from support.asgi import AsgiWebSocket, asgi_http
+    from support.fake_session import Block as CallBlock
+    from support.fake_transcription import (
+        FakeServingModels,
+        FakeTranscriptionServing,
     )
-    assert len(reply.model_config) >= 1
-    async with http_client(app) as client:
-        boot = await client.post("/v1/realtime/transcription_sessions")
-        assert boot.status_code == 200
-        for path in ("/v1/health/live", "/v1/version", "/v1/metadata"):
-            assert (await client.get(path)).status_code == 200, path
-    ws = AsgiWebSocket(app, "/v1/realtime")
-    assert await ws.connect()
-    assert (await ws.receive_json())["type"] == "core.realtime"
+    from support.grpc_harness import FakeServicerContext
+    from support.http import CORE_ROUTE
+    from support.realtime import (
+        BOOTSTRAP_PATH,
+        CORE_REALTIME_PATH,
+        REALTIME_PATH,
+    )
+
+    plugin = helpers.make_frontend(
+        clock, factories={"nemotron": fake_factory.constructor}
+    )
+    models = FakeServingModels(helpers.SERVED)
+    transcription = FakeTranscriptionServing(models)
+    app, state = await helpers.initialize(
+        plugin,
+        helpers.engine_with(grpc_port, options=dict(FOUR_OWNERS)),
+        models=models,
+        transcription=transcription,
+    )
+    await plugin.start(state)
+    calls = [CallBlock(), CallBlock()]
+    transcription.script(*calls)
+    try:
+        run, _ = await helpers.stream_with_lease(plugin, fake_factory, clock)
+        assert plugin.ingress.count == 1
+        client = RealtimeClient(app, clock)
+        await client.open_session(helpers.realtime_update()["session"])
+        assert plugin.ingress.count == 2
+        recognizing = asyncio.ensure_future(
+            recognize(
+                plugin.servicer,
+                recognize_request(pcm16_bytes(pcm16_sine(0.5))),
+            )
+        )
+        await helpers.settle_until(clock, lambda: len(transcription.calls) == 1)
+        assert plugin.ingress.count == 3
+        body, headers = helpers.file_request_body()
+        filing = asyncio.ensure_future(
+            asgi_http(
+                app, "POST", helpers.file_route(), headers=headers, body=body
+            )
+        )
+        await helpers.settle_until(clock, lambda: len(transcription.calls) == 2)
+        assert plugin.ingress.count == 4, "one count per frontend owner"
+        # The cap is full; everything it excludes is still served.
+        reply = await plugin.servicer.GetRivaSpeechRecognitionConfig(
+            riva_asr_pb2.RivaSpeechRecognitionConfigRequest(),
+            FakeServicerContext(),
+        )
+        assert len(reply.model_config) >= 1
+        async with http_client(app) as http:
+            boot = await http.post(BOOTSTRAP_PATH)
+            assert boot.status_code == 200
+            for method, path in OPERATIONAL_ROUTES:
+                answer = await http.request(method, path)
+                assert answer.status_code == 200, path
+        core_ws = AsgiWebSocket(app, CORE_REALTIME_PATH)
+        assert await core_ws.connect()
+        assert (await core_ws.receive_json())["type"] == "core.realtime"
+        core_file = await asgi_http(
+            app, "POST", CORE_ROUTE, headers=headers, body=body
+        )
+        assert core_file.status == 200, "core's file route is outside the cap"
+        bad_query = AsgiWebSocket(app, f"{REALTIME_PATH}?intent=other")
+        assert not await bad_query.connect()
+        assert plugin.ingress.count == 4
+        refused_run = helpers.stream(plugin, clock, config_request())
+        await asyncio.wait_for(refused_run.task, 2.0)
+        assert refused_run.status is grpc.StatusCode.RESOURCE_EXHAUSTED
+        for call in calls:
+            call.release()
+        await asyncio.wait_for(recognizing, 5.0)
+        await asyncio.wait_for(filing, 5.0)
+        await client.disconnect()
+        run.requests.close()
+        await helpers.settle_until(clock, lambda: run.done)
+    finally:
+        for call in calls:
+            call.release()
+        await helpers.drive(clock, plugin.stop(state))
+
+
+# @spec ING-ADM-018, ING-EP-111
+@pytest.mark.parametrize("why", ["core_draining", "fault"])
+async def test_not_serving_wins_over_a_full_cap(
+    small_cap, fake_factory, clock, helpers, why
+) -> None:
+    from support.asgi import asgi_http
+
+    from vllm_riva_frontend.errors import catalog
+
+    plugin, app, state, transcription = small_cap
+    await _fill(plugin, 3)
+    if why == "core_draining":
+        state.draining = True
+    else:
+        fake_factory.faults.append(RuntimeError("retained fault"))
+        await clock.advance(1.0)
+        await helpers.settle_until(clock, lambda: plugin.fault is not None)
+    run = helpers.stream(plugin, plugin.clock, config_request())
+    await asyncio.wait_for(run.task, 2.0)
+    assert run.status is grpc.StatusCode.UNAVAILABLE, run.details
+    assert run.details.startswith("service_unavailable")
+    assert run.requests.pulls == 0
+    body, headers = helpers.file_request_body()
+    response = await asgi_http(
+        app, "POST", helpers.file_route(), headers=headers, body=body
+    )
+    assert response.status == catalog().http_status("service_unavailable")
+    assert transcription.calls == []
     assert plugin.ingress.count == 3
+
+
+# ------------------------------------------------------ refusal sends
+
+
+def unowned(plugin):
+    """The registry's sends without an owner (ING-EP-095)."""
+    return set(plugin.registry.unowned_sends)
+
+
+# @spec ING-EP-095
+@pytest.mark.parametrize("abandoned", ["bound_passed", "handler_cancelled"])
+async def test_refusal_send_is_awaited_inline_and_registered_on_abandonment(
+    small_cap, clock, helpers, abandoned
+) -> None:
+    plugin, _, _, _ = small_cap
+    await _fill(plugin, 3)
+    run = helpers.stubborn_stream(plugin, clock, config_request())
+    try:
+        await helpers.settle_until(clock, lambda: run.context.stalled == 1)
+        assert not run.done, "the handler awaits its refusal send inline"
+        assert unowned(plugin) == set(), "owned by its handler meanwhile"
+        if abandoned == "bound_passed":
+            await clock.advance(plugin.config.response_send_timeout - 1)
+            assert not run.done and unowned(plugin) == set()
+            await clock.advance(2)
+        else:
+            run.task.cancel()
+        await helpers.settle_until(clock, lambda: run.done)
+        assert run.context.cancellations >= 1, "the handler cancelled it"
+        assert len(unowned(plugin)) == 1, "registered once abandoned"
+        assert plugin.ingress.count == 3, "a send without an owner takes none"
+        assert not plugin.registry.records
+        assert run.context.stalled == 1, "no further refusal frame"
+    finally:
+        run.context.unblocked.set()
+    await helpers.settle_until(clock, lambda: unowned(plugin) == set())
+
+
+# @spec ING-EP-095, ING-EP-093
+async def test_refusal_send_after_registry_close_is_awaited_by_its_handler(
+    small_cap, clock, grpc_port, helpers
+) -> None:
+    plugin, _, state, _ = small_cap
+    release_owner = asyncio.Event()
+    helpers.register_dummy(plugin, stubborn=release_owner)
+    stopping = asyncio.ensure_future(plugin.stop(state))
+    run = None
+    try:
+        # The settlement stops the listener, closes the registry and waits
+        # for the stubborn owner.
+        await helpers.until(lambda: not helpers.port_open(grpc_port))
+        await clock.settle(20)
+        assert not stopping.done()
+        run = helpers.stubborn_stream(plugin, clock, config_request())
+        await helpers.settle_until(clock, lambda: run.context.stalled == 1)
+        await helpers.settle_until(
+            clock, lambda: run.context.cancellations >= 1
+        )
+        assert not run.done, "the handler awaits the send it cancelled"
+        for _ in range(3):
+            run.task.cancel()
+            await clock.settle()
+        assert not run.done, "through further cancellations of the handler"
+        assert unowned(plugin) == set(), "nothing registered after the close"
+        run.context.unblocked.set()
+        await helpers.settle_until(clock, lambda: run.done)
+        assert run.context.stalled == 1
+    finally:
+        if run is not None:
+            run.context.unblocked.set()
+        release_owner.set()
+        await asyncio.wait_for(stopping, 5.0)
+
+
+# @spec ING-EP-094
+async def test_registry_close_and_send_registration_never_suspend() -> None:
+    from vllm_riva_frontend.lifecycle import OwnerRegistry
+
+    for name in ("adopt_send", "close_sends"):
+        method = getattr(OwnerRegistry, name)
+        assert callable(method)
+        assert not inspect.iscoroutinefunction(method), (
+            f"{name} runs on the loop with no suspension"
+        )
+    registry = OwnerRegistry()
+    early = asyncio.ensure_future(asyncio.Event().wait())
+    late = asyncio.ensure_future(asyncio.Event().wait())
+    try:
+        assert registry.adopt_send(early) is True
+        assert early in registry.unowned_sends
+        assert not registry.records, "a send without an owner has no record"
+        registry.close_sends()
+        assert registry.adopt_send(late) is False, "its handler keeps it"
+        assert late not in registry.unowned_sends
+        assert early in registry.unowned_sends, "closing keeps the earlier"
+    finally:
+        for task in (early, late):
+            task.cancel()
+        await asyncio.wait({early, late})
+    await asyncio.sleep(0)
+    assert early not in registry.unowned_sends, "an ended send leaves"
 
 
 # @spec ING-ADM-012
@@ -475,7 +688,7 @@ async def test_file_body_read_is_bounded_and_releases_its_owner(
         asgi_http(
             test_app,
             "POST",
-            "/v1/audio/transcriptions",
+            helpers.file_route(),
             headers=headers,
             body=body,
             hold_body=never,

@@ -7,15 +7,39 @@ handlers, then middleware (``init_entrypoints_middleware`` of
 dispatcher middleware sits inside core's and ``--api-key`` applies to it. The
 routers are core's real ones where the frontend interacts with them:
 
-* ``GET /health`` (``vllm/entrypoints/serve/instrumentator/health.py``),
-  which reads ``engine_client.check_health``, ``state.draining`` and
-  ``endpoint_plugins_ready``;
+* ``GET /version``, ``GET /load`` and ``GET /kv_event_sources``
+  (``vllm/entrypoints/serve/instrumentator/basic.py``): core's own
+  ``/version`` stays beside the frontend's version route;
+* ``GET /health`` and ``GET /ready``
+  (``vllm/entrypoints/serve/instrumentator/health.py``): ``/health`` reads
+  ``engine_client.check_health`` only; ``/ready`` also reads
+  ``state.draining`` and ``endpoint_plugins_ready``;
 * ``POST /v1/audio/transcriptions`` and ``POST /v1/audio/translations``
   (``vllm/entrypoints/speech_to_text/factories.py:21-33``), present only when
   the server has the ``transcription`` task;
 * a recording stand-in for core's ``/v1/realtime`` WebSocket route, present
-  with the ``realtime`` task, so a test sees which scopes the dispatcher
-  passed through.
+  with the ``realtime`` task, so a test sees that core's route still serves
+  its own scopes, unchanged, beside the frontend's routes.
+
+The frontend adds its routes under ``PLUGIN_PREFIX`` (``/plugins/riva/v1``)
+and its path-scoped authentication middleware with ``app.add_middleware``
+in ``attach_router``; since core installs its own middleware after the
+plugin hooks, core's WebSocket metrics, authentication and CORS middleware
+wrap the frontend's. ``api_key`` installs core's ``AuthenticationMiddleware``
+the way ``--api-key`` does; a test that needs ``VLLM_API_KEY`` instead sets
+the environment variable (``monkeypatch.setenv``) before ``build_app`` and
+keeps it set through ``init_state``, since core reads it in both places.
+``auth_registrations`` adds further registrations of core's
+``AuthenticationMiddleware`` (each a keyword mapping, possibly without
+``tokens``) after core's own, for the authentication-decision tests
+(ING-EP-086).
+
+``core_app`` is core's real route table for a task set (every router
+``register_api_routers`` attaches) without any plugin; ``attach_plugins``
+attaches plugins to it through core's ``attach_endpoint_plugins``;
+``all_routes`` lists every route of any kind; ``RouteAddingPlugin`` is an
+endpoint plugin that adds given routes (an earlier or later plugin for the
+collision and route-table checks, ING-EP-091 and ING-EP-070).
 
 Plugins are attached through core's real ``attach_endpoint_plugins`` with
 entry-point discovery replaced by the given list, so the route override and
@@ -64,6 +88,36 @@ from support.state import make_args, make_state
 
 SUPPORTED_TASKS_KEY = "supported_tasks"
 
+#: The frontend's namespace (ING-SHIM-023) and its route set.
+PLUGIN_BASE = "/plugins/riva"
+PLUGIN_PREFIX = f"{PLUGIN_BASE}/v1"
+OPERATIONAL_ROUTES = (
+    ("GET", f"{PLUGIN_PREFIX}/health/ready"),
+    ("GET", f"{PLUGIN_PREFIX}/health/live"),
+    ("GET", f"{PLUGIN_PREFIX}/version"),
+    ("GET", f"{PLUGIN_PREFIX}/metadata"),
+)
+BOOTSTRAP_ROUTE = ("POST", f"{PLUGIN_PREFIX}/realtime/transcription_sessions")
+REALTIME_ROUTE = ("WEBSOCKET", f"{PLUGIN_PREFIX}/realtime")
+FILE_ROUTE = ("POST", f"{PLUGIN_PREFIX}/audio/transcriptions")
+#: Core's speech routes the frontend leaves untouched.
+CORE_TRANSCRIPTION_ROUTE = ("POST", "/v1/audio/transcriptions")
+CORE_TRANSLATION_ROUTE = ("POST", "/v1/audio/translations")
+CORE_REALTIME_ROUTE = ("WEBSOCKET", "/v1/realtime")
+
+
+def frontend_routes(*, file_route: bool = True) -> set[tuple[str, str]]:
+    """The frontend's route set (ING-SHIM-023) as ``(method, path)``.
+
+    ``WEBSOCKET`` stands for a WebSocket route. ``file_route`` is whether
+    core's transcription route is registered (ING-FILE-075).
+    """
+    routes = {*OPERATIONAL_ROUTES, BOOTSTRAP_ROUTE, REALTIME_ROUTE}
+    if file_route:
+        routes.add(FILE_ROUTE)
+    return routes
+
+
 core_realtime_router = APIRouter()
 
 
@@ -97,11 +151,15 @@ def build_app(
     api_key: str | list[str] | None = None,
     enable_request_id_headers: bool = False,
     realtime_stand_in: bool = True,
+    root_path: str | None = None,
+    auth_registrations: Iterable[dict[str, Any]] = (),
 ) -> FastAPI:
     """Build the app; see the module docstring.
 
     ``api_key`` installs core's ``AuthenticationMiddleware`` for the given
-    token(s). The result's ``extra["supported_tasks"]`` records the tasks.
+    token(s); ``root_path`` sets ``--root-path``; ``auth_registrations``
+    adds registrations of core's ``AuthenticationMiddleware`` with those
+    keywords. The result's ``extra["supported_tasks"]`` records the tasks.
     """
     tasks = tuple(supported_tasks)
     if args is None:
@@ -112,16 +170,21 @@ def build_app(
                 else ([api_key] if isinstance(api_key, str) else list(api_key))
             ),
             enable_request_id_headers=enable_request_id_headers,
+            root_path=root_path,
         )
     app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     app.state.args = args
     app.root_path = args.root_path or ""
     app.extra[SUPPORTED_TASKS_KEY] = tasks
 
+    from vllm.entrypoints.serve.instrumentator.basic import (
+        router as basic_router,
+    )
     from vllm.entrypoints.serve.instrumentator.health import (
         router as health_router,
     )
 
+    app.include_router(basic_router)
     app.include_router(health_router)
     if "realtime" in tasks and realtime_stand_in:
         app.include_router(core_realtime_router)
@@ -143,7 +206,141 @@ def build_app(
 
     init_exception_handler(app)
     init_entrypoints_middleware(args, app, tasks)
+    if auth_registrations:
+        from vllm.entrypoints.serve.middleware.authenticate import (
+            AuthenticationMiddleware,
+        )
+
+        for keywords in auth_registrations:
+            app.add_middleware(AuthenticationMiddleware, **keywords)
     return app
+
+
+def auth_registrations(app: FastAPI) -> list[dict[str, Any]]:
+    """The keywords of every registration of core's authentication.
+
+    Outermost first, as ``app.user_middleware`` keeps them.
+    """
+    from vllm.entrypoints.serve.middleware.authenticate import (
+        AuthenticationMiddleware,
+    )
+
+    return [
+        dict(m.kwargs)
+        for m in app.user_middleware
+        if m.cls is AuthenticationMiddleware
+    ]
+
+
+def core_app(
+    supported_tasks: Iterable[str] = ("transcription", "realtime"),
+    *,
+    args: Namespace | None = None,
+) -> FastAPI:
+    """Core's full route table for ``supported_tasks``, with no plugin."""
+    from vllm.entrypoints.launchers.api_server.routers import (
+        register_api_routers,
+    )
+
+    app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    app.state.args = args if args is not None else make_args()
+    app.extra[SUPPORTED_TASKS_KEY] = tuple(supported_tasks)
+    register_api_routers(app.state.args, app, tuple(supported_tasks), None)
+    return app
+
+
+def attach_plugins(
+    app: FastAPI,
+    plugins: Sequence[Any],
+    supported_tasks: Iterable[str] | None = None,
+) -> None:
+    """Core's ``attach_endpoint_plugins`` with discovery replaced."""
+    tasks = (
+        tuple(supported_tasks)
+        if supported_tasks is not None
+        else tuple(app.extra.get(SUPPORTED_TASKS_KEY, ()))
+    )
+    with mock.patch(
+        "vllm.plugins.load_endpoint_plugins", return_value=list(plugins)
+    ):
+        attach_endpoint_plugins(app, tasks)
+
+
+def all_routes(app: FastAPI) -> list[tuple[str, str, frozenset[str], Any]]:
+    """``(kind, path, methods, endpoint-or-app)`` for every route, in order.
+
+    ``kind`` is ``http`` (an ``APIRoute`` or Starlette ``Route``),
+    ``websocket`` or ``mount``; methods are empty for the last two.
+    """
+    from starlette.routing import Mount, Route, WebSocketRoute
+
+    rows: list[tuple[str, str, frozenset[str], Any]] = []
+    for route in app.routes:
+        if isinstance(route, APIRoute | Route):
+            rows.append(
+                (
+                    "http",
+                    route.path,
+                    frozenset(route.methods or ()),
+                    route.endpoint,
+                )
+            )
+        elif isinstance(route, WebSocketRoute):
+            rows.append(("websocket", route.path, frozenset(), route.endpoint))
+        elif isinstance(route, Mount):
+            rows.append(("mount", route.path, frozenset(), route.app))
+        else:
+            kind = type(route).__name__
+            path = getattr(route, "path", "")
+            rows.append((kind, path, frozenset(), route))
+    return rows
+
+
+class RouteAddingPlugin:
+    """An endpoint plugin that adds the given routes in ``attach_router``.
+
+    ``http`` is ``(method, path)`` pairs, ``websocket`` and ``mounts`` are
+    paths. Its handlers answer ``{"plugin": name}`` (HTTP) or accept and
+    close with 1000 (WebSocket); a mount serves a bare ``Starlette`` app.
+    """
+
+    required_tasks = None
+
+    def __init__(
+        self,
+        name: str = "other",
+        *,
+        http: Iterable[tuple[str, str]] = (),
+        websocket: Iterable[str] = (),
+        mounts: Iterable[str] = (),
+    ) -> None:
+        self.name = name
+        self.http = list(http)
+        self.websocket = list(websocket)
+        self.mounts = list(mounts)
+
+    def attach_router(self, app: FastAPI) -> None:
+        from starlette.applications import Starlette
+        from starlette.responses import JSONResponse
+
+        name = self.name
+
+        async def answer() -> JSONResponse:
+            return JSONResponse({"plugin": name})
+
+        async def accept(websocket: WebSocket) -> None:
+            await websocket.accept()
+            await websocket.close(code=1000)
+
+        for method, path in self.http:
+            app.add_api_route(path, answer, methods=[method])
+        for path in self.websocket:
+            app.add_api_websocket_route(path, accept)
+        for path in self.mounts:
+            app.mount(path, Starlette())
+
+    async def init_state(self, engine_client, state, args) -> None:
+        return None
 
 
 def supported_tasks(app: FastAPI) -> tuple[str, ...]:
@@ -159,8 +356,8 @@ async def init_state(
 ) -> State:
     """Fill ``app.state`` as core does, then run core's Phase B.
 
-    ``init_endpoint_plugins_state`` calls each plugin's ``init_state`` and
-    sets ``state.draining = False``.
+    ``init_endpoint_plugins_state`` sets ``state.draining = False`` and then
+    calls each plugin's ``init_state``.
     """
     state = make_state(
         engine,
@@ -176,7 +373,7 @@ async def init_state(
 
 async def start_plugins(state: State) -> None:
     """Core's lifespan step: ``start`` each attached plugin in order."""
-    await start_endpoint_plugins(state, getattr(state, "endpoint_plugins", []))
+    await start_endpoint_plugins(state)
 
 
 def plugins_ready(state: State) -> bool:
@@ -290,13 +487,18 @@ def http_client(
     *,
     api_key: str | None = None,
     headers: dict[str, str] | None = None,
+    root_path: str = "",
 ) -> httpx.AsyncClient:
-    """An ``httpx`` client over the ASGI app, on the test's loop."""
+    """An ``httpx`` client over the ASGI app, on the test's loop.
+
+    With ``root_path``, request paths must carry that prefix, as behind a
+    proxy that forwards the full path.
+    """
     all_headers = dict(headers or {})
     if api_key is not None:
         all_headers["Authorization"] = f"Bearer {api_key}"
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
+        transport=httpx.ASGITransport(app=app, root_path=root_path),
         base_url="http://testserver",
         headers=all_headers,
     )

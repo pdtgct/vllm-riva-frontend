@@ -38,6 +38,7 @@ dev = [
     "pytest-cov>=7",
     "pyyaml>=6",
     "ruff>=0.15",
+    "soundfile>=0.12",
     "types-pyyaml>=6",
 ]
 

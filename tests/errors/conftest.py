@@ -3,9 +3,10 @@
 The errors leaf checks the catalog and its projections as units, and the
 phase table end to end on both streaming surfaces: the Riva servicer called
 directly (``support.riva.StreamingCall``) and the Riva Realtime adapter
-reached through the dispatcher of ``test_app`` (``support.realtime
-.RealtimeClient``). Time is the plugin's ``FakeClock``; the plugin is started
-(admission opens last in ``start``), so the gRPC listener binds a free port.
+reached through its WebSocket route ``/plugins/riva/v1/realtime`` on
+``test_app`` (``support.realtime.RealtimeClient``). Time is the plugin's
+``FakeClock``; the plugin is started (admission opens last in ``start``),
+so the gRPC listener binds a free port.
 
 ``riva_options`` (shared) is the ``riva_frontend`` mapping a test adds to the
 defaults (a module or test overrides it). ``stream`` builds a driver for a

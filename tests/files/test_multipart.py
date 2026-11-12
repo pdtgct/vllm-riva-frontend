@@ -12,6 +12,7 @@ import pytest
 from support.fake_transcription import Raise
 from support.http import (
     BOUNDARY,
+    CORE_ROUTE,
     HttpExchange,
     MiB,
     assert_core_error,
@@ -403,6 +404,7 @@ async def test_core_upload_limit_gives_core_error(files_env, monkeypatch):
         reference,
         [("content-type", content_type())],
         chunked(multipart_body([], file=oversized)),
+        path=CORE_ROUTE,
     )
     await expected.finish(timeout=10)
     assert exchange.status == expected.status

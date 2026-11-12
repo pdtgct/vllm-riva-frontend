@@ -1,4 +1,4 @@
-"""Capability, route replacement, files-enabled flag and startup checks."""
+"""Capability, route addition, files-enabled flag and startup checks."""
 
 from __future__ import annotations
 
@@ -6,10 +6,15 @@ import logging
 
 import grpc
 import pytest
-from support.app import find_route
-from support.fake_transcription import FakeTranscriptionServing
+from support.app import (
+    CORE_TRANSLATION_ROUTE,
+    PLUGIN_PREFIX,
+    all_routes,
+    find_route,
+)
+from support.fake_transcription import Block, FakeTranscriptionServing, Return
 from support.grpc_harness import FakeServicerContext
-from support.http import ROUTE, MiB, assert_core_error
+from support.http import CORE_ROUTE, ROUTE, MiB, assert_core_error, until
 from support.riva import recognize, recognize_request
 
 CORE_UPLOAD_LIMIT = 25 * MiB  # VLLM_MAX_AUDIO_CLIP_FILESIZE_MB default
@@ -32,41 +37,147 @@ async def _config_types(plugin) -> list[str]:
     return [entry.parameters["type"] for entry in response.model_config]
 
 
-# ------------------------------------------------------- route replacement
+# ---------------------------------------------------------- route addition
 
 
-# @spec ING-FILE-003
-async def test_route_replaces_core_transcriptions_and_keeps_translations(
-    files_env,
-):
-    from vllm.entrypoints.speech_to_text.transcription import (
-        api_router as core_transcription,
-    )
-    from vllm.entrypoints.speech_to_text.translation import (
-        api_router as core_translation,
-    )
+def _core_transcription_endpoint():
+    from vllm.entrypoints.speech_to_text.transcription import api_router
 
-    env = await files_env(start=False)
-    transcriptions = [
+    return api_router.create_transcriptions
+
+
+def _core_translation_module() -> str:
+    from vllm.entrypoints.speech_to_text.translation import api_router
+
+    return api_router.__name__
+
+
+def _posts(app, path: str) -> list:
+    return [
         route
-        for route in env.app.routes
-        if getattr(route, "path", None) == ROUTE
+        for route in app.routes
+        if getattr(route, "path", None) == path
         and "POST" in (getattr(route, "methods", None) or ())
     ]
-    assert len(transcriptions) == 1
-    assert transcriptions[0].endpoint is not (
-        core_transcription.create_transcriptions
+
+
+# @spec ING-FILE-075
+async def test_file_route_added_beside_core_route_only_when_core_has_it(
+    files_env, clock
+):
+    from fastapi import FastAPI
+    from support.app import attach_plugins
+    from support.fake_session import FakeSessionFactory, fake_entry_points
+    from support.state import make_args
+
+    from vllm_riva_frontend.lifecycle import RivaFrontendPlugin
+
+    env = await files_env(start=False)
+    # The frontend's route is added under its namespace, once, and is the
+    # frontend's own handler.
+    routes = _posts(env.app, ROUTE)
+    assert len(routes) == 1, f"no single frontend route at {ROUTE}"
+    frontend = routes[0]
+    assert frontend.endpoint is not _core_transcription_endpoint()
+    # Core's route stays registered, once, with core's own handler.
+    (core,) = _posts(env.app, CORE_ROUTE)
+    assert core.endpoint is _core_transcription_endpoint()
+
+    # Without core's route (here: a server whose task set has
+    # ``transcription`` but whose route table lacks core's route), the
+    # frontend adds no file route: core's route is the signal, not the task.
+    bare = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    bare.state.args = make_args()
+    factory = FakeSessionFactory(clock=clock)
+    plugin = RivaFrontendPlugin(
+        clock=clock,
+        entry_points=fake_entry_points(nemotron=factory.constructor),
     )
-    translations = find_route(env.app, "POST", "/v1/audio/translations")
-    assert translations is not None
-    assert translations.endpoint.__module__ == core_translation.__name__
+    attach_plugins(bare, [plugin], ("transcription", "realtime"))
+    assert find_route(bare, "POST", ROUTE) is None
+    assert find_route(bare, "POST", CORE_ROUTE) is None
 
 
-# @spec ING-FILE-003, ING-FILE-014
+# @spec ING-FILE-075, ING-FILE-014
 async def test_without_transcription_task_no_file_route_is_added(files_env):
     env = await files_env(tasks=("realtime",), start=False)
     assert find_route(env.app, "POST", ROUTE) is None
-    assert find_route(env.app, "POST", "/v1/audio/translations") is None
+    assert find_route(env.app, "POST", CORE_ROUTE) is None
+    assert find_route(env.app, *CORE_TRANSLATION_ROUTE) is None
+
+
+# @spec ING-FILE-075
+async def test_no_translation_route(files_env):
+    env = await files_env(start=False)
+    # The frontend serves no translation route of its own ...
+    for kind, path, _, _ in all_routes(env.app):
+        if path.startswith(PLUGIN_PREFIX):
+            assert "translation" not in path, (kind, path)
+    # ... and does not mount, replace or shadow core's.
+    (translations,) = _posts(env.app, CORE_TRANSLATION_ROUTE[1])
+    assert translations.endpoint.__module__ == _core_translation_module()
+    for kind, path, _, _ in all_routes(env.app):
+        if kind == "mount":
+            assert not CORE_TRANSLATION_ROUTE[1].startswith(path), path
+    # Every frontend route is under the namespace; none is core's path.
+    frontend_paths = {
+        path
+        for _, path, _, endpoint in all_routes(env.app)
+        if getattr(endpoint, "__module__", "").startswith("vllm_riva_frontend")
+    }
+    assert frontend_paths, "no frontend route found"
+    assert all(p.startswith(PLUGIN_PREFIX) for p in frontend_paths), (
+        frontend_paths
+    )
+
+
+# @spec ING-FILE-076
+@pytest.mark.parametrize("files_enabled", [True, False], ids=["on", "off"])
+async def test_core_route_unchanged_and_outside_cap_gate_guard(
+    files_env, files_enabled
+):
+    from support.http import file_request
+
+    engine = {} if files_enabled else {"num_gpu_blocks": 2}
+    env = await files_env(engine=engine)
+    assert env.plugin.files_enabled is files_enabled
+    if files_enabled:
+        # A full file gate does not hold back core's route.
+        gate = env.plugin.file_gate
+        deadline = env.clock.monotonic() + 3600
+        held = [
+            await gate.acquire(deadline)
+            for _ in range(env.plugin.config.max_concurrent_files)
+        ]
+        in_flight = gate.in_flight
+    # A closed ingress cap does not refuse core's route.
+    env.plugin.ingress.close()
+
+    block = Block(then=Return())
+    env.service.script(block)
+    # A guarded sampling value: core's validation decides it, not the
+    # frontend's guard.
+    exchange = file_request(
+        env.app, [("temperature", "0.5")], path=CORE_ROUTE
+    ).start()
+    await until(
+        lambda: block.entered.is_set() or exchange.done, what="core's call"
+    )
+    assert block.entered.is_set(), (exchange.status, exchange.body)
+    # Core's call holds no frontend owner, admission or permit.
+    assert not env.plugin.registry.records
+    assert env.plugin.ingress.count == 0
+    if files_enabled:
+        assert env.plugin.file_gate.in_flight == in_flight
+        assert env.plugin.file_gate.waiting == 0
+    block.release()
+    await exchange.finish()
+    assert exchange.status == 200, exchange.body
+    (call,) = env.calls
+    assert call.request.temperature == 0.5
+    if files_enabled:
+        for permit in held:
+            permit.release()
 
 
 # ------------------------------------------------------------- capability
@@ -137,8 +248,8 @@ async def test_tiny_capacity_disables_files_with_a_warning(
     assert env.calls == []
 
 
-# @spec ING-FILE-017, ING-FILE-055
-async def test_disabled_files_route_answers_501_before_cap_and_body(
+# @spec ING-FILE-083, ING-FILE-055
+async def test_disabled_files_route_answers_501_first(
     files_env,
 ):
     env = await files_env(engine={"num_gpu_blocks": 2})
@@ -285,14 +396,22 @@ async def test_unary_duration_at_core_decode_limit_is_accepted(files_env):
     assert env.plugin.files_enabled is True
 
 
-# @spec ING-FILE-047
+# @spec ING-FILE-081
 async def test_no_startup_relation_between_duration_and_model_len(
-    files_env,
+    files_env, caplog
 ):
-    # A max_model_len far too small for a 600 s file still starts: the
-    # budget is the model's check per request, not a frontend relation.
+    # A max_model_len far too small for a 600 s file still starts, with no
+    # warning about it: the deployment guide sizes ``--max-model-len``.
+    caplog.set_level(logging.WARNING)
     env = await files_env(engine={"max_model_len": 128})
     assert env.plugin.files_enabled is True
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and r.name.startswith("vllm_riva_frontend")
+    ]
+    assert not any("max_model_len" in m for m in messages), messages
 
 
 # ------------------------------------------------------ inherited sampling

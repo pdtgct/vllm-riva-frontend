@@ -1,8 +1,9 @@
 """Fixtures for the operations leaf.
 
-The four operational routes and the bootstrap route are exercised over
-``test_app`` (core's routers, middleware and plugin wiring) with ``httpx``;
-readiness needs the plugin started, so the gRPC listener binds a free port.
+The four operational routes under ``/plugins/riva/v1`` and the bootstrap
+route are exercised over ``test_app`` (core's routers, middleware and plugin
+wiring) with ``httpx``; readiness needs the plugin started, so the gRPC
+listener binds a free port. Paths come from ``support.app``.
 ``riva_options`` is the ``riva_frontend`` mapping a test adds.
 """
 

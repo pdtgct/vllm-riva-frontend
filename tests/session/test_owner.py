@@ -28,7 +28,7 @@ def _lease(fake_factory):
     return fake_factory.leases[0]
 
 
-# @spec ING-CORE-011, ING-LIFE-058
+# @spec ING-CORE-011, ING-LIFE-063
 async def test_owner_registers_then_enters_configured_when_open_returns(
     make_owner, owner_parts, fake_factory
 ):
@@ -44,7 +44,7 @@ async def test_owner_registers_then_enters_configured_when_open_returns(
     assert fake_factory.names("lease:0") == []
 
 
-# @spec ING-LIFE-017, ING-LIFE-025, ING-LIFE-058
+# @spec ING-LIFE-017, ING-LIFE-025, ING-LIFE-063
 async def test_finalize_flushes_finishes_releases_and_returns_flush_text(
     make_owner, owner_parts, fake_factory
 ):
@@ -217,7 +217,7 @@ async def test_an_abnormal_cause_after_flush_takes_release_only(
     assert lease.names()[-1] == "release"
 
 
-# @spec ING-LIFE-035, ING-LIFE-058
+# @spec ING-LIFE-035, ING-LIFE-063
 async def test_an_abnormal_cause_cancels_and_settles_the_call_before_cleanup(
     make_owner, fake_factory, cause
 ):
@@ -310,9 +310,11 @@ async def test_a_failure_after_finish_settles_does_not_turn_into_abort(
 #
 # A call that delays its cancellation (``Block(delay_cancel=True)``) must not
 # hold the stream's answer past the cleanup bound (``session_cleanup_timeout``
-# 30 s, clipped to ``D`` while draining). Past it the owner answers with the
-# selected cause; the record's continuation keeps the record, waits for the
-# call before any other lease call and runs the rest of the cleanup.
+# 30 s, fixed when cleanup begins; the time remaining to ``D`` instead when
+# cleanup begins during a drain's graceful work, ING-LIFE-059). Past it the
+# owner answers with the selected cause; the record's continuation keeps the
+# record, waits for the call before any other lease call and runs the rest of
+# the cleanup.
 
 CLEANUP_BUDGET = 30.0
 
@@ -339,7 +341,7 @@ async def _finish(block, *tasks) -> None:
             await asyncio.wait_for(task, 2)
 
 
-# @spec ING-LIFE-035, ING-LIFE-037, ING-LIFE-057
+# @spec ING-LIFE-035, ING-LIFE-059, ING-LIFE-062
 async def test_a_call_delaying_cancellation_is_answered_at_the_cleanup_bound(
     make_owner, fake_factory, cause, clock
 ):
@@ -388,7 +390,7 @@ async def test_no_lease_call_starts_while_a_cancelled_call_is_unsettled(
     assert lease.state == "released"
 
 
-# @spec ING-LIFE-037, ING-LIFE-035
+# @spec ING-LIFE-060, ING-LIFE-035
 async def test_an_expired_abort_delaying_its_cancellation_defers_release(
     make_owner, owner_parts, fake_factory, clock
 ):
@@ -414,7 +416,7 @@ async def test_an_expired_abort_delaying_its_cancellation_defers_release(
     assert len(owner_parts["registry"].records) == 0
 
 
-# @spec ING-LIFE-035, ING-LIFE-058, ING-EP-060
+# @spec ING-LIFE-035, ING-LIFE-063, ING-EP-106
 async def test_the_record_stays_under_its_continuation_until_cleanup_ends(
     make_owner, owner_parts, fake_factory, cause, clock
 ):
@@ -439,8 +441,8 @@ async def test_the_record_stays_under_its_continuation_until_cleanup_ends(
     assert lease.names()[-1] == "release"
 
 
-# @spec ING-LIFE-035, ING-EP-043, ING-EP-059
-async def test_stop_cancels_the_continuation_of_an_unsettled_call(
+# @spec ING-LIFE-064, ING-EP-079, ING-CORE-032, ING-LIFE-035
+async def test_a_torn_down_plugin_still_cleans_up_by_lease_state(
     make_owner, owner_parts, fake_factory, cause, clock
 ):
     registry = owner_parts["registry"]
@@ -453,23 +455,26 @@ async def test_stop_cancels_the_continuation_of_an_unsettled_call(
         continuation = record.continuation
         assert continuation is not None and not continuation.done()
 
-        # What ``stop`` does to the registry: mark it torn down, then cancel
-        # every owner, continuation and child.
+        # The plugin is torn down (``stop``) while the continuation waits for
+        # the unsettled call; ``stop`` awaits continuations, it does not
+        # replace their cleanup with the lease's ``teardown()``.
         registry.torn_down = True
-        registry.cancel_all()
         await settle()
-
-        assert continuation.cancelled()
-        assert len(registry.records) == 0
-        assert lease.names() == ["feed", "teardown"]
+        assert not continuation.done()
+        assert lease.names() == ["feed"]
     finally:
         await _finish(block, feed, failing)
-    # The late settlement starts no lease call on a stopped plugin.
-    assert lease.names() == ["feed", "teardown"]
+
+    # The late settlement is followed by the cleanup the lease state allows.
+    assert continuation.done() and not continuation.cancelled()
+    assert lease.names() == ["feed", "abort", "release"]
+    assert "teardown" not in lease.names()
+    assert lease.teardown_calls == 0
+    assert len(registry.records) == 0
 
 
-# @spec ING-LIFE-035, ING-LIFE-057, ING-LIFE-053
-async def test_settling_a_cancelled_call_is_clipped_to_the_drain_deadline(
+# @spec ING-LIFE-059, ING-LIFE-062, ING-LIFE-035, ING-LIFE-053
+async def test_settling_a_call_cancelled_at_d_takes_the_cleanup_timeout(
     make_owner, fake_factory, clock
 ):
     from vllm_riva_frontend.errors import FrontendError
@@ -486,10 +491,17 @@ async def test_settling_a_cancelled_call_is_clipped_to_the_drain_deadline(
     try:
         await clock.advance(2.9)
         assert not feed.done()
-        # At ``D`` the feed is cancelled, and its settlement gets no wait
-        # beyond ``D``: the stream is answered at once.
+        # At ``D`` the feed is cancelled. Its settlement is terminal cleanup
+        # that begins after ``D``: it runs under ``session_cleanup_timeout``
+        # from that start, not clipped to the time remaining to ``D`` (none).
         await clock.advance(0.2)
-        assert feed.done(), "the settlement wait outlived D"
+        assert block.cancellations >= 1, "D did not cancel the feed"
+        assert not feed.done(), "the settlement was clipped to D"
+        await clock.advance(CLEANUP_BUDGET - 0.4)
+        assert not feed.done(), "the cleanup bound ended early"
+
+        await clock.advance(0.4)
+        assert feed.done(), "the cleanup bound did not end the wait"
         assert isinstance(feed.exception(), FrontendError)
         assert feed.exception().code == "service_unavailable"
         assert lease.names() == ["feed"]

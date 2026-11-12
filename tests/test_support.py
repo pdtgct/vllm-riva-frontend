@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import struct
 from argparse import Namespace
 
@@ -20,7 +21,9 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from starlette.datastructures import State
 from starlette.requests import ClientDisconnect
 from starlette.responses import JSONResponse
+from support import app as app_support
 from support import audio, riva
+from support import http as http_support
 from support import realtime as realtime_support
 from support.app import (
     build_app,
@@ -75,7 +78,8 @@ from support.http import (
     multipart_body,
     until,
 )
-from support.state import RecordingShutdown, make_args, make_state
+from support.seam import FakeSeam, reference_settlement
+from support.state import ABSENT, RecordingShutdown, make_args, make_state
 
 # ------------------------------------------------------------------ clock
 
@@ -520,10 +524,12 @@ async def test_fake_factory_teardown_all_is_terminal(fake_factory):
     lease = await fake_factory.open(cadence="560ms", locale="auto")
     parked = asyncio.create_task(asyncio.sleep(100))
     fake_factory.tasks.add(parked)
-    assert fake_factory.teardown_all() == {parked}
+    assert fake_factory.teardown_all() == {parked, lease.generation}
     assert fake_factory.closed and fake_factory.teardown_calls == 1
     with pytest.raises(asyncio.CancelledError):
         await parked
+    with pytest.raises(asyncio.CancelledError):
+        await lease.generation
     with pytest.raises(SeamError) as info:
         await fake_factory.open(cadence="560ms", locale="auto")
     assert (info.value.session_error, info.value.reason) == (
@@ -637,7 +643,10 @@ async def test_fake_factory_teardown_all_cancels_running_cleanup():
     release.cancel()
     with pytest.raises(asyncio.CancelledError):
         await release
-    (task,) = factory.teardown_all()
+    returned = factory.teardown_all()
+    task = factory.cleanup[lease]
+    assert returned == {task, lease.generation}
+    assert lease.generation.done(), "abort awaited the generation task"
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not factory.owns(lease)
@@ -707,17 +716,6 @@ async def test_fake_engine_death_is_observable():
         await engine.check_health()
     engine.set_capacity(num_gpu_blocks=None)
     assert engine.vllm_config.cache_config.num_gpu_blocks is None
-
-
-def test_stream_deadline_defaults_match_core():
-    from vllm.v1.core.stream_admission import StreamAdmissionConfig
-
-    defaults = StreamAdmissionConfig()
-    assert (
-        defaults.never_fed_timeout,
-        defaults.parked_idle_timeout,
-        defaults.draining_timeout,
-    ) == (15.0, 60.0, 40.0)
 
 
 # ---------------------------------------------------------- transcription
@@ -825,7 +823,6 @@ class _RecordingPlugin:
 
     name = "recording"
     required_tasks = ("realtime",)
-    owns_non_http_listener = True
 
     def __init__(self) -> None:
         self.events: list[tuple[str, object]] = []
@@ -912,11 +909,17 @@ async def test_init_state_runs_core_phase_b_and_health():
         assert (await authed.get("/health")).status_code == 200
 
 
-async def test_init_state_refuses_listener_plugins_without_one_api_server():
-    plugin = _RecordingPlugin()
-    app = build_app([plugin], args=make_args(api_server_count=2))
-    with pytest.raises(ValueError, match="api-server-count"):
-        await init_state(app, FakeEngineClient())
+async def test_core_leaves_the_api_server_count_check_to_the_plugin():
+    """RFC 2 core refuses no plugin for the process count (ING-EP-081)."""
+    for count in (2, 0, None, ABSENT):
+        plugin = _RecordingPlugin()
+        app = build_app([plugin], args=make_args(api_server_count=count))
+        state = await init_state(app, FakeEngineClient())
+        assert [event[0] for event in plugin.events][-1] == "init_state"
+        if count is ABSENT:
+            assert not hasattr(state.args, "api_server_count")
+        else:
+            assert state.args.api_server_count == count
 
 
 async def test_lifecycle_helpers_drive_core_functions():
@@ -929,7 +932,9 @@ async def test_lifecycle_helpers_drive_core_functions():
     plugin.ready_value = False
     assert not plugins_ready(state)
     async with http_client(app) as client:
-        assert (await client.get("/health")).status_code == 503
+        # Core's /ready aggregates plugin readiness; /health is engine only.
+        assert (await client.get("/ready")).status_code == 503
+        assert (await client.get("/health")).status_code == 200
     plugin.ready_value = True
     await drain_plugins(state, 5.0)
     assert state.draining is True
@@ -938,7 +943,8 @@ async def test_lifecycle_helpers_drive_core_functions():
     draining_seen, timeout = drained[0][1]
     assert draining_seen is True and 0 < timeout <= 5.0
     async with http_client(app) as client:
-        assert (await client.get("/health")).status_code == 503
+        assert (await client.get("/ready")).status_code == 503
+        assert (await client.get("/health")).status_code == 200
     await stop_plugins(state)
     assert [event[0] for event in plugin.events][-1] == "stop"
     assert state.started_endpoint_plugins == []
@@ -1440,7 +1446,7 @@ def _realtime_app() -> FastAPI:
     """A tiny app speaking the pinned Realtime event shapes."""
     app = FastAPI()
 
-    @app.websocket("/v1/realtime")
+    @app.websocket(realtime_support.REALTIME_PATH)
     async def realtime(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.send_json(
@@ -1674,7 +1680,7 @@ def test_file_request_builds_a_multipart_exchange():
     assert headers["content-type"].startswith("multipart/form-data")
     assert int(headers["content-length"]) == sum(map(len, exchange.chunks))
     assert headers["x-a"] == "1"
-    assert exchange.path == "/v1/audio/transcriptions"
+    assert exchange.path == "/plugins/riva/v1/audio/transcriptions"
     assert (b"host", b"testserver") in exchange.scope["headers"]
     no_length = file_request(FastAPI(), with_length=False, body=b"raw")
     assert "content-length" not in dict(no_length.headers)
@@ -1758,3 +1764,471 @@ def test_fake_transcription_keeps_the_served_models_sampling_settings():
     assert tuned.default_sampling_params == {"temperature": 0.7}
     tuned.default_sampling_params["top_p"] = 0.9
     assert tuned.default_sampling_params == {"temperature": 0.7, "top_p": 0.9}
+
+
+# ------------------------------------------- fake factory obligations
+
+
+async def _open(factory: FakeSessionFactory):
+    return await factory.open(cadence="560ms", locale="auto")
+
+
+async def _cancel_release(lease, seam: FakeSeam) -> None:
+    """Run ``release`` as a task, let it suspend, cancel and await it."""
+    seam.slow(lease, "release")
+    release = asyncio.create_task(lease.release())
+    await settle()
+    release.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await release
+
+
+@pytest.fixture
+def seam(clock):
+    return FakeSeam(FakeSessionFactory(clock=clock), clock)
+
+
+async def test_fake_generation_task_starts_with_open_and_ends_with_flush(
+    seam,
+):
+    lease = await _open(seam.factory)
+    await settle()
+    task = seam.generation(lease)
+    assert task is not None and not task.done()
+    assert seam.engine_calls(lease) == ["generate"]
+    await lease.flush()
+    await settle()
+    assert task.done() and not task.cancelled()
+    await lease.finish()
+    await lease.release()
+    assert seam.running_tasks() == set()
+    assert await seam.factory.drain(seam.clock.monotonic()) == []
+
+
+async def test_fake_abort_cancels_generation_once_and_awaits_its_abort(seam):
+    lease = await _open(seam.factory)
+    await settle()
+    engine_abort = seam.slow_engine_abort(lease)
+    abort = asyncio.create_task(lease.abort())
+    await engine_abort.entered.wait()
+    assert seam.engine_calls(lease) == ["generate", "abort"]
+    assert not abort.done(), "abort awaits the generation task's end"
+    engine_abort.release()
+    await abort
+    assert seam.generation(lease).cancelled()
+    assert seam.factory.cancel_log == [("abort", "generation", 0)]
+    assert seam.late_cancellations() == []
+
+
+async def test_fake_cancelled_abort_leaves_generation_running_then_holds(
+    seam,
+):
+    """``SESS-ABORT-002``: release after a cancelled abort keeps a task."""
+    lease = await _open(seam.factory)
+    await settle()
+    engine_abort = seam.slow_engine_abort(lease)
+    abort = asyncio.create_task(lease.abort())
+    await engine_abort.entered.wait()
+    abort.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abort
+    generation = seam.generation(lease)
+    assert not generation.done(), "the cancelled abort cancels no further"
+    await lease.release()
+    assert seam.owns(lease)
+    assert seam.factory.held_because[lease] == "generation_running"
+    drain = asyncio.create_task(seam.factory.drain(math.inf))
+    await settle()
+    assert not drain.done(), "drain(math.inf) awaits the holding task"
+    engine_abort.release()
+    assert await drain == []
+    assert generation.done() and not seam.owns(lease)
+    assert seam.late_cancellations() == []
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "raised"])
+async def test_fake_abort_cancels_generation_before_its_scripted_wait(
+    seam, outcome
+):
+    """``SESS-ABORT-001``: the cancellation stands whatever ``abort`` meets.
+
+    As the model's lease does, ``abort`` requests the generation task's
+    cancellation before its first suspension, so a scripted ``abort`` that
+    is cancelled or raises still leaves the task cancelled, and
+    ``drain(math.inf)`` returns once the later ``release`` has run.
+    """
+    lease = await _open(seam.factory)
+    await settle()
+    generation = seam.generation(lease)
+    if outcome == "cancelled":
+        block = seam.slow(lease, "abort")
+        abort = asyncio.create_task(lease.abort())
+        await block.entered.wait()
+        abort.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abort
+    else:
+        lease.script("abort", Raise(failed("engine_dead")))
+        with pytest.raises(SeamError):
+            await lease.abort()
+    assert lease.state == "aborted"
+    assert seam.factory.cancel_log == [("abort", "generation", 0)]
+    await settle()
+    assert generation.cancelled(), "abort cancelled generation first"
+    assert seam.engine_calls(lease) == ["generate", "abort"]
+    await lease.release()
+    assert await asyncio.wait_for(seam.factory.drain(math.inf), 5) == []
+    assert not seam.owns(lease)
+    assert seam.late_cancellations() == []
+
+
+async def test_fake_cancelled_release_hands_over_to_ordered_cleanup(seam):
+    """Obligations 2 and 6: the cleanup ends after the generation task."""
+    lease = await _open(seam.factory)
+    await settle()
+    engine_abort = seam.slow_engine_abort(lease)
+    abort = asyncio.create_task(lease.abort())
+    await engine_abort.entered.wait()
+    abort.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abort
+    await _cancel_release(lease, seam)
+    assert seam.handed_over(lease) and seam.owns(lease)
+    cleanup = seam.factory.cleanup[lease]
+    await settle()
+    assert not cleanup.done(), "the cleanup waits for the generation task"
+    engine_abort.release()
+    await settle()
+    events = seam.factory.events
+    assert events.index(("generation.end", 0)) < events.index(
+        ("cleanup.end", 0)
+    )
+    assert seam.late_cancellations() == []
+    assert seam.foreign_cancellations() == []
+
+
+async def test_fake_drain_with_a_finite_deadline_cancels_nothing(seam):
+    """Obligation 1: a finite deadline returns at the deadline."""
+    lease = await _open(seam.factory)
+    await lease.abort()
+    retirement = seam.slow_cleanup()
+    await _cancel_release(lease, seam)
+    drain = asyncio.create_task(seam.factory.drain(seam.clock.monotonic() + 2))
+    await seam.clock.advance(2.1)
+    assert await drain == []
+    assert seam.owns(lease), "the deadline cancelled nothing"
+    retirement.release()
+    assert await seam.factory.drain(math.inf) == []
+    assert not seam.owns(lease)
+
+
+async def test_fake_retained_faults_are_returned_once(seam):
+    """Obligations 3 and 4, and the exclusions of obligation 3."""
+    factory = seam.factory
+    # An ordinary refusal and a surfaced generation failure: no fault.
+    factory.script("open", Raise(refused("capacity")))
+    with pytest.raises(SeamError):
+        await _open(factory)
+    lease = await _open(factory)
+    await settle()
+    seam.fail_generation(lease, failed("engine_dead"))
+    await settle()
+    with pytest.raises(SeamError) as info:
+        await lease.feed(np.zeros(4, np.float32), on_accepted=lambda n: None)
+    assert info.value.reason == "engine_dead"
+    assert await factory.drain(seam.clock.monotonic()) == []
+
+    # A generation task whose handler raises after the hand-over.
+    lease = await _open(factory)
+    await settle()
+    late = RuntimeError("abort failed after the hand-over")
+    handler = seam.fail_engine_abort(lease, late)
+    abort = asyncio.create_task(lease.abort())
+    await handler.entered.wait()
+    abort.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abort
+    await _cancel_release(lease, seam)
+    handler.release()
+    assert await factory.drain(math.inf) == [late]
+    assert await factory.drain(math.inf) == []
+
+    # A handler raising while an uncancelled abort awaits it.
+    lease = await _open(factory)
+    await settle()
+    raised = RuntimeError("handler raised under abort")
+    handler = seam.fail_engine_abort(lease, raised)
+    handler.release()
+    await lease.abort()  # returns normally
+    assert await factory.drain(seam.clock.monotonic()) == [raised]
+    assert await factory.drain(seam.clock.monotonic()) == []
+
+
+async def test_fake_cancelled_open_after_generation_started_is_held(seam):
+    factory = seam.factory
+    opening = asyncio.create_task(_open(factory))
+    block = seam.slow_open()
+    await block.entered.wait()
+    (lease,) = factory.generation
+    assert lease.generation_started
+    engine_abort = seam.slow_engine_abort(lease)
+    opening.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    sources = [entry[0] for entry in factory.cancel_log]
+    assert sources == ["open", "open.hand_over"]
+    assert factory.held_because[lease] == "cancelled_open"
+    await engine_abort.entered.wait()
+    engine_abort.release()
+    faults, still_running = await reference_settlement(factory, seam.clock)
+    assert faults == [] and still_running == []
+    assert seam.running_tasks() == set()
+    assert seam.late_cancellations() == []
+
+
+async def test_fake_cancelled_open_before_generation_step_drops_it(seam):
+    factory = seam.factory
+    block = seam.slow_open(before_generation=True)
+    opening = asyncio.create_task(_open(factory))
+    await block.entered.wait()
+    ((lease, generation),) = factory.generation.items()
+    assert not lease.generation_started
+    opening.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    assert factory.holding == {} and factory.cleanup == {}
+    await asyncio.sleep(0)
+    assert generation.cancelled(), "ended within one loop turn"
+    assert seam.engine_calls(lease) == []
+    assert ("generation.start", 0) not in factory.events
+    assert seam.running_tasks() == set()
+    assert seam.abandoned() is lease
+
+
+async def test_fake_seam_refuse_next_open_refuses_once_starting_nothing(seam):
+    factory = seam.factory
+    seam.refuse_next_open("capacity")
+    with pytest.raises(SeamError) as info:
+        await _open(factory)
+    assert (info.value.session_error, info.value.reason) == (
+        "refused",
+        "capacity",
+    )
+    assert factory.leases == [] and factory.generation == {}
+    assert seam.running_tasks() == set()
+    assert seam.abandoned() is None, "a refusal gave up no session"
+    lease = await _open(factory)  # only the next ``open`` is refused
+    assert factory.leases == [lease]
+
+
+async def test_fake_seam_exposes_an_abandoned_session_and_holds_its_abort(
+    seam,
+):
+    factory = seam.factory
+    assert seam.abandoned() is None
+    engine_abort = seam.slow_abandoned_engine_abort()
+    block = seam.slow_open()
+    opening = asyncio.create_task(_open(factory))
+    await block.entered.wait()
+    await settle()
+    opening.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+    session = seam.abandoned()
+    assert session is not None and session not in factory.leases
+    await settle()
+    generation = seam.generation(session)
+    assert seam.engine_calls(session) == ["generate", "abort"]
+    assert not generation.done(), "the engine abort is kept pending"
+    assert seam.owns(session)
+    assert engine_abort.entered.is_set()
+    engine_abort.release()
+    assert await asyncio.wait_for(factory.drain(math.inf), 5) == []
+    assert generation.cancelled() and not seam.owns(session)
+    # The hook applies to one ``open`` only.
+    later = await _open(factory)
+    await settle()
+    assert later.pending("engine_abort") == 0
+
+
+async def test_fake_teardown_all_returns_every_task_and_is_inert_after(seam):
+    """Obligations 7 and 8, and the last-resort case of ING-EP-096."""
+    factory = seam.factory
+    lease = await _open(factory)
+    await settle()
+    engine_abort = seam.slow_engine_abort(lease)
+    faults, still_running = await asyncio.wait_for(
+        _settle_with(factory, seam, engine_abort), 5
+    )
+    assert still_running == [lease.generation]
+    assert faults == []
+    assert factory.closed
+    with pytest.raises(SeamError):
+        await _open(factory)
+    # Repeated settlement ends at once and reports nothing again.
+    again = factory.teardown_all()
+    assert all(task.done() for task in again)
+    assert await factory.drain(math.inf) == []
+    assert factory.refused_after_close == []
+
+
+async def _settle_with(factory, seam, engine_abort):
+    settlement = asyncio.create_task(reference_settlement(factory, seam.clock))
+    await engine_abort.entered.wait()
+    engine_abort.release()
+    return await settlement
+
+
+async def test_fake_records_foreign_cancellations_of_factory_tasks(seam):
+    lease = await _open(seam.factory)
+    await settle()
+    seam.generation(lease).cancel()  # nobody in the factory asked
+    await settle()
+    assert seam.foreign_cancellations() == [("generation", 0)]
+
+
+async def test_fake_counts_concurrent_drains(seam):
+    lease = await _open(seam.factory)
+    await lease.abort()
+    retirement = seam.slow_cleanup()
+    await _cancel_release(lease, seam)
+    first = asyncio.create_task(seam.factory.drain(math.inf))
+    second = asyncio.create_task(seam.factory.drain(math.inf))
+    await settle()
+    assert seam.factory.max_concurrent_drains == 2
+    retirement.release()
+    await asyncio.gather(first, second)
+    assert seam.factory.active_drains == 0
+
+
+# ------------------------------------------------ namespace and auth harness
+
+
+def test_plugin_namespace_constants_agree():
+    assert app_support.PLUGIN_PREFIX == "/plugins/riva/v1"
+    assert realtime_support.REALTIME_PATH == "/plugins/riva/v1/realtime"
+    assert realtime_support.REALTIME_URL == (
+        "/plugins/riva/v1/realtime?intent=transcription"
+    )
+    assert (app_support.BOOTSTRAP_ROUTE[1]) == realtime_support.BOOTSTRAP_PATH
+    assert app_support.FILE_ROUTE[1] == http_support.ROUTE
+    assert http_support.CORE_ROUTE == "/v1/audio/transcriptions"
+    routes = app_support.frontend_routes()
+    assert len(routes) == 7
+    assert all(path.startswith("/plugins/riva/v1/") for _, path in routes)
+    assert app_support.FILE_ROUTE not in app_support.frontend_routes(
+        file_route=False
+    )
+
+
+def test_core_app_attach_plugins_and_all_routes():
+    core = app_support.core_app(("transcription", "realtime"))
+    before = app_support.all_routes(core)
+    assert ("http", "/v1/audio/transcriptions") in {
+        (kind, path) for kind, path, _, _ in before
+    }
+    other = app_support.RouteAddingPlugin(
+        "other",
+        http=[("GET", "/plugins/other/x")],
+        websocket=["/plugins/other/ws"],
+        mounts=["/plugins/mounted"],
+    )
+    app_support.attach_plugins(core, [other])
+    after = app_support.all_routes(core)
+    assert after[: len(before)] == before
+    added = {(kind, path) for kind, path, _, _ in after[len(before) :]}
+    assert added == {
+        ("http", "/plugins/other/x"),
+        ("websocket", "/plugins/other/ws"),
+        ("mount", "/plugins/mounted"),
+    }
+
+
+async def test_build_app_installs_core_auth_registrations_on_request():
+    plain = build_app()
+    assert app_support.auth_registrations(plain) == []
+    keyed = build_app(
+        api_key="secret", auth_registrations=[{"tokens": ["other"]}, {}]
+    )
+    # Outermost first: the last registration added wraps the others.
+    assert app_support.auth_registrations(keyed) == [
+        {},
+        {"tokens": ["other"]},
+        {"tokens": ["secret"]},
+    ]
+
+
+async def test_build_app_reads_vllm_api_key_from_the_environment(monkeypatch):
+    monkeypatch.setenv("VLLM_API_KEY", "from-env")
+    app = build_app()
+    assert app_support.auth_registrations(app) == [{"tokens": ["from-env"]}]
+
+
+async def test_root_path_reaches_the_scope_on_every_driver():
+    seen: list[tuple[str, str]] = []
+
+    async def app(scope, receive, send) -> None:
+        seen.append((scope["root_path"], scope["path"]))
+        if scope["type"] == "websocket":
+            await receive()
+            await send({"type": "websocket.close", "code": 1000})
+            return
+        await send({"type": "http.response.start", "status": 204})
+        await send({"type": "http.response.body", "body": b""})
+
+    socket = AsgiWebSocket(app, "/plugins/riva/v1/x", root_path="/proxy")
+    assert not await socket.connect()
+    assert socket.refused_before_accept
+    await asgi_http(app, "GET", "/plugins/riva/v1/y", root_path="/proxy")
+    assert seen == [
+        ("/proxy", "/proxy/plugins/riva/v1/x"),
+        ("/proxy", "/proxy/plugins/riva/v1/y"),
+    ]
+
+
+async def test_asgi_websocket_offers_and_reads_a_denial_response():
+    async def app(scope, receive, send) -> None:
+        await receive()
+        if "websocket.http.response" in scope.get("extensions", {}):
+            await send(
+                {
+                    "type": "websocket.http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            await send(
+                {
+                    "type": "websocket.http.response.body",
+                    "body": b'{"error": "Unauthorized"}',
+                }
+            )
+            return
+        await send({"type": "websocket.close", "code": 1008})
+
+    denied = AsgiWebSocket(app, denial_response=True)
+    assert not await denied.connect()
+    assert await denied.read_denial() == (401, {"error": "Unauthorized"})
+    assert denied.refused_before_accept
+
+    closed = AsgiWebSocket(app)
+    assert closed.scope["path"] == "/plugins/riva/v1/realtime"
+    assert closed.scope["query_string"] == b"intent=transcription"
+    assert "extensions" not in closed.scope
+    assert not await closed.connect()
+    assert closed.close_code == 1008 and closed.refused_before_accept
+
+
+def test_state_stub_presets_draining_and_records_shutdown_observations():
+    engine = FakeEngineClient()
+    state = make_state(engine, draining=True)
+    assert state.draining is True
+    seen: list[bool] = []
+    state.request_shutdown = RecordingShutdown(
+        on_call=lambda: seen.append(state.draining) or "observed"
+    )
+    state.request_shutdown()
+    assert seen == [True]
+    assert state.request_shutdown.observations == ["observed"]
+    absent = make_args(api_server_count=ABSENT)
+    assert not hasattr(absent, "api_server_count")

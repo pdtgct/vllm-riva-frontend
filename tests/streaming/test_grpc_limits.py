@@ -18,7 +18,13 @@ from support.audio import (
 )
 from support.fake_session import Block, Raise
 from support.grpc_harness import FakeServicerContext, RpcAbort, aio_channel
-from support.riva import LINEAR_PCM, MULAW, UNSPECIFIED, recognition_config
+from support.riva import (
+    LINEAR_PCM,
+    MULAW,
+    UNSPECIFIED,
+    catalog_code,
+    recognition_config,
+)
 
 from .conftest import (
     riva_options,
@@ -35,6 +41,33 @@ LIMIT_OPTIONS = (
 )
 
 
+#: Every code of the frontend's error catalog (ING-ERR-060).
+CATALOG_CODES = frozenset(
+    {
+        "service_unavailable",
+        "busy",
+        "admission_wait_timeout",
+        "idle_timeout",
+        "finalization_timeout",
+        "configuration_timeout",
+        "request_timeout",
+        "malformed_request",
+        "request_too_large",
+        "session_terminal",
+        "protocol_order",
+        "invalid_event",
+        "invalid_config_field",
+        "unsupported_capability",
+        "unknown_locale",
+        "config_change_rejected",
+        "unsupported_format",
+        "invalid_audio",
+        "buffer_overflow",
+        "internal",
+    }
+)
+
+
 def _failure_text(exc: BaseException) -> str:
     failures = getattr(exc, "failures", None) or []
     return " ".join([str(exc), *map(str, failures)])
@@ -42,7 +75,7 @@ def _failure_text(exc: BaseException) -> str:
 
 @pytest.mark.parametrize("option", LIMIT_OPTIONS)
 @pytest.mark.parametrize("value", [0, -1, float("inf")])
-# @spec ING-GRPC-031
+# @spec ING-GRPC-034
 async def test_init_state_requires_finite_positive_limits(clock, option, value):
     with pytest.raises(Exception) as caught:
         async with serving(
@@ -52,7 +85,7 @@ async def test_init_state_requires_finite_positive_limits(clock, option, value):
     assert option in _failure_text(caught.value)
 
 
-# @spec ING-GRPC-031
+# @spec ING-GRPC-034
 async def test_init_state_requires_the_receive_cap_relation(clock):
     options = small_unary_options(grpc_receive_max_bytes=8192 + 1024 + 1)
     with pytest.raises(Exception) as caught:
@@ -61,7 +94,7 @@ async def test_init_state_requires_the_receive_cap_relation(clock):
     assert "grpc_receive_max_bytes" in _failure_text(caught.value)
 
 
-# @spec ING-GRPC-031
+# @spec ING-GRPC-034
 async def test_default_receive_cap_is_audio_limit_plus_envelope(clock):
     async with serving(clock=clock, start=False) as served:
         config = served.plugin.config
@@ -71,7 +104,8 @@ async def test_default_receive_cap_is_audio_limit_plus_envelope(clock):
         )
 
 
-# @spec ING-GRPC-031
+# @spec ING-GRPC-034
+# @spec ING-ERR-061
 async def test_framework_cap_applies_to_both_rpcs_on_the_listener(clock):
     options = small_unary_options()
     address = options["grpc_bind"]
@@ -89,6 +123,8 @@ async def test_framework_cap_applies_to_both_rpcs_on_the_listener(clock):
                 timeout=5.0,
             )
         assert unary.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        # gRPC's native framing error: no catalog code leads its details
+        assert catalog_code(unary.value.details()) not in CATALOG_CODES
 
         async def requests():
             yield rasr.StreamingRecognizeRequest(
@@ -102,6 +138,7 @@ async def test_framework_cap_applies_to_both_rpcs_on_the_listener(clock):
             async for _ in stub.StreamingRecognize(requests(), timeout=5.0):
                 pass
         assert streaming.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        assert catalog_code(streaming.value.details()) not in CATALOG_CODES
 
 
 # ------------------------------------------------------------ unary
@@ -265,37 +302,55 @@ async def test_unary_recognize_writes_nothing_to_the_filesystem(clock):
             ),
             audio=wav_pcm16(pcm16_sine(0.1)),
         )
-        with _Writes() as writes:
-            # success, both declared and header-inferred
-            await served.servicer.Recognize(good, FakeServicerContext())
-            await served.servicer.Recognize(riff, FakeServicerContext())
-            # rejection
-            with pytest.raises(RpcAbort):
-                await served.servicer.Recognize(too_big, FakeServicerContext())
-            # failure inside core's service
-            served.transcription.script(Raise(RuntimeError("engine fault")))
-            with pytest.raises(RpcAbort):
+        # The transcription calls left blocked below are released at the
+        # end: a conforming stop awaits a file call without cancelling it
+        # (ING-FILE-077, ING-FILE-079), so an unreleased call would hang it.
+        gates: list[Block] = []
+        try:
+            with _Writes() as writes:
+                # success, both declared and header-inferred
                 await served.servicer.Recognize(good, FakeServicerContext())
-            # cancellation while core works
-            gate = Block()
-            served.transcription.script(gate)
-            context = FakeServicerContext()
-            task = asyncio.create_task(served.servicer.Recognize(good, context))
-            await asyncio.wait_for(gate.entered.wait(), 2.0)
-            context.cancel()
-            task.cancel()
-            await asyncio.wait({task}, timeout=5.0)
-            # the RPC deadline while core works
-            served.transcription.script(Block())
-            context = FakeServicerContext(
-                time_remaining=1.0, clock=served.clock
-            )
-            task = asyncio.create_task(served.servicer.Recognize(good, context))
-            await served.clock.settle(50)
-            await served.clock.advance(2.0)
-            await asyncio.wait({task}, timeout=5.0)
-            if not task.done():
+                await served.servicer.Recognize(riff, FakeServicerContext())
+                # rejection
+                with pytest.raises(RpcAbort):
+                    await served.servicer.Recognize(
+                        too_big, FakeServicerContext()
+                    )
+                # failure inside core's service
+                served.transcription.script(Raise(RuntimeError("engine fault")))
+                with pytest.raises(RpcAbort):
+                    await served.servicer.Recognize(good, FakeServicerContext())
+                # cancellation while core works
+                gate = Block()
+                gates.append(gate)
+                served.transcription.script(gate)
+                context = FakeServicerContext()
+                task = asyncio.create_task(
+                    served.servicer.Recognize(good, context)
+                )
+                await asyncio.wait_for(gate.entered.wait(), 2.0)
+                context.cancel()
                 task.cancel()
                 await asyncio.wait({task}, timeout=5.0)
+                # the RPC deadline while core works
+                deadline_gate = Block()
+                gates.append(deadline_gate)
+                served.transcription.script(deadline_gate)
+                context = FakeServicerContext(
+                    time_remaining=1.0, clock=served.clock
+                )
+                task = asyncio.create_task(
+                    served.servicer.Recognize(good, context)
+                )
+                await served.clock.settle(50)
+                await served.clock.advance(2.0)
+                await asyncio.wait({task}, timeout=5.0)
+                if not task.done():
+                    task.cancel()
+                    await asyncio.wait({task}, timeout=5.0)
+                await served.clock.settle(50)
+            assert writes == [], writes
+        finally:
+            for gate in gates:
+                gate.release()
             await served.clock.settle(50)
-        assert writes == [], writes

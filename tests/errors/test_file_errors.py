@@ -1,7 +1,8 @@
 """Errors of the complete-file paths: ``Recognize`` and the file route.
 
-``Recognize`` is called on the servicer directly; the file route through
-``test_app`` (core's routers, exception handlers and middleware). Core's
+``Recognize`` is called on the servicer directly; the frontend's file route
+``POST /plugins/riva/v1/audio/transcriptions`` (``support.http.ROUTE``)
+through ``test_app`` (core's routers, exception handlers and middleware). Core's
 transcription service is ``FakeTranscriptionServing``, scripted to raise or
 return what core's would.
 """
@@ -17,6 +18,7 @@ import pytest
 from support.audio import pcm16_bytes, pcm16_sine, wav_bytes
 from support.fake_session import Block, Raise
 from support.fake_transcription import error_response
+from support.http import ROUTE
 from support.riva import recognize, recognize_request
 
 MODEL = "nvidia/nemotron-asr-streaming-test"
@@ -32,12 +34,11 @@ async def _recognize(plugin, request):
 # ------------------------------------------------------------- Recognize
 
 
-# @spec ING-ERR-052, ING-ERR-053, ING-ERR-054, ING-ERR-039, ING-ERR-040
+# @spec ING-ERR-052, ING-ERR-053, ING-ERR-039, ING-ERR-040
 @pytest.mark.parametrize(
     ("raised", "status", "code"),
     [
         ("size", "RESOURCE_EXHAUSTED", "request_too_large"),
-        ("budget", "RESOURCE_EXHAUSTED", "request_too_large"),
         ("value", "INVALID_ARGUMENT", "invalid_config_field"),
         ("dead", "UNAVAILABLE", "service_unavailable"),
         ("other", "INTERNAL", "internal"),
@@ -53,7 +54,6 @@ async def test_recognize_projects_cores_raised_exceptions(
         "size": VLLMValidationError(
             "Maximum file size exceeded", parameter="audio_filesize_mb"
         ),
-        "budget": ValueError("file exceeds max_model_len: 9 > 8"),
         "value": ValueError("something core did not like"),
         "dead": EngineDeadError(),
         "other": RuntimeError("boom"),
@@ -97,7 +97,7 @@ async def test_recognize_projects_a_returned_error_response(
         assert "language" in outcome.details.split("(fields:", 1)[1]
 
 
-# @spec ING-ERR-022, ING-ERR-029, ING-ERR-003
+# @spec ING-ERR-022, ING-ERR-064, ING-ERR-003
 async def test_recognize_truncated_riff_data_is_invalid_audio(
     started, fake_transcription, helpers
 ) -> None:
@@ -115,7 +115,7 @@ async def test_recognize_truncated_riff_data_is_invalid_audio(
     assert fake_transcription.calls == []
 
 
-# @spec ING-ERR-029, ING-ERR-003
+# @spec ING-ERR-064, ING-ERR-003
 async def test_recognize_rejection_names_every_offending_field(
     started, fake_transcription, helpers
 ) -> None:
@@ -157,7 +157,7 @@ async def test_route_malformed_content_type_is_400_in_cores_shape(
 ) -> None:
     async with _client(test_app) as client:
         response = await client.post(
-            "/v1/audio/transcriptions",
+            ROUTE,
             content=b"not multipart",
             headers={"Content-Type": "text/plain"},
         )
@@ -173,7 +173,7 @@ async def test_route_oversized_content_type_is_413(started, test_app) -> None:
     value = "multipart/form-data; boundary=" + "a" * 5000
     async with _client(test_app) as client:
         response = await client.post(
-            "/v1/audio/transcriptions",
+            ROUTE,
             content=b"x",
             headers={"Content-Type": value},
         )
@@ -186,7 +186,7 @@ async def test_route_before_start_is_503_service_unavailable(
     app_state, test_app
 ) -> None:
     async with _client(test_app) as client:
-        response = await client.post("/v1/audio/transcriptions", **_form())
+        response = await client.post(ROUTE, **_form())
     assert response.status_code == 503
     error = response.json()["error"]
     assert error["message"].startswith("service_unavailable: ")
@@ -194,6 +194,7 @@ async def test_route_before_start_is_503_service_unavailable(
 
 
 # @spec ING-ERR-009
+# @spec ING-ERR-061
 async def test_route_passes_cores_error_response_through_unchanged(
     started, test_app, fake_transcription
 ) -> None:
@@ -204,7 +205,7 @@ async def test_route_passes_cores_error_response_through_unchanged(
     )
     fake_transcription.script(Return(core_error))
     async with _client(test_app) as client:
-        response = await client.post("/v1/audio/transcriptions", **_form())
+        response = await client.post(ROUTE, **_form())
     assert response.status_code == 400
     assert response.json() == core_error.model_dump()
 
@@ -219,7 +220,7 @@ async def test_route_passes_cores_raised_validation_error_through(
         Raise(VLLMValidationError("bad value", parameter="temperature"))
     )
     async with _client(test_app) as client:
-        response = await client.post("/v1/audio/transcriptions", **_form())
+        response = await client.post(ROUTE, **_form())
     assert response.status_code == 400
     error = response.json()["error"]
     # core's own handler shaped it: no frontend catalog prefix
@@ -238,7 +239,7 @@ async def test_route_stalled_body_is_408_request_timeout(
         asgi_http(
             test_app,
             "POST",
-            "/v1/audio/transcriptions",
+            ROUTE,
             headers=[
                 ("content-type", "multipart/form-data; boundary=xyz"),
                 ("content-length", "100"),
@@ -258,20 +259,28 @@ async def test_route_stalled_body_is_408_request_timeout(
 async def test_route_core_execution_timeout_is_504(
     started, test_app, clock, fake_transcription, helpers
 ) -> None:
-    fake_transcription.script(Block())
-    async with _client(test_app) as client:
-        request = asyncio.create_task(
-            client.post("/v1/audio/transcriptions", **_form())
+    core_call = Block()
+    fake_transcription.script(core_call)
+    try:
+        async with _client(test_app) as client:
+            request = asyncio.create_task(client.post(ROUTE, **_form()))
+            await helpers.until(lambda: len(fake_transcription.calls) == 1)
+            await clock.advance(1201)  # file_execution_timeout default: 1200 s
+            # Core's call does not settle, so the handler answers when the
+            # cleanup bound expires (ING-FILE-078: session_cleanup_timeout,
+            # 30 s).
+            await clock.advance(31)
+            # A bounded poll, not asyncio.wait_for: cancelling the request
+            # task is a transport cancellation the owner absorbs while its
+            # cleanup waits on virtual time, so a cancelling wait would never
+            # return.
+            await helpers.until(request.done, what="the 504 answer")
+            response = request.result()
+        assert response.status_code == 504
+        assert response.json()["error"]["message"].startswith(
+            "request_timeout: "
         )
-        await helpers.until(lambda: len(fake_transcription.calls) == 1)
-        await clock.advance(1201)  # file_execution_timeout default: 1200 s
-        # Core's call never settles, so the handler answers when the cleanup
-        # bound expires (ING-FILE-070: session_cleanup_timeout, 30 s).
-        await clock.advance(31)
-        # A bounded poll, not asyncio.wait_for: cancelling the request task
-        # is a transport cancellation the owner absorbs while its cleanup
-        # waits on virtual time, so a cancelling wait would never return.
-        await helpers.until(request.done, what="the 504 answer")
-        response = request.result()
-    assert response.status_code == 504
-    assert response.json()["error"]["message"].startswith("request_timeout: ")
+    finally:
+        # The continuation still awaits core's call, and a conforming stop
+        # awaits it without cancelling it (ING-FILE-077, ING-FILE-079).
+        core_call.release()

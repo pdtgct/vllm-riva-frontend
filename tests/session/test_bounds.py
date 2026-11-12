@@ -8,6 +8,9 @@ Defaults (vehicle leaf): ``preconfiguration_timeout`` 30 s,
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import grpc
 import pytest
 from support.audio import pcm16_bytes, pcm16_sine
@@ -33,7 +36,7 @@ async def _opened(riva, fake_factory):
 # --------------------------------------------------------- configuration
 
 
-# @spec ING-LIFE-022, ING-LIFE-057
+# @spec ING-LIFE-022, ING-LIFE-062
 async def test_silent_preconfiguration_times_out_and_frees_the_slot(
     riva, fake_factory, started
 ):
@@ -157,7 +160,7 @@ async def test_client_idle_timing_is_suspended_during_a_lease_call(
 # ------------------------------------------------------------ lease call
 
 
-# @spec ING-LIFE-042, ING-LIFE-057
+# @spec ING-LIFE-042, ING-LIFE-062
 async def test_a_feed_over_lease_call_timeout_breaks_the_lease(
     riva, fake_factory
 ):
@@ -229,7 +232,7 @@ class TestFinalizationDisarms:
         assert call.finals == ["final words"]
 
 
-# @spec ING-LIFE-044, ING-LIFE-057
+# @spec ING-LIFE-044, ING-LIFE-062
 async def test_the_finalization_bound_applies_after_half_close(
     riva, fake_factory
 ):
@@ -253,7 +256,7 @@ async def test_the_finalization_bound_applies_after_half_close(
 # --------------------------------------------------------------- cleanup
 
 
-# @spec ING-LIFE-037
+# @spec ING-LIFE-060
 async def test_an_exhausted_cleanup_budget_hands_the_session_to_the_factory(
     riva, fake_factory, started
 ):
@@ -283,7 +286,7 @@ async def test_an_exhausted_cleanup_budget_hands_the_session_to_the_factory(
     assert len(started.registry.records) == 0
 
 
-# @spec ING-LIFE-037
+# @spec ING-LIFE-059
 async def test_the_cleanup_budget_is_shared_by_abort_and_release(
     riva, fake_factory
 ):
@@ -308,3 +311,178 @@ async def test_the_cleanup_budget_is_shared_by_abort_and_release(
     await call.wait()
     assert fake_factory.handed_over == [lease]
     assert lease.state == "aborted"
+
+
+# ------------------------------------------ cleanup and the drain deadline
+
+CLEANUP = 30.0
+
+
+async def _drain(started, app_state, timeout: float):
+    """Start the plugin's ``drain`` as core calls it; return ``(task, D)``."""
+    from support.app import drain_plugin
+
+    from vllm_riva_frontend.lifecycle import engine_reserve
+
+    deadline = started.clock.monotonic() + timeout - engine_reserve(timeout)
+    task = asyncio.ensure_future(drain_plugin(started, app_state, timeout))
+    await started.clock.settle()
+    return task, deadline
+
+
+async def _ended(task) -> None:
+    """Let a plugin call end; cancel it if it is still running."""
+    done, _ = await asyncio.wait({task}, timeout=2)
+    if not done:
+        task.cancel()
+        await asyncio.wait({task}, timeout=2)
+    with contextlib.suppress(BaseException):
+        task.result()
+
+
+def _fail_with_release_held(call, lease) -> Block:
+    """Fail the lease's next ``feed``; keep ``release`` suspended."""
+    lease.script("feed", Raise(failed("expired")))
+    release = Block()
+    lease.script("release", release)
+    call.audio(PIECE)
+    return release
+
+
+# @spec ING-LIFE-059
+@pytest.mark.parametrize("when", ["graceful", "draining_only", "after_d"])
+async def test_cleanup_bound_fixed_at_start_d_during_graceful_else_cleanup_timeout(  # noqa: E501
+    riva, fake_factory, started, app_state, drain_trigger, when
+):
+    call, lease = await _opened(riva, fake_factory)
+    drain = None
+    if when == "graceful":
+        # ``D`` is 90 s away: the cleanup bound is the time remaining to it,
+        # not capped by ``session_cleanup_timeout`` (30 s).
+        drain, deadline = await _drain(started, app_state, 100.0)
+        release = _fail_with_release_held(call, lease)
+        await release.entered.wait()
+        start = call.clock.monotonic()
+        expires = deadline
+    elif when == "draining_only":
+        # Core set ``state.draining`` and no ``drain`` call runs.
+        app_state.draining = True
+        release = _fail_with_release_held(call, lease)
+        await release.entered.wait()
+        start = call.clock.monotonic()
+        expires = start + CLEANUP
+    else:
+        # Cleanup begins at ``D``, when the outstanding feed's wait ends.
+        lease.script("feed", Block())
+        release = Block()
+        lease.script("release", release)
+        call.audio(PIECE)
+        drain, deadline = await drain_trigger()
+        await call.advance(deadline - call.clock.monotonic() + 0.01)
+        await release.entered.wait()
+        start = call.clock.monotonic()
+        expires = start + CLEANUP
+    try:
+        assert lease.names()[-2:] == ["abort", "release"]
+        await call.advance(min(CLEANUP, expires - start) - 0.2)
+        assert lease not in fake_factory.handed_over, "the bound ended early"
+        if expires - start > CLEANUP:
+            await call.advance(expires - call.clock.monotonic() - 0.2)
+            assert lease not in fake_factory.handed_over, (
+                "the bound was capped by session_cleanup_timeout"
+            )
+
+        await call.advance(0.4)
+        await call.wait()
+        assert fake_factory.handed_over == [lease], "the bound did not expire"
+        assert len(started.registry.records) == 0
+    finally:
+        release.release()
+        if drain is not None and when == "graceful":
+            await _ended(drain)
+
+
+# @spec ING-LIFE-060
+@pytest.mark.parametrize("where", ["serving", "stop"])
+@pytest.mark.parametrize("outstanding", ["abort", "release"])
+async def test_expiry_cancels_release_or_abort_then_runs_and_cancels_release_task(  # noqa: E501
+    riva, fake_factory, started, app_state, where, outstanding
+):
+    from support.app import stop_plugins
+
+    call, lease = await _opened(riva, fake_factory)
+    engine_abort = Block()
+    if outstanding == "abort":
+        # ``abort`` waits for the generation task's engine abort.
+        lease.script("engine_abort", engine_abort)
+    release = Block()
+    lease.script("release", release)
+    stopper = None
+    if where == "serving":
+        call.audio(PIECE)  # starts the idle bound
+        lease.script("feed", Raise(failed("expired")))
+        call.audio(PIECE)
+    else:
+        stopper = asyncio.ensure_future(stop_plugins(app_state))
+    await call.until(lambda: outstanding in lease.names(), what=outstanding)
+    await call.settle()
+    try:
+        await call.advance(CLEANUP - 0.2)
+        assert lease not in fake_factory.handed_over
+        assert not release.released.is_set()
+
+        await call.advance(0.4)
+        await call.wait()
+
+        # ``release`` began after the outstanding call settled, ran to its
+        # first suspension and was cancelled there and awaited: the session
+        # is with the factory's cleanup before the owner counts as ended.
+        assert lease.names()[-2:] == ["abort", "release"]
+        assert release.entered.is_set(), "release was cancelled unstarted"
+        assert fake_factory.handed_over == [lease]
+        assert lease.state == "aborted", "release completed instead"
+        assert "teardown" not in lease.names()
+        assert len(started.registry.records) == 0
+    finally:
+        engine_abort.release()
+        release.release()
+        if stopper is not None:
+            await _ended(stopper)
+
+
+# @spec ING-LIFE-062
+@pytest.mark.parametrize("drain", ["draining_only", "graceful"])
+async def test_waits_clip_to_d_only_during_graceful_drain(
+    riva, fake_factory, started, app_state, drain
+):
+    call, lease = await _opened(riva, fake_factory)
+    lease.script("feed", Block())
+    call.audio(PIECE)
+    await call.until(lambda: "feed" in lease.names(), what="feed")
+    task = None
+    try:
+        if drain == "draining_only":
+            # No ``drain`` call: the 45 s ``lease_call_timeout`` holds.
+            app_state.draining = True
+            await call.advance(44.8)
+            assert not call.done, "the bound was clipped without a drain"
+            await call.advance(0.4)
+            await call.wait()
+            call.assert_status(
+                grpc.StatusCode.UNAVAILABLE, "service_unavailable"
+            )
+        else:
+            # During the drain's graceful work the wait ends at ``D``.
+            task, deadline = await _drain(started, app_state, 20.0)
+            await call.advance(deadline - call.clock.monotonic() - 0.1)
+            assert not call.done
+            await call.advance(0.2)
+            await call.wait()
+            call.assert_status(
+                grpc.StatusCode.UNAVAILABLE, "service_unavailable"
+            )
+            assert call.clock.monotonic() < deadline + 1
+        assert lease.names() == ["feed", "abort", "release"]
+    finally:
+        if task is not None:
+            await _ended(task)

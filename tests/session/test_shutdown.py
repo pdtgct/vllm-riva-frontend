@@ -8,6 +8,7 @@ the plugin raises the shutdown trigger for every remaining stream owner.
 from __future__ import annotations
 
 import grpc
+import pytest
 from support.audio import pcm16_bytes, pcm16_sine
 from support.fake_session import Block, Raise, Return, failed
 from support.realtime import COMPLETED, append_event, error_code
@@ -101,7 +102,7 @@ async def test_a_failure_while_settling_takes_the_shutdown_abort_row(
     assert "finish" not in lease.names()
 
 
-# @spec ING-LIFE-053, ING-LIFE-057
+# @spec ING-LIFE-053, ING-LIFE-062
 async def test_a_settlement_wait_is_clipped_to_the_drain_deadline(
     riva, fake_factory, drain_trigger
 ):
@@ -118,6 +119,110 @@ async def test_a_settlement_wait_is_clipped_to_the_drain_deadline(
     # The feed's own bound (45 s) has not expired; D has.
     call.assert_status(grpc.StatusCode.UNAVAILABLE, "service_unavailable")
     assert lease.names()[-3:] == ["feed", "abort", "release"]
+
+
+SLICE = 1600
+
+
+class TestReadMessage:
+    @pytest.fixture
+    def riva_options(self):
+        return {"pre_submit_max_samples": SLICE}
+
+    # @spec ING-LIFE-065
+    async def test_shutdown_finalization_feeds_the_rest_of_the_read_message_before_flush(  # noqa: E501
+        self, riva, fake_factory, drain_trigger
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        first = Block()
+        lease.script("feed", first)
+        # One read, validated message of three slices; the first is fed.
+        call.audio(pcm16_bytes(pcm16_sine(0.3)))
+        await first.entered.wait()
+        pulls = call.requests.pulls
+
+        await drain_trigger()
+        first.release(Return([]))
+        await call.wait()
+
+        names = lease.names()
+        assert "flush" in names
+        before_flush = names[: names.index("flush")]
+        # Every slice of the message, then the resampler tail, before flush.
+        assert before_flush.count("feed") >= 3
+        assert sum(lease.accepted) >= 3 * SLICE
+        assert names[-3:] == ["flush", "finish", "release"]
+        assert call.finals == ["final words"]
+        call.assert_ok()
+        # No further transport message was read.
+        assert call.requests.pulls == pulls
+
+    # @spec ING-LIFE-065
+    async def test_a_slice_that_cannot_be_fed_takes_the_shutdown_abort_row(
+        self, riva, fake_factory, drain_trigger
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        first = Block()
+        second = Block()
+        lease.script("feed", first, second)
+        call.audio(pcm16_bytes(pcm16_sine(0.3)))
+        await first.entered.wait()
+
+        _, deadline = await drain_trigger()
+        first.release(Return([]))
+        await call.until(lambda: second.entered.is_set(), what="slice two")
+        # The remaining slice's wait is clipped to ``D``.
+        await call.advance(deadline - call.clock.monotonic() + 0.01)
+        await call.wait()
+
+        call.assert_status(grpc.StatusCode.UNAVAILABLE, "service_unavailable")
+        assert "flush" not in lease.names()
+        assert lease.names()[-2:] == ["abort", "release"]
+        assert call.finals == []
+
+    # @spec ING-LIFE-065
+    async def test_realtime_shutdown_finalization_completes_the_read_append(
+        self, realtime, first_update, fake_factory, drain_trigger
+    ):
+        """An already-read ``append`` is fed whole before the shutdown flush.
+
+        The Realtime session's one read, validated ``append`` spans several
+        slices; the trigger arrives while its first slice's ``feed`` runs.
+        The owner feeds the rest of that message before it flushes and reads
+        no further WebSocket message, then completes and closes 1001.
+        """
+        session = realtime()
+        await session.open_session(first_update())
+        lease = _lease(fake_factory)
+        first = Block()
+        lease.script("feed", first)
+        await session.send(append_event(pcm16_bytes(pcm16_sine(0.3))))
+        await first.entered.wait()
+        consumed = session.ws.consumed
+
+        await drain_trigger()
+        await session.send(append_event(PIECE))  # after the trigger: unread
+        first.release(Return([]))
+        await session.ws.wait_closed()
+        await session.drain_events()
+
+        names = lease.names()
+        assert "flush" in names
+        before_flush = names[: names.index("flush")]
+        # Every slice of the read message before the flush.
+        assert before_flush.count("feed") >= 3
+        assert sum(lease.accepted) >= 3 * SLICE
+        assert names[-3:] == ["flush", "finish", "release"]
+        assert len(session.of_type(COMPLETED)) == 1
+        assert session.close_code == 1001
+        # No further transport message was read.
+        assert session.ws.consumed == consumed
 
 
 # @spec ING-LIFE-048

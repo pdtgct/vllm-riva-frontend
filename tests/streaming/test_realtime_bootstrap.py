@@ -1,8 +1,14 @@
-"""``POST /v1/realtime/transcription_sessions``: the default session object."""
+"""The Realtime bootstrap and its default session object.
+
+``POST /plugins/riva/v1/realtime/transcription_sessions`` (``BOOTSTRAP_PATH``).
+"""
 
 from __future__ import annotations
 
-from support.app import http_client
+import asyncio
+
+import pytest
+from support.app import drain_plugin, http_client, plugins_ready
 from support.fake_session import FakeSessionFactory
 from support.realtime import BOOTSTRAP_PATH, RealtimeClient, update_event
 
@@ -16,7 +22,7 @@ async def _bootstrap(served) -> dict:
     return response.json()
 
 
-# @spec ING-NIMWS-001
+# @spec ING-NIMWS-025
 # @spec ING-NIMWS-020
 async def test_bootstrap_returns_the_default_object_with_the_served_identity(
     served,
@@ -49,7 +55,7 @@ async def test_bootstrap_language_is_empty_without_a_default_locale(clock):
     assert body["input_audio_transcription"]["language"] == ""
 
 
-# @spec ING-NIMWS-001
+# @spec ING-NIMWS-025
 # @spec ING-NIMWS-013
 def test_bootstrap_session_builder_matches_the_route():
     from vllm_riva_frontend.nim_ws import bootstrap_session
@@ -61,7 +67,7 @@ def test_bootstrap_session_builder_matches_the_route():
     assert without["input_audio_transcription"]["language"] == ""
 
 
-# @spec ING-NIMWS-001
+# @spec ING-NIMWS-025
 # @spec ING-LIFE-045
 async def test_bootstrap_creates_no_owner_and_starts_no_timer(served):
     sleepers = served.clock.sleepers
@@ -86,3 +92,45 @@ async def test_the_bootstrap_object_round_trips_as_the_first_update(served):
     updated = await client.next()
     assert updated["type"] == "transcription_session.updated", updated
     assert opens(served) == [{"cadence": "560ms", "locale": "auto"}]
+
+
+async def _bootstrap_object(served) -> dict:
+    body = await _bootstrap(served)
+    assert body["input_audio_transcription"]["model"] == SERVED
+    assert body["input_audio_format"] == "pcm16"
+    return body
+
+
+@pytest.mark.parametrize(
+    "state", ["not_started", "draining_flag", "draining", "past_settle_point"]
+)
+# @spec ING-NIMWS-025
+async def test_bootstrap_at_plugin_path_returns_default_object_in_any_state(
+    clock, state
+):
+    """HTTP 200 and the default object whatever the plugin's state."""
+    start = state != "not_started"
+    async with serving(clock=clock, start=start) as served:
+        reference = None
+        if state == "not_started":
+            assert not plugins_ready(served.state)
+        elif state == "draining_flag":
+            reference = await _bootstrap_object(served)
+            served.state.draining = True
+        drain = None
+        if state in ("draining", "past_settle_point"):
+            reference = await _bootstrap_object(served)
+            drain = asyncio.create_task(
+                drain_plugin(served.plugin, served.state, 60.0)
+            )
+            await served.clock.settle(20)
+            assert not served.plugin.admission_open
+            if state == "past_settle_point":
+                await served.clock.advance(49.5)  # past the settle point
+        body = await _bootstrap_object(served)
+        if reference is not None:
+            assert body == reference
+        assert served.factory.leases == []
+        if drain is not None:
+            await served.clock.advance(60)
+            await asyncio.wait_for(drain, 5.0)

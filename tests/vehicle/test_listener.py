@@ -13,6 +13,7 @@ from typing import Any
 
 import grpc
 import pytest
+from support.fake_session import Block
 from support.riva import config_request
 
 SERVING = 1
@@ -38,30 +39,38 @@ def address_of(plugin: Any) -> str:
 # ------------------------------------------------------------ attach_router
 
 
-# @spec ING-EP-007
-def test_attach_router_adds_bootstrap_operational_and_file_routes(
+# @spec ING-EP-063
+def test_attach_router_adds_namespace_routes_beside_cores_file_route(
     frontend, test_app
 ) -> None:
-    from support.app import find_route
+    from support.app import (
+        CORE_TRANSCRIPTION_ROUTE,
+        PLUGIN_PREFIX,
+        all_routes,
+        find_route,
+        frontend_routes,
+    )
 
-    for path in (
-        "/v1/health/ready",
-        "/v1/health/live",
-        "/v1/version",
-        "/v1/metadata",
-    ):
-        route = find_route(test_app, "GET", path)
-        assert route is not None, path
-    assert find_route(test_app, "POST", "/v1/realtime/transcription_sessions")
-    file_route = find_route(test_app, "POST", "/v1/audio/transcriptions")
-    assert file_route is not None
-    assert "speech_to_text" not in file_route.endpoint.__module__, (
-        "core's transcription route is replaced by the frontend's"
+    rows = all_routes(test_app)
+    for method, path in sorted(frontend_routes()):
+        if method == "WEBSOCKET":
+            assert any(
+                kind == "websocket" and route_path == path
+                for kind, route_path, _, _ in rows
+            ), path
+        else:
+            route = find_route(test_app, method, path)
+            assert route is not None, (method, path)
+            assert path.startswith(f"{PLUGIN_PREFIX}/")
+    core_file = find_route(test_app, *CORE_TRANSCRIPTION_ROUTE)
+    assert core_file is not None
+    assert "speech_to_text" in core_file.endpoint.__module__, (
+        "core's transcription route is left to core"
     )
 
 
-# @spec ING-EP-007
-def test_dispatcher_is_middleware_inside_cores_authentication(
+# @spec ING-EP-063
+def test_frontend_middleware_sits_inside_cores_authentication(
     frontend, helpers
 ) -> None:
     from support.app import middleware_stack
@@ -69,23 +78,26 @@ def test_dispatcher_is_middleware_inside_cores_authentication(
         AuthenticationMiddleware,
     )
 
-    from vllm_riva_frontend.nim_ws import RealtimeDispatcher
-
     app = helpers.build(frontend, api_key="secret")
     stack = middleware_stack(app)
-    assert RealtimeDispatcher in stack
+    ours = [
+        index
+        for index, cls in enumerate(stack)
+        if cls.__module__.startswith("vllm_riva_frontend")
+    ]
+    assert len(ours) == 1, stack
     assert AuthenticationMiddleware in stack
-    assert stack.index(AuthenticationMiddleware) < stack.index(
-        RealtimeDispatcher
-    ), "core's authentication is outermost"
+    assert stack.index(AuthenticationMiddleware) < ours[0], (
+        "core's authentication is outermost"
+    )
 
 
-# @spec ING-EP-007
-async def test_api_key_applies_to_claimed_scopes_and_plugin_routes(
+# @spec ING-EP-084
+async def test_api_key_applies_to_frontend_routes_and_realtime_handshake(
     clock, fake_factory, helpers
 ) -> None:
     from support.app import http_client
-    from support.realtime import REALTIME_URL, RealtimeClient
+    from support.realtime import BOOTSTRAP_PATH, RealtimeClient
 
     plugin = helpers.make_frontend(
         clock, factories={"nemotron": fake_factory.constructor}
@@ -96,12 +108,12 @@ async def test_api_key_applies_to_claimed_scopes_and_plugin_routes(
     await plugin.start(state)
     try:
         async with http_client(app) as client:
-            denied = await client.post("/v1/realtime/transcription_sessions")
+            denied = await client.post(BOOTSTRAP_PATH)
             assert denied.status_code == 401
         async with http_client(app, api_key="secret") as client:
-            allowed = await client.post("/v1/realtime/transcription_sessions")
+            allowed = await client.post(BOOTSTRAP_PATH)
             assert allowed.status_code == 200
-        client = RealtimeClient(app, clock, url=REALTIME_URL)
+        client = RealtimeClient(app, clock)
         assert not await client.connect()
         assert plugin.ingress.count == 0
         assert fake_factory.names() == []
@@ -169,7 +181,7 @@ async def test_port_zero_is_refused(clock, fake_factory, helpers) -> None:
         await plugin.start(state)
 
 
-# @spec ING-EP-005, ING-EP-035
+# @spec ING-EP-005, ING-EP-080
 async def test_health_is_not_serving_until_admission_opens_last(
     initialized, monkeypatch
 ) -> None:
@@ -216,7 +228,7 @@ async def test_health_is_not_serving_until_admission_opens_last(
     assert not plugin.listener_monitor.done()
 
 
-# @spec ING-EP-035
+# @spec ING-EP-080
 async def test_no_owner_is_admitted_before_start(initialized, helpers) -> None:
     plugin, _ = initialized
     run = helpers.stream(plugin, plugin.clock, config_request())
@@ -228,31 +240,78 @@ async def test_no_owner_is_admitted_before_start(initialized, helpers) -> None:
     assert plugin.ingress.count == 0
 
 
-# @spec ING-EP-008
-async def test_start_failure_after_bind_rolls_back(
+# @spec ING-EP-080
+async def test_health_serving_set_last_unless_core_is_draining(
+    initialized, helpers
+) -> None:
+    from vllm_riva_frontend.grpc import RIVA_SERVICE_NAME
+
+    plugin, state = initialized
+    state.draining = True  # core began shutting down before start's last step
+    await plugin.start(state)
+    address = address_of(plugin)
+    assert helpers.port_open(int(address.rsplit(":", 1)[1]))
+    for service in ("", RIVA_SERVICE_NAME):
+        assert await health_status(address, service) == NOT_SERVING, service
+    assert plugin.ready(state) is False
+    run = helpers.stream(plugin, plugin.clock, config_request())
+    await asyncio.wait_for(run.task, 2.0)
+    assert run.status is grpc.StatusCode.UNAVAILABLE
+    assert run.details.startswith("service_unavailable")
+    assert not plugin.registry.records
+
+
+class _Boom:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("monitor failed")
+
+
+# @spec ING-EP-064, ING-EP-096, ING-EP-100
+async def test_start_rollback_cancels_supervisors_stops_and_settles_factory(
     initialized, fake_factory, grpc_port, monkeypatch, helpers
 ) -> None:
     import vllm_riva_frontend.lifecycle as lifecycle
 
     plugin, state = initialized
-
-    class Boom:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("monitor failed")
-
-    monkeypatch.setattr(lifecycle, "ListenerMonitor", Boom)
+    before = len(fake_factory.calls)
+    monkeypatch.setattr(lifecycle, "ListenerMonitor", _Boom)
     with pytest.raises(RuntimeError, match="monitor failed"):
         await plugin.start(state)
     await asyncio.sleep(0.01)
     assert not helpers.port_open(grpc_port), "server stopped with no grace"
+    collector = plugin.fault_collector
+    assert collector is not None and collector.done()
+    assert collector.cancelled(), "a rolled-back start cancels the collector"
+    helpers.factory_settlement(fake_factory, since=before)
     assert fake_factory.teardown_calls == 1
-    collector = getattr(plugin, "fault_collector", None)
-    if collector is not None:
-        await asyncio.sleep(0)
-        assert collector.done()
     assert state.request_shutdown.calls == 0, "rollback exit is not a fault"
     assert plugin.fault is None
     assert not plugin.admission_open
+
+
+# @spec ING-EP-064
+async def test_cancelled_start_rollback_is_not_interrupted(
+    initialized, fake_factory, monkeypatch, helpers
+) -> None:
+    import vllm_riva_frontend.lifecycle as lifecycle
+
+    plugin, state = initialized
+    clock = plugin.clock
+    monkeypatch.setattr(lifecycle, "ListenerMonitor", _Boom)
+    block = Block()
+    fake_factory.script("drain", block)  # the settlement's drain(math.inf)
+    task = asyncio.ensure_future(plugin.start(state))
+    await helpers.settle_until(clock, lambda: block.entered.is_set())
+    for _ in range(3):
+        task.cancel()
+        await clock.settle()
+    assert not task.done(), "the rollback runs to its end"
+    assert fake_factory.teardown_calls == 0
+    block.release()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+    assert fake_factory.teardown_calls == 1
+    helpers.factory_settlement(fake_factory)
 
 
 # @spec ING-EP-055
@@ -296,7 +355,7 @@ async def test_keepalive_option_sets_the_server_ping_interval(
 # ------------------------------------------------------------------- ready
 
 
-# @spec ING-EP-009
+# @spec ING-EP-065
 async def test_ready_is_a_synchronous_attribute_read(
     started, fake_engine
 ) -> None:
@@ -307,13 +366,13 @@ async def test_ready_is_a_synchronous_attribute_read(
     assert fake_engine.health_checks == checks
 
 
-# @spec ING-EP-009
+# @spec ING-EP-065
 async def test_ready_is_false_before_start(initialized) -> None:
     plugin, state = initialized
     assert plugin.ready(state) is False
 
 
-# @spec ING-EP-009
+# @spec ING-EP-065
 async def test_ready_is_false_while_draining(started, clock) -> None:
     plugin, state = started
     state.draining = True
@@ -325,7 +384,7 @@ async def test_ready_is_false_while_draining(started, clock) -> None:
         await task
 
 
-# @spec ING-EP-009
+# @spec ING-EP-065
 async def test_ready_is_false_after_stop_and_after_a_fault(
     started, fake_factory, clock, helpers
 ) -> None:
@@ -338,15 +397,53 @@ async def test_ready_is_false_after_stop_and_after_a_fault(
     assert plugin.ready(state) is False
 
 
+# @spec ING-EP-082, ING-EP-065
+async def test_core_draining_alone_closes_admission_and_ready_without_d(
+    started, fake_factory, test_app, clock, helpers
+) -> None:
+    from support.asgi import asgi_http
+
+    from vllm_riva_frontend.errors import catalog
+
+    plugin, state = started
+    run, lease = await helpers.stream_with_lease(plugin, fake_factory, clock)
+    state.draining = True  # core set the flag; no drain call runs
+    assert plugin.ready(state) is False
+    refused = helpers.stream(plugin, clock, config_request())
+    await asyncio.wait_for(refused.task, 2.0)
+    assert refused.status is grpc.StatusCode.UNAVAILABLE
+    assert refused.details.startswith("service_unavailable")
+    body, headers = helpers.file_request_body()
+    response = await asgi_http(
+        test_app, "POST", helpers.file_route(), headers=headers, body=body
+    )
+    assert response.status == catalog().http_status("service_unavailable")
+    assert plugin.drain_deadline is None, "being draining sets no D"
+    # No bound is clipped: the admitted stream keeps its own bounds.
+    await clock.advance(30)
+    assert not run.done
+    run.requests.push(helpers.audio_message())
+    run.requests.close()
+    await helpers.settle_until(clock, lambda: run.done)
+    assert run.status is grpc.StatusCode.OK
+    assert lease.names()[-3:] == ["flush", "finish", "release"]
+
+
 # ---------------------------------------------------- one process, one engine
 
 
-# @spec ING-EP-004
-async def test_one_process_serves_http_routes_and_one_grpc_listener(
+# @spec ING-EP-061
+async def test_one_process_serves_core_routes_namespace_and_one_grpc_listener(
     clock, fake_factory, helpers, grpc_port
 ) -> None:
-    from support.app import find_route, http_client
+    from support.app import (
+        CORE_TRANSCRIPTION_ROUTE,
+        PLUGIN_PREFIX,
+        find_route,
+        http_client,
+    )
     from support.asgi import AsgiWebSocket
+    from support.realtime import CORE_REALTIME_PATH
 
     constructor = helpers.counting(fake_factory.constructor)
     plugin = helpers.make_frontend(clock, factories={"nemotron": constructor})
@@ -358,14 +455,19 @@ async def test_one_process_serves_http_routes_and_one_grpc_listener(
         assert plugin.factory is fake_factory
         assert fake_factory.constructed_with[0] is engine
         assert state.engine_client is engine
-        # Core's /v1/realtime is still served for unclaimed scopes.
-        ws = AsgiWebSocket(app, "/v1/realtime")
+        # Core's /v1/realtime is served by core, unchanged.
+        ws = AsgiWebSocket(app, CORE_REALTIME_PATH)
         assert await ws.connect()
         assert (await ws.receive_json())["type"] == "core.realtime"
-        assert find_route(app, "GET", "/v1/metadata") is not None
+        core_file = find_route(app, *CORE_TRANSCRIPTION_ROUTE)
+        assert core_file is not None
+        assert "speech_to_text" in core_file.endpoint.__module__
+        assert find_route(app, "GET", f"{PLUGIN_PREFIX}/metadata") is not None
         async with http_client(app) as client:
-            assert (await client.get("/v1/health/live")).status_code == 200
+            live = await client.get(f"{PLUGIN_PREFIX}/health/live")
+            assert live.status_code == 200
         assert helpers.port_open(grpc_port)
+        assert plugin.ingress.count == 0
     finally:
         await helpers.drive(clock, plugin.stop(state))
 

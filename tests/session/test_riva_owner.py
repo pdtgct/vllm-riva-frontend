@@ -15,6 +15,7 @@ import pytest
 from support.audio import pcm16_bytes, pcm16_sine, wav_pcm16
 from support.fake_session import Block, Raise, Return, failed
 from support.grpc_harness import RpcAbort
+from support.riva import catalog_code
 
 from .conftest import lease_calls
 
@@ -67,7 +68,7 @@ class TestFlowControl:
     def riva_options(self):
         return {"pre_submit_max_samples": 16_000}
 
-    # @spec ING-CORE-021, ING-CORE-010, ING-CORE-009
+    # @spec ING-CORE-021, ING-CORE-032, ING-CORE-009
     async def test_reading_stops_while_feed_awaits_the_engine(
         self, riva, fake_factory
     ):
@@ -391,7 +392,7 @@ async def test_finalization_inside_a_partial_riff_header_is_unsupported_format(
 # --------------------------------------------------------- ownership
 
 
-# @spec ING-LIFE-058
+# @spec ING-LIFE-063
 async def test_one_owner_is_registered_before_the_first_read_until_release(
     riva, fake_factory, started
 ):
@@ -522,6 +523,9 @@ async def test_engine_expired_projects_idle_timeout(riva, fake_factory):
 # ------------------------------------------------------------ sends
 
 PIECE = pcm16_bytes(pcm16_sine(0.1))
+#: Virtual time past the old one-second wait of ``stop``: ``stop`` now
+#: awaits what it settles with no fixed time limit (ING-EP-093).
+STOP_WAIT_PAST = 5.0
 
 
 class TestSendBound:
@@ -529,7 +533,7 @@ class TestSendBound:
     def riva_options(self):
         return {"response_send_timeout": 5}
 
-    # @spec ING-LIFE-051, ING-ADM-016, ING-LIFE-038
+    # @spec ING-LIFE-061, ING-ADM-016, ING-LIFE-038
     async def test_a_stalled_write_ends_the_owner_as_a_transport_failure(
         self, riva, fake_factory, started
     ):
@@ -562,7 +566,7 @@ class TestSendBound:
         assert call.context.stalled == 1
         assert call.responses == []
 
-    # @spec ING-LIFE-051
+    # @spec ING-LIFE-061
     async def test_a_stalled_status_is_abandoned_at_the_bound(
         self, riva, fake_factory, started
     ):
@@ -589,7 +593,7 @@ class TestSendBound:
         finally:
             call.context.unblocked.set()
 
-    # @spec ING-LIFE-051, ING-ERR-015
+    # @spec ING-LIFE-061, ING-ERR-015
     async def test_a_stalled_refusal_abandons_the_rpc(self, riva, started):
         started.ingress.close()  # as ``drain`` closes it
         refused = riva(start=False)
@@ -614,7 +618,46 @@ class TestSendBound:
             refused.context.unblocked.set()
 
 
-# @spec ING-LIFE-051, ING-LIFE-053
+# @spec ING-LIFE-061, ING-LIFE-064, ING-ERR-062
+async def test_interrupted_send_takes_shutdown_row_not_transport_failure(
+    riva, fake_factory, started, app_state
+):
+    from support.app import stop_plugins
+
+    call = riva()
+    call.configure()
+    await call.settle()
+    lease = _lease(fake_factory)
+    lease.script("feed", Return(["hello"]))
+    call.context.block = True
+    call.audio(PIECE)
+    await call.until(lambda: call.context.stalled == 1, what="a write")
+    (record,) = started.registry.records.values()
+    owner = record.owner
+
+    # The write is within its bound (60 s) when ``stop`` cancels the owner.
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await call.settle()
+        await call.until(lambda: call.done, what="the handler's end")
+    finally:
+        call.context.unblocked.set()
+        await call.settle()
+    await asyncio.wait_for(stopper, 2)
+
+    assert owner.cause is not None
+    assert owner.cause.code == "service_unavailable", "a transport failure"
+    # The shutdown abort row's status was offered, as its one attempt.
+    assert call.context.stalled == 2
+    assert isinstance(call.context.parked[1], RpcAbort)
+    assert catalog_code(call.context.parked[1].details) == (
+        "service_unavailable"
+    )
+    assert lease.names() == ["feed", "abort", "release"]
+    assert len(started.registry.records) == 0
+
+
+# @spec ING-LIFE-061, ING-LIFE-053
 async def test_a_write_stalled_before_the_drain_ends_by_d(
     riva, fake_factory, started, drain_trigger
 ):
@@ -640,7 +683,7 @@ async def test_a_write_stalled_before_the_drain_ends_by_d(
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-051, ING-ERR-059
+# @spec ING-LIFE-061, ING-ERR-062
 async def test_a_status_after_d_to_a_stalled_reader_does_not_wait(
     riva, fake_factory, started, drain_trigger
 ):
@@ -667,7 +710,7 @@ async def test_a_status_after_d_to_a_stalled_reader_does_not_wait(
 # ------------------------------------------------------ cleanup ownership
 
 
-# @spec ING-LIFE-058, ING-EP-060, ING-EP-059
+# @spec ING-LIFE-063, ING-LIFE-064, ING-EP-106, ING-EP-093
 async def test_a_second_cancellation_waits_for_cleanup(
     riva, fake_factory, started
 ):
@@ -699,7 +742,7 @@ async def test_a_second_cancellation_waits_for_cleanup(
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-058, ING-LIFE-035, ING-EP-060
+# @spec ING-LIFE-063, ING-LIFE-035, ING-EP-106
 async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     riva, fake_factory, started
 ):
@@ -729,6 +772,56 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     await call.settle()
     assert records[0].continuation.done()
     assert lease.names() == ["feed", "abort", "release"]
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-064, ING-EP-079, ING-CORE-032
+@pytest.mark.parametrize("state", ["open", "flushed", "open_pending"])
+async def test_settlement_cancel_takes_shutdown_row_and_cleans_by_lease_state(
+    riva, fake_factory, started, app_state, state
+):
+    from support.app import stop_plugins
+
+    call = riva()
+    call.configure()
+    opening = Block()
+    if state == "open_pending":
+        fake_factory.script("open", opening)
+        await opening.entered.wait()
+    else:
+        await call.settle()
+        if state == "flushed":
+            fake_factory.leases[0].script("finish", Block())
+            call.half_close()
+            await call.until(
+                lambda: "finish" in fake_factory.leases[0].names(),
+                what="finish",
+            )
+    (record,) = started.registry.records.values()
+    owner = record.owner
+
+    # ``stop`` (the plugin torn down) cancels the owner in its settlement.
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await call.settle()
+        await asyncio.wait_for(asyncio.shield(stopper), 2)
+    finally:
+        opening.release()
+        await call.settle()
+
+    # The selected cause and the cleanup, not the status the client gets.
+    assert owner.cause is not None
+    assert owner.cause.code == "service_unavailable"
+    if state == "open":
+        assert _lease(fake_factory).names() == ["abort", "release"]
+    elif state == "flushed":
+        assert _lease(fake_factory).names() == ["flush", "finish", "release"]
+    else:
+        assert lease_calls(fake_factory) == []
+    for lease in fake_factory.leases:
+        assert "teardown" not in lease.names()
+        assert lease.teardown_calls == 0
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
 
@@ -772,7 +865,7 @@ def _resisting(
     return state
 
 
-# @spec ING-LIFE-051, ING-EP-060
+# @spec ING-LIFE-061, ING-EP-106
 async def test_a_final_stalled_before_the_drain_ends_by_d(
     riva, fake_factory, started, drain_trigger
 ):
@@ -799,7 +892,7 @@ async def test_a_final_stalled_before_the_drain_ends_by_d(
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-058
+# @spec ING-LIFE-061, ING-EP-093, ING-EP-106, ING-LIFE-063
 async def test_a_status_stalled_before_the_drain_ends_by_d(
     riva, fake_factory, started, drain_trigger
 ):
@@ -829,7 +922,7 @@ async def test_a_status_stalled_before_the_drain_ends_by_d(
     assert len(started.registry.records) == 0
 
 
-# @spec ING-LIFE-051, ING-ERR-015
+# @spec ING-LIFE-061, ING-ERR-015
 async def test_a_blocked_refusal_ends_by_an_earlier_d(
     riva, started, drain_trigger
 ):
@@ -851,7 +944,7 @@ async def test_a_blocked_refusal_ends_by_an_earlier_d(
     assert refused.requests.pulls == 0
 
 
-# @spec ING-LIFE-051
+# @spec ING-LIFE-061
 async def test_a_final_due_after_the_rpc_deadline_is_not_started(
     riva, fake_factory, started
 ):
@@ -878,7 +971,7 @@ class TestUnsettledSend:
     def riva_options(self):
         return {"response_send_timeout": 5}
 
-    # @spec ING-LIFE-051, ING-EP-060, ING-ADM-016, ING-LIFE-037
+    # @spec ING-LIFE-061, ING-EP-106, ING-ADM-016, ING-LIFE-063
     async def test_a_write_delaying_its_cancellation_fails_at_its_bound(
         self, riva, fake_factory, started
     ):
@@ -904,9 +997,11 @@ class TestUnsettledSend:
         (record,) = started.registry.records.values()
         (unsettled,) = record.unsettled_sends
         assert unsettled in record.children and not unsettled.done()
-        assert started.ingress.count == 1
+        # The owner has ended and there is no continuation: a record held
+        # only by an unsettled send takes no ingress-cap count.
+        assert started.ingress.count == 0
 
-        # The record and admission go once the send settles.
+        # The record goes once the send settles.
         resist.settled.set()
         await call.settle()
         assert unsettled.done()
@@ -914,7 +1009,7 @@ class TestUnsettledSend:
         assert started.ingress.count == 0
         assert call.responses == []
 
-    # @spec ING-LIFE-051, ING-EP-059, ING-EP-060
+    # @spec ING-LIFE-061, ING-LIFE-063, ING-EP-079, ING-EP-093, ING-EP-106
     @pytest.mark.parametrize("when", ["at_the_bound", "after_the_bound"])
     async def test_a_cancellation_at_the_bound_leaves_the_send_to_stop(
         self, riva, fake_factory, started, app_state, when
@@ -946,19 +1041,74 @@ class TestUnsettledSend:
         assert not write.done()
         assert write in record.unsettled_sends
         assert list(started.registry.records.values()) == [record]
-        assert started.ingress.count == 1
+        assert started.ingress.count == 0
         assert lease.names() == ["feed", "abort", "release"]
 
         from support.app import stop_plugins
 
-        await stop_plugins(app_state)
-        await call.settle()
-        assert write.cancelled()
+        # ``stop`` awaits the unsettled write, with no fixed time limit.
+        stopper = asyncio.ensure_future(stop_plugins(app_state))
+        try:
+            await call.advance(STOP_WAIT_PAST)
+            assert not stopper.done(), "stop returned with a send unsettled"
+            assert not write.done()
+        finally:
+            resist.settled.set()
+            await call.settle()
+        assert stopper is not None
+        await asyncio.wait_for(stopper, 2)
+        assert write.done()
         assert len(started.registry.records) == 0
         assert started.ingress.count == 0
         assert call.responses == []
 
-    # @spec ING-LIFE-051
+    # @spec ING-LIFE-063, ING-EP-106
+    async def test_one_owner_per_stream_record_persists_through_continuation_and_sends(  # noqa: E501
+        self, riva, fake_factory, started
+    ):
+        call = riva()
+        call.configure()
+        await call.settle()
+        lease = _lease(fake_factory)
+        lease.script("feed", Raise(failed("expired")))
+        abort = Block(delay_cancel=True)
+        lease.script("abort", abort)
+        resist = _resisting(call.context)
+        call.context.block = True
+        call.audio(PIECE)
+        await abort.entered.wait()
+        (record,) = started.registry.records.values()
+        try:
+            # Past the cleanup bound the status is due; it stalls and
+            # fails its bound, unsettled, while the continuation waits.
+            await call.advance(started.config.session_cleanup_timeout + 0.1)
+            await call.until(lambda: call.context.stalled == 1, what="status")
+            await call.advance(5.1)
+            assert call.done
+            assert list(started.registry.records.values()) == [record]
+            assert record.continuation is not None
+            assert not record.continuation.done()
+            (unsettled,) = record.unsettled_sends
+            # The continuation holds the stream's one ingress-cap count.
+            assert started.ingress.count == 1
+
+            abort.release()
+            await call.settle()
+            assert record.continuation.done()
+            assert lease.names() == ["feed", "abort", "release"]
+            # Only the unsettled send holds the record now: the count was
+            # released, once, when the owner and its continuation ended.
+            assert list(started.registry.records.values()) == [record]
+            assert not unsettled.done()
+            assert started.ingress.count == 0
+        finally:
+            abort.release()
+            resist.settled.set()
+            await call.settle()
+        assert len(started.registry.records) == 0
+        assert started.ingress.count == 0
+
+    # @spec ING-LIFE-061
     async def test_a_write_completing_after_its_bound_has_failed(
         self, riva, fake_factory, started
     ):
@@ -985,8 +1135,8 @@ class TestUnsettledSend:
         assert len(started.registry.records) == 0
         assert started.ingress.count == 0
 
-    # @spec ING-LIFE-051, ING-EP-059, ING-EP-043
-    async def test_after_stop_a_resisting_send_neither_waits_nor_leaks(
+    # @spec ING-LIFE-061, ING-LIFE-064, ING-EP-079, ING-EP-093
+    async def test_after_stop_a_resisting_send_is_awaited_and_cleanup_aborts(
         self, riva, fake_factory, started, app_state
     ):
         call = riva()
@@ -998,7 +1148,8 @@ class TestUnsettledSend:
         call.context.block = True
         call.audio(PIECE)
         await call.until(lambda: call.context.stalled == 1, what="a write")
-        before = asyncio.all_tasks()
+        (record,) = started.registry.records.values()
+        owner = record.owner
 
         from support.app import stop_plugins
 
@@ -1010,36 +1161,38 @@ class TestUnsettledSend:
             assert call.done, "the handler waited after stop"
             await call.wait()
             assert call.abandoned and call.context.aborts == []
-            # The status got its one attempt; nothing else was started.
+            # Interrupted by the plugin's cancellation, the write is no
+            # transport failure: the shutdown abort row's status got its
+            # one attempt, and the lease was cleaned up by its state.
+            assert owner.cause is not None
+            assert owner.cause.code == "service_unavailable"
             assert call.context.stalled == 2
             assert isinstance(call.context.parked[1], RpcAbort)
-            assert "abort" not in lease.names()
-            assert lease.state == "torn_down"
-            await call.advance(1.1)  # ``stop``'s one bounded wait
-            assert stopper.done()
-            # Every task started since ``stop`` is done or was cancelled.
-            leftover = [
-                task for task in asyncio.all_tasks() - before if not task.done()
-            ]
-            assert all(task.cancelling() for task in leftover), leftover
+            assert lease.names() == ["feed", "abort", "release"]
+            assert "teardown" not in lease.names()
+            # ``stop`` awaits the sends that resist, with no time limit.
+            await call.advance(STOP_WAIT_PAST)
+            assert not stopper.done(), "stop returned with sends unsettled"
         finally:
             resist.settled.set()
             await call.settle()
+        await asyncio.wait_for(stopper, 2)
         assert all(task.done() for task in resist.tasks)
         assert len(started.registry.records) == 0
         assert started.ingress.count == 0
 
-    # @spec ING-EP-059, ING-EP-060, ING-LIFE-051, ING-ERR-015
-    async def test_stop_cancels_continuations_unsettled_and_kept_sends(
+    # @spec ING-EP-079, ING-EP-093, ING-EP-106, ING-LIFE-061, ING-ERR-015
+    async def test_stop_awaits_continuations_unsettled_and_kept_sends(
         self, riva, fake_factory, started, app_state
     ):
         # A stream answered while its cleanup goes on: a continuation.
         held = riva()
         held.configure()
         await held.settle()
-        fake_factory.leases[0].script("feed", Raise(failed("expired")))
+        held_lease = fake_factory.leases[0]
+        held_lease.script("feed", Raise(failed("expired")))
         abort = Block(delay_cancel=True)
-        fake_factory.leases[0].script("abort", abort)
+        held_lease.script("abort", abort)
         held.audio(PIECE)
         await abort.entered.wait()
         await held.advance(started.config.session_cleanup_timeout + 0.1)
@@ -1066,7 +1219,7 @@ class TestUnsettledSend:
         assert sending_record.unsettled_sends == {unsettled}
         assert resist.cancellations == 1
 
-        # A refusal, which has no record: its send is kept by the registry.
+        # A refusal, which has no record: its handler awaits its send.
         started.ingress.close()
         refused = riva(start=False)
         refusal = _resisting(refused.context, suppress=True)
@@ -1082,24 +1235,37 @@ class TestUnsettledSend:
         stopper = asyncio.ensure_future(stop_plugins(app_state))
         try:
             await refused.settle()
-            assert continuation.cancelled()
-            assert unsettled.cancelled()
-            assert refusal.cancellations == 1, "stop did not cancel it"
             # The refusal's own bound is far off: it ended because ``stop``
             # made every send bound count as passed.
+            assert refusal.cancellations == 1, "the refusal send went on"
             assert refused.done
             await refused.wait()
             assert refused.abandoned
-            await refused.advance(1.1)
-            assert stopper.done()
+            # The continuation and the unsettled send are awaited, never
+            # cancelled by ``stop``, and ``stop`` has no fixed time limit.
+            await refused.advance(STOP_WAIT_PAST)
+            assert not continuation.cancelled()
+            assert not continuation.done()
+            assert not unsettled.done()
+            assert not stopper.done(), "stop returned with work unsettled"
+
+            abort.release()
+            await refused.settle()
+            assert continuation.done() and not continuation.cancelled()
+            assert held_lease.names() == ["feed", "abort", "release"]
+            assert not stopper.done(), "stop left the unsettled send"
         finally:
             abort.release()
             resist.settled.set()
             await refused.settle()
+        await asyncio.wait_for(stopper, 2)
+        assert unsettled.done()
+        for lease in fake_factory.leases:
+            assert "teardown" not in lease.names()
         assert len(started.registry.records) == 0
         assert started.ingress.count == 0
 
-    # @spec ING-LIFE-051
+    # @spec ING-LIFE-061
     async def test_a_write_suppressing_its_cancellation_still_failed(
         self, riva, fake_factory, started
     ):
@@ -1127,7 +1293,7 @@ class TestUnsettledSend:
         assert call.finals == []
         assert len(started.registry.records) == 0
 
-    # @spec ING-LIFE-051, ING-LIFE-038, ING-EP-059, ING-EP-060
+    # @spec ING-LIFE-061, ING-LIFE-038, ING-LIFE-063, ING-EP-093, ING-EP-106
     async def test_a_cancellation_while_a_failed_write_is_abandoned(
         self, riva, fake_factory, started, app_state
     ):
@@ -1148,6 +1314,7 @@ class TestUnsettledSend:
         (record,) = started.registry.records.values()
         (write,) = resist.tasks
 
+        stopper = None
         try:
             await call.advance(5.1)
 
@@ -1162,25 +1329,27 @@ class TestUnsettledSend:
             assert lease.names() == ["feed", "abort", "release"]
             assert record.owner.cause.code == "internal"
             assert record.owner.cause.phase == "transport"
-            # The unsettled write holds the record and stays reachable by
-            # ``stop``.
+            # The unsettled write holds the record (with no ingress-cap
+            # count) and stays reachable by ``stop``, which awaits it.
             assert write in record.unsettled_sends and not write.done()
             assert list(started.registry.records.values()) == [record]
-            assert started.ingress.count == 1
+            assert started.ingress.count == 0
 
             from support.app import stop_plugins
 
-            await stop_plugins(app_state)
-            await call.settle()
-            assert write.cancelled()
+            stopper = asyncio.ensure_future(stop_plugins(app_state))
+            await call.advance(STOP_WAIT_PAST)
+            assert not stopper.done(), "stop returned with a send unsettled"
         finally:
             resist.settled.set()
             await call.settle()
+        await asyncio.wait_for(stopper, 2)
+        assert write.done()
         assert len(started.registry.records) == 0
         assert started.ingress.count == 0
         assert call.responses == []
 
-    # @spec ING-LIFE-051, ING-ERR-059
+    # @spec ING-LIFE-061, ING-ERR-062
     @pytest.mark.parametrize("when", ["first_step", "abandonment"])
     async def test_a_cancellation_during_a_failed_last_attempt_changes_nothing(
         self, riva, fake_factory, started, when

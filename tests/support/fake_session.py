@@ -35,15 +35,67 @@ with ``defer_acceptance`` set, ``feed`` stays pending until the test calls
 So a test can observe the caller's credit at the instant of the callback,
 with ``feed`` still blocked.
 
-The factory's cleanup: a ``release`` cancelled after it began hands the
-session to the factory, which runs a cleanup task for it (its behaviour is
-scripted as ``"cleanup"``; ``Return()`` by default, so it ends at once).
-A cleanup task that fails records its exception as a fault (a cancelled one
-records none). ``drain(deadline)`` awaits the pending cleanup tasks until
-the absolute ``deadline`` on the factory's ``clock`` (``RealClock`` by
-default, as the model plugin's factory uses ``time.monotonic()``), keeps any
-still running and returns the recorded faults, each exactly once, clearing
-them. ``owns(lease)`` tells whether a session's cleanup is still running.
+The factory's tasks model the factory obligations of the session design
+("Seam conformance", "Factory obligations" 1 to 8), so a settlement test
+sees factory work that outlives the owner that handed a session over:
+
+* **Generation task.** ``open`` starts one per session (``generation``)
+  before its own scripted wait. Its first step records the engine call
+  ``generate``; it then runs until ``flush`` succeeds (normal end),
+  ``fail_generation`` ends it with an exception, or it is cancelled. Its
+  cancellation handler records ``abort`` as an engine call and awaits the
+  lease's scripted ``"engine_abort"`` behaviour (``Return()`` by default; a
+  ``Block`` keeps the handler awaiting the engine's abort; a ``Raise`` makes
+  the handler raise), then ends cancelled.
+* **Who cancels it.** ``abort`` requests its cancellation (unless its
+  handler has begun) before its own scripted behaviour, then awaits its end,
+  cancelling nothing more when the behaviour or the wait is cancelled or
+  raises;
+  a cancelled ``open`` requests its cancellation twice with no suspension in
+  between and hands a started session to a holding task (one whose
+  generation task never started is dropped, untracked: it never runs its
+  body and ends at the next loop turn); ``teardown_all`` and ``teardown()``
+  cancel unconditionally. No other factory code cancels it (obligation 5).
+  Every request is logged (``cancel_log``); a request made after the
+  handler began is in ``late_cancellations``, and a cancellation the
+  factory did not request (someone else cancelled a factory task) is in
+  ``foreign_cancellations``.
+* **Cleanup task.** A ``release`` cancelled at any suspension after it
+  began (it has no earlier one, obligation 6) hands the session to one
+  cleanup task: it runs the scripted ``"cleanup"`` behaviour (the
+  retirement wait), then awaits the generation task's end without
+  cancelling it (obligation 2), and only then ends, raising a failed
+  retirement's exception.
+* **Holding task.** A session whose ``release`` finished its retirement
+  wait (or failed it) while its generation task still runs, and a started
+  session of a cancelled ``open``, is held by one holding task until the
+  generation task ends (``SESS-ABORT-002``).
+* **Faults.** Retained (``faults``) and returned by ``drain`` exactly once:
+  a cleanup or holding task's exception, and a generation task's exception
+  that no lease call surfaced (any but one ``fail_generation`` delivered
+  while the owner still held the session, which fails the lease with the
+  exception's ``reason`` instead). A ``CancelledError`` is never retained.
+* **drain(deadline).** Awaits the cleanup and holding tasks that exist
+  when it is called until they end or the absolute ``deadline`` on the
+  factory's ``clock`` passes (``math.inf`` waits until they end), cancelling
+  none (obligation 1), then returns the retained faults and clears them.
+  ``active_drains`` and ``max_concurrent_drains`` show whether callers
+  serialized their calls.
+* **teardown_all().** Closes the factory, cancels every owned task not yet
+  done and returns every task it owns (``owned_tasks()``, plus anything a
+  test put in ``tasks``). A closed factory starts no task (obligation 7):
+  a hand-over after it is recorded in ``refused_after_close`` instead. A
+  later ``teardown_all`` returns only ended tasks and raises nothing, and a
+  later ``drain`` returns at once (obligation 8).
+
+``events`` records the task lifecycle in one order (``("generation.start",
+n)``, ``("generation.handler", n)``, ``("generation.end", n)``,
+``("cleanup.start", n)``, ``("cleanup.end", n)``, ``("holding.start", n)``,
+``("holding.end", n)``, ``("teardown_all", None)``), and
+``owns(lease)`` tells whether a cleanup or holding task still holds a
+session. ``aclose()`` cancels whatever is left at the end of a test.
+``start_generation=False`` turns generation tasks off (the earlier model:
+no task until a cancelled ``release``).
 
 Seam errors are ``SeamError`` instances defined here, carrying
 ``session_error`` and ``reason``; no model-plugin class is involved.
@@ -58,6 +110,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -157,6 +210,11 @@ class Block:
     parked it absorbs every cancellation (counted in ``cancellations``) and
     keeps waiting; ``release()`` then settles it, as cancelled if it was
     cancelled meanwhile and by ``then`` otherwise.
+
+    ``on_enter`` runs synchronously when the call starts waiting, before
+    the loop turns again: a test can cancel the calling task there, so the
+    cancellation lands at this very suspension (for example a cancelled
+    ``open`` whose generation task has not taken its first step).
     """
 
     then: Return | Raise = field(default_factory=Return)
@@ -164,6 +222,7 @@ class Block:
     released: asyncio.Event = field(default_factory=asyncio.Event)
     delay_cancel: bool = False
     cancellations: int = 0
+    on_enter: Callable[[], Any] | None = None
 
     def release(self, then: Return | Raise | None = None) -> None:
         if then is not None:
@@ -173,6 +232,8 @@ class Block:
     async def park(self) -> None:
         """Wait for ``release()`` as the mode says (see the class doc)."""
         self.entered.set()
+        if self.on_enter is not None:
+            self.on_enter()
         if not self.delay_cancel:
             await self.released.wait()
             return
@@ -264,6 +325,18 @@ class FakeLease:
         self._after: dict[str, list[Callable[[], Any]]] = {}
         self._scripts = _Scripts()
         self._running: str | None = None
+        #: The session's generation task (``None`` when not modelled).
+        self.generation: asyncio.Task[Any] | None = None
+        #: Engine calls the generation task made (``generate``, ``abort``).
+        self.engine_calls: list[str] = []
+        self.generation_started = False
+        self.handler_began = False
+        self._generation_end = asyncio.Event()
+        #: Set when the generation task may take its first engine step.
+        self._start_gate = asyncio.Event()
+        self._start_gate.set()
+        self._generation_error: BaseException | None = None
+        self._surfaced = False
 
     @property
     def target(self) -> str:
@@ -315,6 +388,31 @@ class FakeLease:
     def names(self) -> list[str]:
         """The names of this lease's calls, in order."""
         return [call.name for call in self.calls]
+
+    def fail_generation(
+        self, exc: BaseException, *, surfaced: bool | None = None
+    ) -> None:
+        """End the generation task with ``exc`` (a generation failure).
+
+        While the owner still holds the session (``surfaced`` defaults to
+        "not handed to a cleanup or holding task") the failure is surfaced:
+        the lease fails with ``exc.reason`` (``abnormal_end`` when absent)
+        and the factory retains nothing. Otherwise the exception is a
+        retained fault (obligation 3).
+        """
+        if surfaced is None:
+            surfaced = not self.factory.owns(self) and (
+                self not in self.factory.handed_over
+            )
+        if surfaced:
+            self._surfaced = True
+            self._fail(getattr(exc, "reason", None) or "abnormal_end")
+        self._generation_error = exc
+        self._generation_end.set()
+
+    @property
+    def generation_done(self) -> bool:
+        return self.generation is None or self.generation.done()
 
     # -- protocol ---------------------------------------------------------
 
@@ -375,6 +473,7 @@ class FakeLease:
                     self._fail(exc.reason)
                 raise
             self.state = "flushed"
+            self._generation_end.set()
             self._succeeded("flush")
             return text
 
@@ -392,10 +491,24 @@ class FakeLease:
         self._record("abort", (), {})
         behaviour = self._scripts.next("abort")
         async with self._call("abort"):
-            # The model's lease is ``aborted`` before its wait, so a caller
-            # whose bound cancels ``abort`` can still ``release``.
+            # As the model's lease does, ``abort`` requests the generation
+            # task's cancellation and marks the lease ``aborted`` before any
+            # suspension, so the cancellation stands even when the scripted
+            # behaviour is cancelled or raises, and a caller whose bound
+            # cancels ``abort`` can still ``release``.
+            generation = self.generation
+            if (
+                generation is not None
+                and not generation.done()
+                and not self.handler_began
+            ):
+                self.factory._cancel(generation, "abort", self)
             self.state = "aborted"
             result = await _perform(behaviour, None)
+            if generation is not None and not generation.done():
+                # A cancelled wait leaves the generation task running and
+                # cancels it no further (obligation 5).
+                await asyncio.wait({generation})
             self._succeeded("abort")
             return result
 
@@ -405,14 +518,23 @@ class FakeLease:
         if self.state == "released":
             return None
         async with self._call("release"):
+            # Hand-over coverage is in place before the first suspension
+            # (obligation 6): ``_call`` does not suspend.
             try:
                 result = await _perform(behaviour, None)
             except asyncio.CancelledError:
                 # A cancelled release hands the session to the factory.
                 self.factory._hand_over(self)
                 raise
+            except BaseException:
+                # A failed retirement wait: a holding task keeps the session
+                # until its generation task ends; the failure is surfaced.
+                self.factory._hold(self, "failed_retirement")
+                raise
             self.state = "released"
             self.factory.released.append(self)
+            if not self.generation_done:
+                self.factory._hold(self, "generation_running")
             self._succeeded("release")
             return result
 
@@ -420,6 +542,8 @@ class FakeLease:
         self._record("teardown", (), {})
         self.teardown_calls += 1
         self.state = "torn_down"
+        if self.generation is not None and not self.generation.done():
+            self.factory._cancel(self.generation, "teardown", self)
 
     # -- internals ----------------------------------------------------------
 
@@ -537,7 +661,7 @@ def fake_entry_points(
 
 
 class FakeSessionFactory:
-    """A scriptable, recording session factory."""
+    """A scriptable, recording session factory. See the module docstring."""
 
     def __init__(
         self,
@@ -549,6 +673,7 @@ class FakeSessionFactory:
         strict: bool = True,
         validate: bool = True,
         clock: Any = None,
+        start_generation: bool = True,
     ) -> None:
         self.clock = clock if clock is not None else RealClock()
         self.served_cadences: frozenset[str] = frozenset(served_cadences)
@@ -557,19 +682,53 @@ class FakeSessionFactory:
         self.final_text = final_text
         self.strict = strict
         self.validate = validate
+        self.start_generation = start_generation
+        #: When set, the next ``open`` holds its generation task before its
+        #: first engine step until the scripted wait of ``open`` ends, so a
+        #: cancelled ``open`` finds a task that never started.
+        self.gate_next_open = False
+        #: When set, the engine-abort behaviour of the next ``open``'s
+        #: session (the generation task's cancellation handler), so a test
+        #: can keep the engine abort of a session a cancelled ``open`` gives
+        #: up pending.
+        self.next_open_engine_abort: Behaviour | None = None
+        #: Every session a cancelled or failed ``open`` gave up, in order.
+        self.abandoned: list[FakeLease] = []
         self.calls: list[Call] = []
         self.leases: list[FakeLease] = []
         self.released: list[FakeLease] = []
         self.handed_over: list[FakeLease] = []
-        #: Faults the next ``drain`` returns (a test appends to it).
+        #: Faults the next ``drain`` returns (a test may append to it).
         self.faults: list[BaseException] = []
         self.drains: list[float] = []
         self.teardown_calls = 0
         self.closed = False
-        #: Tasks ``teardown_all`` cancels and returns (a test adds to it).
+        #: Extra tasks ``teardown_all`` cancels and returns (a test adds).
         self.tasks: set[asyncio.Task[Any]] = set()
+        #: The generation task of each session ``open`` started.
+        self.generation: dict[FakeLease, asyncio.Task[Any]] = {}
         #: The cleanup task of each session handed to the factory.
         self.cleanup: dict[FakeLease, asyncio.Task[Any]] = {}
+        #: The holding task of each session held until generation ends.
+        self.holding: dict[FakeLease, asyncio.Task[Any]] = {}
+        #: Why each held session is held (``failed_retirement``,
+        #: ``generation_running``, ``cancelled_open``).
+        self.held_because: dict[FakeLease, str] = {}
+        #: Hand-overs or holds requested after ``teardown_all``.
+        self.refused_after_close: list[tuple[str, FakeLease]] = []
+        #: ``(source, kind, lease index)`` per cancellation the factory
+        #: requested; ``late_cancellations`` holds those made after the
+        #: generation task's handler began; ``foreign_cancellations`` the
+        #: ``(kind, lease index)`` of cancellations nobody here requested.
+        self.cancel_log: list[tuple[str, str, int]] = []
+        self.late_cancellations: list[tuple[str, int]] = []
+        self.foreign_cancellations: list[tuple[str, int]] = []
+        self.events: list[tuple[str, int | None]] = []
+        #: Every task ``teardown_all`` returned, over all its calls.
+        self.returned: set[asyncio.Task[Any]] = set()
+        self.active_drains = 0
+        self.max_concurrent_drains = 0
+        self._requested: dict[asyncio.Task[Any], int] = {}
         self._collected: set[asyncio.Future[Any]] = set()
         self._scripts = _Scripts()
         self._order = 0
@@ -577,7 +736,8 @@ class FakeSessionFactory:
     def constructor(self, engine_client: Any, model_config: Any) -> Any:
         """An entry-point constructor that accepts this factory's model.
 
-        Records the arguments it was called with on ``constructed_with``.
+        Records the arguments it was called with on ``constructed_with``
+        and starts nothing (``ING-CORE-031``).
         """
         self.constructed_with = (engine_client, model_config)
         return self
@@ -585,8 +745,8 @@ class FakeSessionFactory:
     def script(self, name: str, *behaviours: Behaviour) -> None:
         """Queue behaviours for the next calls of ``name``.
 
-        ``name`` is ``open``, ``drain`` or ``cleanup`` (the cleanup task of
-        the next session handed to the factory).
+        ``name`` is ``open``, ``drain`` or ``cleanup`` (the retirement wait
+        of the next session handed to the factory's cleanup).
         """
         self._scripts.script(name, *behaviours)
 
@@ -600,6 +760,34 @@ class FakeSessionFactory:
             for call in self.calls
             if target is None or call.target == target
         ]
+
+    def owned_tasks(self) -> set[asyncio.Task[Any]]:
+        """Every generation, cleanup and holding task, done or not."""
+        return (
+            set(self.generation.values())
+            | set(self.cleanup.values())
+            | set(self.holding.values())
+        )
+
+    def running_tasks(self) -> set[asyncio.Task[Any]]:
+        """The owned tasks (and ``tasks``) not yet done."""
+        return {t for t in self.owned_tasks() | self.tasks if not t.done()}
+
+    def owns(self, lease: FakeLease) -> bool:
+        """Whether a cleanup or holding task still holds ``lease``."""
+        for table in (self.cleanup, self.holding):
+            task = table.get(lease)
+            if task is not None and not task.done():
+                return True
+        return False
+
+    async def aclose(self) -> None:
+        """Cancel and await what is still running (test teardown only)."""
+        running = self.running_tasks()
+        for task in running:
+            self._cancel(task, "aclose", None)
+        if running:
+            await asyncio.wait(running)
 
     # -- protocol ---------------------------------------------------------
 
@@ -615,6 +803,9 @@ class FakeSessionFactory:
             if locale not in self.locales:
                 raise refused("locale", f"locale {locale!r} unknown")
         behaviour = self._scripts.next("open")
+        if isinstance(behaviour, Raise):
+            # A refusal before any session exists starts nothing.
+            raise behaviour.exc
         lease = FakeLease(
             self,
             len(self.leases),
@@ -622,55 +813,241 @@ class FakeSessionFactory:
             locale=locale,
             strict=self.strict,
         )
-        result = await _perform(behaviour, lease)
+        if self.next_open_engine_abort is not None:
+            lease.script("engine_abort", self.next_open_engine_abort)
+            self.next_open_engine_abort = None
+        if self.start_generation:
+            if self.gate_next_open:
+                self.gate_next_open = False
+                lease._start_gate.clear()
+            self._start_generation(lease)
+        try:
+            result = await _perform(behaviour, lease)
+        except BaseException:
+            self._abandon_open(lease)
+            raise
+        lease._start_gate.set()
         if isinstance(result, FakeLease):
             self.leases.append(result)
         return result
 
-    def owns(self, lease: FakeLease) -> bool:
-        """Whether the factory's cleanup of ``lease`` is still running."""
-        task = self.cleanup.get(lease)
-        return task is not None and not task.done()
-
     async def drain(self, deadline: float) -> list[BaseException]:
         self._record("factory", "drain", (deadline,), {})
         self.drains.append(deadline)
-        behaviour = self._scripts.next("drain")
-        pending = {task for task in self.cleanup.values() if not task.done()}
-        if pending:
-            # ``asyncio.wait`` leaves the tasks running when it is cancelled,
-            # so a cleanup still running at the deadline stays owned here.
-            with contextlib.suppress(TimeoutError):
-                await self.clock.wait_for(asyncio.wait(pending), deadline)
-        for task in list(self.cleanup.values()):
-            if task.done():
-                self._collect(task)
-        faults = list(self.faults)
-        self.faults.clear()
-        return await _perform(behaviour, faults)
+        self.active_drains += 1
+        self.max_concurrent_drains = max(
+            self.max_concurrent_drains, self.active_drains
+        )
+        try:
+            behaviour = self._scripts.next("drain")
+            pending = {
+                task
+                for table in (self.cleanup, self.holding)
+                for task in table.values()
+                if not task.done()
+            }
+            if pending:
+                # ``asyncio.wait`` leaves the tasks running when it is
+                # cancelled or times out, so the wait cancels no task.
+                if deadline == math.inf:
+                    await asyncio.wait(pending)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        await self.clock.wait_for(
+                            asyncio.wait(pending), deadline
+                        )
+            for lease, task in list(self.generation.items()):
+                if task.done():
+                    self._generation_fault(lease, task)
+            for table in (self.cleanup, self.holding):
+                for task in list(table.values()):
+                    if task.done():
+                        self._collect(task)
+            faults = list(self.faults)
+            self.faults.clear()
+            return await _perform(behaviour, faults)
+        finally:
+            self.active_drains -= 1
 
     def teardown_all(self) -> set[asyncio.Task[Any]]:
         self._record("factory", "teardown_all", (), {})
+        self.events.append(("teardown_all", None))
         self.teardown_calls += 1
         self.closed = True
-        tasks = set(self.tasks)
-        tasks.update(t for t in self.cleanup.values() if not t.done())
+        tasks = self.owned_tasks() | set(self.tasks)
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                self._cancel(task, "teardown_all", None)
+        self.returned |= tasks
         return tasks
 
     # -- internals ----------------------------------------------------------
 
+    def _lease_of(self, task: asyncio.Task[Any]) -> tuple[str, int]:
+        for kind, table in (
+            ("generation", self.generation),
+            ("cleanup", self.cleanup),
+            ("holding", self.holding),
+        ):
+            for lease, owned in table.items():
+                if owned is task:
+                    return kind, lease.index
+        return "extra", -1
+
+    def _cancel(
+        self, task: asyncio.Task[Any], source: str, lease: FakeLease | None
+    ) -> None:
+        """Request ``task``'s cancellation, logged with its source."""
+        kind, index = self._lease_of(task)
+        self.cancel_log.append((source, kind, index))
+        if kind == "generation" and lease is None:
+            lease = next(
+                (le for le, t in self.generation.items() if t is task), None
+            )
+        if kind == "generation" and lease is not None and lease.handler_began:
+            self.late_cancellations.append((source, index))
+        self._requested[task] = self._requested.get(task, 0) + 1
+        task.cancel()
+
+    def _check_foreign(self, kind: str, index: int) -> None:
+        """Record cancellations of the current task nobody here requested."""
+        task = asyncio.current_task()
+        if task is None:
+            return
+        foreign = task.cancelling() - self._requested.get(task, 0)
+        if foreign > 0:
+            self.foreign_cancellations.append((kind, index))
+            self._requested[task] = task.cancelling()
+
+    def _start_generation(self, lease: FakeLease) -> None:
+        task = asyncio.ensure_future(self._generation_body(lease))
+        lease.generation = task
+        self.generation[lease] = task
+        task.add_done_callback(lambda t: self._generation_done(lease, t))
+
+    async def _generation_body(self, lease: FakeLease) -> None:
+        if not lease._start_gate.is_set():
+            # Not yet started: a cancellation here ends the task at once,
+            # before its body (no engine call, no handler).
+            await lease._start_gate.wait()
+        lease.generation_started = True
+        self.events.append(("generation.start", lease.index))
+        lease.engine_calls.append("generate")
+        try:
+            await lease._generation_end.wait()
+        except asyncio.CancelledError:
+            self._check_foreign("generation", lease.index)
+            lease.handler_began = True
+            self.events.append(("generation.handler", lease.index))
+            lease.engine_calls.append("abort")
+            behaviour = lease._scripts.next("engine_abort")
+            try:
+                await _perform(behaviour, None)
+            except asyncio.CancelledError:
+                # A cancellation while awaiting the engine's abort.
+                self._check_foreign("generation", lease.index)
+                raise
+            raise
+        if lease._generation_error is not None:
+            raise lease._generation_error
+
+    def _generation_done(self, lease: FakeLease, task: asyncio.Task) -> None:
+        self.events.append(("generation.end", lease.index))
+        self._generation_fault(lease, task)
+
+    def _generation_fault(self, lease: FakeLease, task: asyncio.Task) -> None:
+        """Retain an unsurfaced generation exception, once."""
+        if task in self._collected:
+            return
+        self._collected.add(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and not (
+            lease._surfaced and error is lease._generation_error
+        ):
+            self.faults.append(error)
+
+    def _abandon_open(self, lease: FakeLease) -> None:
+        """A cancelled or failed ``open`` gives its session up.
+
+        The generation task is cancelled twice with no suspension between
+        the requests (the wait's cancellation and the hand-over); a task
+        that already took its first step is covered by a holding task, one
+        that has not is dropped and never runs its body.
+        """
+        self.abandoned.append(lease)
+        generation = lease.generation
+        if generation is None or generation.done():
+            return
+        self._cancel(generation, "open", lease)
+        self._cancel(generation, "open.hand_over", lease)
+        if lease.generation_started:
+            self._hold(lease, "cancelled_open")
+        else:
+            del self.generation[lease]
+
     def _hand_over(self, lease: FakeLease) -> None:
+        if self.closed:
+            self.refused_after_close.append(("cleanup", lease))
+            return
         self.handed_over.append(lease)
         behaviour = self._scripts.next("cleanup")
-        task = asyncio.ensure_future(_perform(behaviour, None))
+        task = asyncio.ensure_future(self._cleanup_body(lease, behaviour))
         task.add_done_callback(self._collect)
         self.cleanup[lease] = task
 
+    async def _cleanup_body(self, lease: FakeLease, behaviour: Any) -> None:
+        self.events.append(("cleanup.start", lease.index))
+        try:
+            failure: BaseException | None = None
+            try:
+                await _perform(behaviour, None)
+            except asyncio.CancelledError:
+                self._check_foreign("cleanup", lease.index)
+                raise
+            except Exception as exc:
+                failure = exc
+            await self._await_generation(lease, "cleanup")
+            if failure is not None:
+                raise failure
+        finally:
+            self.events.append(("cleanup.end", lease.index))
+
+    def _hold(self, lease: FakeLease, why: str) -> None:
+        if lease.generation_done:
+            return
+        if self.closed:
+            self.refused_after_close.append(("holding", lease))
+            return
+        self.held_because[lease] = why
+        task = asyncio.ensure_future(self._holding_body(lease))
+        task.add_done_callback(self._collect)
+        self.holding[lease] = task
+
+    async def _holding_body(self, lease: FakeLease) -> None:
+        self.events.append(("holding.start", lease.index))
+        try:
+            await self._await_generation(lease, "holding")
+        finally:
+            self.events.append(("holding.end", lease.index))
+
+    async def _await_generation(self, lease: FakeLease, kind: str) -> None:
+        """Wait for the generation task's end, never cancelling it."""
+        generation = lease.generation
+        if generation is None or generation.done():
+            return
+        try:
+            await asyncio.wait({generation})
+        except asyncio.CancelledError:
+            self._check_foreign(kind, lease.index)
+            raise
+
     def _collect(self, task: asyncio.Future[Any]) -> None:
-        """Record a finished cleanup task's exception as a fault, once."""
+        """Retain a finished cleanup or holding task's exception, once."""
         if task in self._collected:
+            return
+        if not task.done():
             return
         self._collected.add(task)
         if task.cancelled():

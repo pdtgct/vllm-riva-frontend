@@ -15,7 +15,7 @@ collection succeeds while the modules do not exist yet.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import math
 import socket
 import sys
 from collections.abc import Awaitable, Callable, Iterable
@@ -34,6 +34,13 @@ SMALL_CAP = {
 
 
 # -------------------------------------------------------------- helpers
+
+
+def file_route() -> str:
+    """The frontend's file route (``support.http.ROUTE``)."""
+    from support.http import ROUTE
+
+    return ROUTE
 
 
 def port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -215,6 +222,24 @@ async def drive(
     return await asyncio.wait_for(task, 5.0)
 
 
+async def drive_stop(clock: Any, awaitable: Awaitable[Any]) -> None:
+    """A fixture teardown's ``stop``: ``drive`` it, bounded in real time.
+
+    The clock advances as in ``drive``; a stop still running after that
+    gets ``STOP_BOUND`` real seconds (``support.teardown.await_stop``) and
+    then fails the test, even when it absorbs the cancellation that
+    ``drive``'s ``wait_for`` would wait on. The stop's own exception never
+    masks the test's result.
+    """
+    from support.teardown import await_stop
+
+    async def advance() -> None:
+        await clock.advance(0.25)
+        await asyncio.sleep(0.001)
+
+    await await_stop(awaitable, advance=advance, rounds=400)
+
+
 async def until(predicate: Callable[[], bool], *, timeout: float = 3.0) -> None:
     """``support.clock.until`` with a longer bound, for real gRPC I/O."""
     from support.clock import until as poll
@@ -232,6 +257,117 @@ async def settle_until(
         await clock.settle(5)
         await asyncio.sleep(0.001)
     raise AssertionError("condition not reached")
+
+
+# ------------------------------------------------------ drain and owners
+
+
+def begin_drain(plugin: Any, state: Any, timeout: float) -> asyncio.Task:
+    """Core's drain step: set ``state.draining``, then start ``drain``."""
+    state.draining = True
+    return asyncio.ensure_future(plugin.drain(state, timeout))
+
+
+def register_dummy(
+    plugin: Any,
+    kind_name: str = "stream",
+    *,
+    stubborn: asyncio.Event | None = None,
+    events: list[Any] | None = None,
+) -> tuple[asyncio.Task, Any]:
+    """Register a plain task as an owner.
+
+    Its body waits forever; when cancelled it awaits ``stubborn`` (if
+    given) before it ends cancelled, so its cleanup outlives the
+    cancellation. ``events`` records ``"owner.cancelled"`` and
+    ``"owner.end"``.
+    """
+    from vllm_riva_frontend.admission import OwnerKind
+
+    async def body() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if events is not None:
+                events.append("owner.cancelled")
+            if stubborn is not None:
+                await stubborn.wait()
+            raise
+        finally:
+            if events is not None:
+                events.append("owner.end")
+
+    task = asyncio.ensure_future(body())
+    record = plugin.registry.register(getattr(OwnerKind, kind_name), task)
+    return task, record
+
+
+def factory_settlement(factory: Any, since: int = 0) -> int:
+    """Assert ``factory.calls`` holds the factory settlement (ING-EP-096).
+
+    The steps are ``drain(math.inf)``, ``teardown_all()`` and a finite
+    ``drain(now)``, in that order with no other factory call between them,
+    at or after call index ``since``. Returns the index of the
+    ``drain(math.inf)`` call.
+    """
+    calls = [
+        (index, call)
+        for index, call in enumerate(factory.calls)
+        if index >= since and call.target == "factory"
+    ]
+    for position, (index, call) in enumerate(calls):
+        if call.name == "drain" and call.args == (math.inf,):
+            rest = [later for _, later in calls[position + 1 : position + 3]]
+            assert [later.name for later in rest] == [
+                "teardown_all",
+                "drain",
+            ], [(later.name, later.args) for _, later in calls]
+            assert math.isfinite(rest[1].args[0]), rest[1].args
+            return index
+    raise AssertionError(
+        "no factory settlement: "
+        f"{[(call.name, call.args) for _, call in calls]}"
+    )
+
+
+def stubborn_stream(plugin: Any, clock: Any, *messages: Any) -> Any:
+    """A ``StreamingCall`` whose transport stalls every write and status.
+
+    A stalled send also delays its cancellation: it absorbs every
+    cancellation (``context.cancellations``) and ends, cancelled if it was
+    cancelled meanwhile, only once the test sets ``context.unblocked``. So a
+    refusal's send stays unsettled after its handler cancels it.
+    """
+    from support.grpc_harness import FakeServicerContext
+    from support.riva import StreamingCall
+
+    class StubbornContext(FakeServicerContext):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.block = True
+            self.cancellations = 0
+
+        async def _stall(self, item: Any) -> None:
+            self.stalled += 1
+            self.parked.append(item)
+            absorbed = 0
+            while not self.unblocked.is_set():
+                try:
+                    await self.unblocked.wait()
+                except asyncio.CancelledError:
+                    absorbed += 1
+                    self.cancellations += 1
+                    task = asyncio.current_task()
+                    if task is not None:
+                        task.uncancel()
+            if absorbed:
+                raise asyncio.CancelledError
+
+    call = StreamingCall(plugin.servicer, clock, messages=messages, start=False)
+    call.context = StubbornContext(clock=clock)
+    call.responses = call.context.writes
+    call.start()
+    return call
 
 
 # ------------------------------------------------------------- Riva wire
@@ -361,8 +497,9 @@ async def initialized(frontend: Any, app_state: Any) -> Any:
     """``(plugin, state)`` after ``init_state``."""
     yield frontend, app_state
     if not getattr(frontend, "torn_down", True):
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(frontend.stop(app_state), 5.0)
+        from support.teardown import await_stop
+
+        await await_stop(frontend.stop(app_state))
 
 
 @pytest.fixture
@@ -374,8 +511,7 @@ async def started(frontend: Any, app_state: Any, clock: Any) -> Any:
     await frontend.start(app_state)
     yield frontend, app_state
     if not frontend.torn_down:
-        with contextlib.suppress(Exception):
-            await drive(clock, frontend.stop(app_state))
+        await drive_stop(clock, frontend.stop(app_state))
 
 
 @pytest.fixture
@@ -398,5 +534,4 @@ async def small_cap(clock: Any, fake_factory: Any, grpc_port: int) -> Any:
     await plugin.start(state)
     yield plugin, app, state, transcription
     if not plugin.torn_down:
-        with contextlib.suppress(Exception):
-            await drive(clock, plugin.stop(state))
+        await drive_stop(clock, plugin.stop(state))

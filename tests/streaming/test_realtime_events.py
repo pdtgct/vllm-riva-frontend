@@ -52,13 +52,26 @@ async def _no_event(client: RealtimeClient, wait: float = 0.05) -> bool:
     return False
 
 
-# @spec ING-NIMWS-021
+# @spec ING-NIMWS-029
 async def test_conversation_created_precedes_any_client_event(served):
     client = RealtimeClient(served.app, served.clock)
     assert await client.connect()
     first = await client.next()
     assert first["type"] == "conversation.created"
     assert served.factory.leases == []
+
+
+# @spec ING-NIMWS-029
+async def test_conversation_created_first(served):
+    """A client event already waiting is processed after the created event."""
+    client = RealtimeClient(served.app, served.clock)
+    assert await client.connect()
+    client.ws.push_json(update_event(default_session()))
+    first = await client.next()
+    assert first["type"] == "conversation.created"
+    second = await client.next()
+    assert second["type"] == "transcription_session.updated", second
+    assert client.types().count("conversation.created") == 1
 
 
 # @spec ING-NIMWS-023
@@ -451,7 +464,7 @@ async def test_an_append_above_the_envelope_cap_is_refused_before_decode(
 # --------------------------------------------------- refusal and shutdown
 
 
-# @spec ING-NIMWS-016
+# @spec ING-NIMWS-028
 # @spec ING-ERR-015
 async def test_ingress_cap_refusal_accepts_errors_busy_and_closes_1013(clock):
     options = riva_options(load_shed_max_sessions=1)
@@ -470,7 +483,7 @@ async def test_ingress_cap_refusal_accepts_errors_busy_and_closes_1013(clock):
         assert len(served.plugin.registry.records) == 1
 
 
-# @spec ING-NIMWS-016
+# @spec ING-NIMWS-028
 async def test_a_draining_plugin_refuses_with_service_unavailable(served):
     drain = asyncio.create_task(drain_plugin(served.plugin, served.state, 60.0))
     await served.clock.settle(20)
@@ -483,6 +496,55 @@ async def test_a_draining_plugin_refuses_with_service_unavailable(served):
     assert not served.plugin.registry.records
     await served.clock.advance(60)
     await asyncio.wait_for(drain, 5.0)
+
+
+@pytest.mark.parametrize("cause", ["ingress_cap", "draining_flag", "drain"])
+# @spec ING-NIMWS-028
+async def test_cap_or_draining_refusal_accepts_errors_and_closes_1013(
+    clock, cause
+):
+    """Accept, one ``error`` with the catalog code, close 1013; nothing more.
+
+    The refused connection gets no ``conversation.created``, has no client
+    event read and creates no owner or lease.
+    """
+    options = riva_options(load_shed_max_sessions=1)
+    async with serving(
+        clock=clock, options=options, tasks=("realtime",)
+    ) as served:
+        drain = None
+        leases = 0
+        if cause == "ingress_cap":
+            holder = RealtimeClient(served.app, served.clock)
+            await holder.open_session()
+            leases = 1
+        elif cause == "draining_flag":
+            served.state.draining = True  # core's flag, no drain call
+        else:
+            drain = asyncio.create_task(
+                drain_plugin(served.plugin, served.state, 60.0)
+            )
+            await served.clock.settle(20)
+        records = len(served.plugin.registry.records)
+        count = served.plugin.ingress.count
+        refused = RealtimeClient(served.app, served.clock)
+        assert await refused.connect()
+        refused.ws.push_json(update_event(default_session()))
+        before = await refused.assert_closes(1013)
+        assert [e["type"] for e in before] == ["error"]
+        expected = "busy" if cause == "ingress_cap" else "service_unavailable"
+        assert error_code(before[0]) == expected, before[0]
+        if cause == "ingress_cap":
+            assert error_authority(before[0]) == "load_shed", before[0]
+        assert "conversation.created" not in refused.types()
+        await refused.wait_closed()
+        assert refused.ws.consumed <= 1, "a client event was read"
+        assert len(served.factory.leases) == leases
+        assert len(served.plugin.registry.records) == records
+        assert served.plugin.ingress.count == count
+        if drain is not None:
+            await served.clock.advance(60)
+            await asyncio.wait_for(drain, 5.0)
 
 
 # @spec ING-NIMWS-017

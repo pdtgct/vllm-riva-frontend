@@ -20,12 +20,21 @@ attributes the frontend reads or core's plugin functions set:
 ``make_args`` is the ``Namespace`` of serve arguments the app and the
 plugin functions read (``api_server_count``, ``enable_server_load_tracking``,
 the CORS and ``api_key`` options of ``init_entrypoints_middleware``).
+``make_args(api_server_count=ABSENT)`` leaves the attribute out, as a
+namespace built without core's serve parser would (ING-EP-081 counts it as
+one process). ``make_state(draining=...)`` presets ``state.draining`` (core
+sets it before or without a ``drain`` call, ING-EP-082 and ING-EP-102).
+
+``RecordingShutdown(on_call=...)`` runs ``on_call()`` at each call and keeps
+its results in ``observations``, so a test sees what held at the instant the
+plugin requested shutdown (for example that admission was already closed,
+ING-EP-111).
 """
 
 from __future__ import annotations
 
 from argparse import Namespace
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from starlette.datastructures import State
@@ -36,15 +45,22 @@ from support.fake_transcription import (
     FakeTranscriptionServing,
 )
 
+#: Leave an argument out of the namespace altogether.
+ABSENT = object()
+
 
 class RecordingShutdown:
     """``state.request_shutdown``: synchronous, idempotent, counted."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_call: Callable[[], Any] | None = None) -> None:
         self.calls = 0
+        self.on_call = on_call
+        self.observations: list[Any] = []
 
     def __call__(self) -> None:
         self.calls += 1
+        if self.on_call is not None:
+            self.observations.append(self.on_call())
 
     @property
     def requested(self) -> bool:
@@ -75,7 +91,9 @@ def make_args(**overrides: Any) -> Namespace:
         "log_error_stack": False,
     }
     values.update(overrides)
-    return Namespace(**values)
+    return Namespace(
+        **{key: value for key, value in values.items() if value is not ABSENT}
+    )
 
 
 def make_state(
@@ -86,10 +104,12 @@ def make_state(
     state: State | None = None,
     models: FakeServingModels | None = None,
     transcription: FakeTranscriptionServing | None = None,
+    draining: bool | None = None,
 ) -> State:
     """Fill ``state`` as core does before ``init_endpoint_plugins_state``.
 
-    A new ``State`` is built when none is given.
+    A new ``State`` is built when none is given. ``draining`` is left unset
+    unless given (core's Phase B sets it to ``False``).
     """
     tasks = tuple(tasks)
     state = state if state is not None else State()
@@ -110,6 +130,8 @@ def make_state(
             else FakeTranscriptionServing(models)
         )
     state.request_shutdown = RecordingShutdown()
+    if draining is not None:
+        state.draining = draining
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
     return state

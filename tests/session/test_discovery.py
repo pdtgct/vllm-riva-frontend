@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
+from support.clock import settle
 from support.fake_session import FakeSessionFactory, fake_entry_points
 
 from .conftest import failure_text, startup_failure
@@ -99,6 +103,40 @@ def test_a_named_factory_is_the_only_one_used(fake_engine):
     )
 
     assert factory is second
+
+
+@pytest.fixture
+def real_session_constructor():
+    """The model plugin's constructor; its conformance run overrides this."""
+    pytest.skip(
+        "the model plugin's seam conformance run provides its constructor"
+    )
+
+
+@pytest.fixture(
+    params=["fake", pytest.param("real", marks=pytest.mark.real_factory)]
+)
+def session_constructor(request):
+    """A session-factory constructor: the fake's, or the model plugin's."""
+    if request.param == "fake":
+        return FakeSessionFactory().constructor
+    return request.getfixturevalue("real_session_constructor")
+
+
+# @spec ING-CORE-031
+async def test_constructor_starts_no_task_or_session(
+    fake_engine, session_constructor
+):
+    before = asyncio.all_tasks()
+
+    factory = session_constructor(fake_engine, fake_engine.model_config)
+    await settle()
+
+    assert factory is not None
+    assert asyncio.all_tasks() - before == set(), "construction started a task"
+    # Inert until its first ``open``: nothing to drain, nothing to tear down.
+    assert await asyncio.wait_for(factory.drain(time.monotonic()), 1.0) == []
+    assert factory.teardown_all() == set()
 
 
 # @spec ING-CORE-012, ING-CORE-017

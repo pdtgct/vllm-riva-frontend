@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import io
 import json
 
 import pytest
@@ -16,7 +18,9 @@ from support.fake_transcription import (
     transcription_response,
 )
 from support.http import (
+    CORE_ROUTE,
     HttpExchange,
+    MiB,
     assert_core_error,
     chunked,
     content_type,
@@ -24,7 +28,14 @@ from support.http import (
     until,
 )
 
-from .helpers import GuardedCall, SlowWatcherCancel, TrackedStream, is_uuid
+from .helpers import (
+    GuardedCall,
+    SlowWatcherCancel,
+    TrackedStream,
+    is_uuid,
+    start_drain,
+    start_stop,
+)
 
 ABORT_PERIOD = 0.25
 
@@ -46,7 +57,7 @@ def _record_aborts(env):
 # ----------------------------------------------------------- request IDs
 
 
-# @spec ING-FILE-026
+# @spec ING-FILE-026, ING-FILE-084
 async def test_route_fixes_the_engine_request_id(files_env):
     env = await files_env()
     exchange = env.request(
@@ -115,7 +126,7 @@ def test_build_raw_request_over_a_scope_replaces_client_ids():
 # ------------------------------------------------- abort and settlement
 
 
-# @spec ING-FILE-068, ING-FILE-029, ING-FILE-067, ING-FILE-007
+# @spec ING-FILE-068, ING-FILE-077, ING-FILE-089, ING-FILE-007
 async def test_disconnect_during_core_call_aborts_until_settled(files_env):
     env = await files_env()
     guarded = GuardedCall(env.service)
@@ -147,7 +158,7 @@ async def test_disconnect_during_core_call_aborts_until_settled(files_env):
     assert exchange.status is None, "a response after the disconnect"
 
 
-# @spec ING-FILE-068, ING-FILE-069, ING-FILE-029
+# @spec ING-FILE-068, ING-FILE-069, ING-FILE-077
 async def test_stream_disconnect_waits_for_the_outstanding_pull(files_env):
     env = await files_env()
     aborts = _record_aborts(env)
@@ -201,7 +212,7 @@ async def settle_and_unblock(exchange: HttpExchange) -> None:
     exchange.unblock_send()
 
 
-# @spec ING-FILE-007, ING-FILE-073
+# @spec ING-FILE-007, ING-FILE-091
 async def test_disconnect_during_complete_send_suppresses_only(files_env):
     env = await files_env()
     exchange = env.request(block_send=0).start()
@@ -213,7 +224,7 @@ async def test_disconnect_during_complete_send_suppresses_only(files_env):
     assert env.engine.aborted == []
 
 
-# @spec ING-FILE-073, ING-FILE-064, ING-ADM-016
+# @spec ING-FILE-091, ING-FILE-064, ING-ADM-016
 async def test_stalled_reader_of_complete_response_is_cut_without_abort(
     files_env,
 ):
@@ -231,7 +242,7 @@ async def test_stalled_reader_of_complete_response_is_cut_without_abort(
     assert len(exchange.starts) <= 1
 
 
-# @spec ING-FILE-073, ING-FILE-068
+# @spec ING-FILE-091, ING-FILE-068
 async def test_stalled_reader_of_unfinished_stream_aborts(files_env):
     env = await files_env()
     stream = TrackedStream(
@@ -362,7 +373,7 @@ async def test_failure_after_headers_ends_the_stream_without_a_status(
 # ------------------------------------------------------- terminal cause
 
 
-# @spec ING-FILE-067
+# @spec ING-FILE-089
 async def test_disconnect_before_any_cause_wins_over_a_later_failure(
     files_env,
 ):
@@ -379,7 +390,7 @@ async def test_disconnect_before_any_cause_wins_over_a_later_failure(
     assert exchange.error is None
 
 
-# @spec ING-FILE-067
+# @spec ING-FILE-089
 async def test_disconnect_after_deadline_suppresses_the_response(files_env):
     env = await files_env()
     block = Block()
@@ -394,7 +405,7 @@ async def test_disconnect_after_deadline_suppresses_the_response(files_env):
     assert exchange.status is None
 
 
-# @spec ING-FILE-067
+# @spec ING-FILE-089
 async def test_abort_failure_does_not_change_the_selected_response(
     files_env,
 ):
@@ -416,7 +427,7 @@ async def test_abort_failure_does_not_change_the_selected_response(
     assert_core_error(exchange, 504, "request_timeout")
 
 
-# @spec ING-FILE-067, ING-ERR-056, ING-FILE-064
+# @spec ING-FILE-089, ING-ERR-056, ING-FILE-064
 @pytest.mark.parametrize(
     "then",
     [
@@ -444,7 +455,7 @@ async def test_deadline_due_with_core_outcome_wins_at_the_call_boundary(
     assert_core_error(exchange, 504, "request_timeout")
 
 
-# @spec ING-FILE-067, ING-ERR-056, ING-FILE-064, ING-FILE-035
+# @spec ING-FILE-089, ING-ERR-056, ING-FILE-064, ING-FILE-035
 @pytest.mark.parametrize("fails", [True, False], ids=["failure", "event"])
 async def test_deadline_due_with_a_pull_wins_at_the_pull_boundary(
     files_env, fails
@@ -482,6 +493,153 @@ async def test_deadline_due_with_a_pull_wins_at_the_pull_boundary(
     assert stream.closed
 
 
+async def _failing_abort(env):
+    """Make every engine abort record its ID and then raise."""
+
+    async def failing_abort(request_id):
+        env.engine.aborted.append(request_id)
+        raise RuntimeError("abort failed")
+
+    env.engine.abort = failing_abort
+
+
+# @spec ING-FILE-089
+@pytest.mark.parametrize(
+    ("first", "later", "status", "code"),
+    [
+        ("deadline", "shutdown", 504, "request_timeout"),
+        ("deadline", "abort-failure", 504, "request_timeout"),
+        ("deadline", "disconnect", None, None),
+        ("disconnect", "shutdown", None, None),
+        ("disconnect", "abort-failure", None, None),
+        ("shutdown", "deadline", 503, "service_unavailable"),
+    ],
+    ids=[
+        "deadline-then-shutdown",
+        "deadline-then-abort-failure",
+        "deadline-then-disconnect",
+        "disconnect-then-shutdown",
+        "disconnect-then-abort-failure",
+        "shutdown-then-deadline",
+    ],
+)
+async def test_terminal_cause_selection_rules(
+    files_env, first, later, status, code
+):
+    """One terminal cause: the first decides, a later event changes nothing.
+
+    A disconnect before any cause wins and produces no response; otherwise
+    the first of shutdown, a deadline or a failure decides the response; a
+    later disconnect suppresses the response and keeps the cause; a later
+    abort failure or the plugin's shutdown changes nothing.
+    """
+    env = await files_env()
+    guarded = GuardedCall(env.service)
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    exchange = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    ended: asyncio.Future | None = None
+
+    async def happen(event: str) -> None:
+        nonlocal ended
+        if event == "deadline":
+            timeout = env.plugin.config.file_execution_timeout
+            await env.clock.advance(timeout + 0.1)
+        elif event == "disconnect":
+            exchange.disconnect()
+            await env.clock.settle()
+        elif event == "shutdown":
+            ended = start_drain(env)
+            await env.clock.settle()
+        elif event == "abort-failure":
+            await _failing_abort(env)
+            await env.clock.advance(ABORT_PERIOD)
+
+    await happen(first)
+    await until(lambda: env.engine.aborted, what="the first cause aborts")
+    await happen(later)
+    block.release()
+    if ended is not None:
+        await asyncio.wait_for(ended, 5)
+    await exchange.finish()
+    assert exchange.error is None, exchange.error
+    if status is None:
+        assert exchange.status is None, exchange.body
+        assert exchange.messages == []
+    else:
+        assert len(exchange.starts) == 1
+        assert_core_error(exchange, status, code)
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+    assert guarded.cancelled == 0
+
+
+# @spec ING-FILE-082, ING-FILE-086
+@pytest.mark.parametrize(
+    ("selected", "status", "code"),
+    [
+        ("none", 503, "service_unavailable"),
+        ("deadline", 504, "request_timeout"),
+        ("disconnect", None, None),
+    ],
+)
+async def test_plugin_cancel_answers_selected_cause_and_hands_cleanup_to_continuation(  # noqa: E501
+    files_env, selected, status, code
+):
+    """The plugin's cancellation answers at once and hands cleanup over.
+
+    Core's call is still running when ``drain``'s settlement cancels the
+    owner: the handler answers at once with the cause already selected (or
+    ``service_unavailable`` when none was), sends nothing after a
+    disconnect, and its cleanup continuation keeps the record, permit,
+    file-owner slot and load count until core's call has returned.
+    """
+    env = await files_env(load_tracking=True)
+    guarded = GuardedCall(env.service)
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    exchange = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    if selected == "deadline":
+        await env.clock.advance(env.plugin.config.file_execution_timeout + 0.1)
+        await until(lambda: env.engine.aborted, what="abort at the deadline")
+    elif selected == "disconnect":
+        exchange.disconnect()
+        await until(lambda: env.engine.aborted, what="abort at the disconnect")
+    await env.clock.settle()
+    assert not exchange.done, "the handler answered before its cleanup bound"
+
+    drain = start_drain(env)
+    # The handler answers at once, while core's call still runs.
+    await until(lambda: exchange.done, what="the handler answered at once")
+    assert not block.released.is_set()
+    assert exchange.error is None, exchange.error
+    if status is None:
+        assert exchange.status is None, exchange.body
+        assert exchange.messages == []
+    else:
+        assert_core_error(exchange, status, code)
+    records = list(env.plugin.registry.records.values())
+    assert len(records) == 1, "the record was dropped before settlement"
+    assert records[0].continuation is not None
+    assert not records[0].continuation.done()
+    assert env.plugin.file_gate.in_flight == 1
+    assert env.plugin.ingress.file_count == 1
+    assert env.state.server_load_metrics == 1
+    await env.clock.settle()
+    assert not drain.done(), "the settlement did not await the continuation"
+
+    before = len(env.engine.aborted)
+    block.release()
+    await asyncio.wait_for(drain, 5)
+    assert len(env.engine.aborted) > before, "no final abort"
+    assert guarded.cancelled == 0, "the owner cancelled core's call"
+    assert not env.plugin.registry.records
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.ingress.file_count == 0
+    assert env.state.server_load_metrics == 0
+
+
 # ---------------------------------------- cleanup bound and continuation
 
 
@@ -498,7 +656,7 @@ async def _handover(env, *, load_tracking=False):
     return guarded, block, exchange
 
 
-# @spec ING-FILE-070, ING-FILE-071, ING-FILE-072
+# @spec ING-FILE-078, ING-FILE-079, ING-FILE-090
 async def test_cleanup_bound_hands_over_to_a_registered_continuation(
     files_env,
 ):
@@ -528,19 +686,7 @@ async def test_cleanup_bound_hands_over_to_a_registered_continuation(
     assert guarded.cancelled == 0
 
 
-# @spec ING-FILE-071, ING-FILE-029
-async def test_stop_cancels_the_continuation_and_its_children(files_env):
-    env = await files_env()
-    guarded, block, _ = await _handover(env)
-    assert env.plugin.registry.records
-    await env.served.stop(timeout=5)  # core's ``stop_endpoint_plugins``
-    await until(lambda: guarded.cancelled == 1, what="core call cancelled")
-    assert not any(
-        not r.task.done() for r in env.plugin.registry.records.values()
-    )
-
-
-# @spec ING-FILE-070
+# @spec ING-FILE-078
 async def test_handler_answers_at_the_cleanup_bound_without_settling(
     files_env,
 ):
@@ -559,7 +705,7 @@ async def test_handler_answers_at_the_cleanup_bound_without_settling(
     await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
 
 
-# @spec ING-FILE-070, ING-FILE-071, ING-FILE-074
+# @spec ING-FILE-078, ING-FILE-079, ING-FILE-080, ING-FILE-087
 async def test_cleanup_holds_accounting_until_the_watcher_settles(files_env):
     env = await files_env()
     env.service.script(Raise(RuntimeError("core failed")))
@@ -590,7 +736,7 @@ async def test_cleanup_holds_accounting_until_the_watcher_settles(files_env):
     assert env.plugin.ingress.file_count == 0
 
 
-# @spec ING-FILE-070, ING-FILE-071, ING-EP-059
+# @spec ING-FILE-078, ING-FILE-079, ING-EP-093
 async def test_watcher_before_the_permit_is_settled_or_stopped(files_env):
     env = await files_env(riva_frontend={"max_concurrent_files": 1})
     block = Block()
@@ -615,18 +761,372 @@ async def test_watcher_before_the_permit_is_settled_or_stopped(files_env):
     assert len(env.plugin.registry.records) == 2
     assert env.plugin.ingress.file_count == 2
 
-    # ``stop`` cancels the continuation and the watcher it waits for.
-    await env.served.stop(timeout=5)
-    await until(lambda: not env.plugin.registry.records, what="unregistered")
+    # ``stop``'s settlement cancels the owners and awaits every
+    # continuation with the children it holds, cooperatively: the second
+    # request's watcher and the first request's core call.
+    ended = start_stop(env)
+    await env.clock.settle()
+    watcher.release()
+    block.release()
+    await asyncio.wait_for(ended, 5)
+    assert not env.plugin.registry.records
     assert env.plugin.ingress.file_count == 0
     assert env.plugin.file_gate.in_flight == 0
     await first.finish()
 
 
+# @spec ING-FILE-077, ING-FILE-069
+@pytest.mark.parametrize("shutdown", ["drain", "stop"])
+@pytest.mark.parametrize("phase", ["call", "pull"])
+async def test_owner_never_cancels_core_call_or_pull_continuation_inherits_them(
+    files_env, phase, shutdown
+):
+    """Neither the owner nor the settlement cancels core's call or a pull.
+
+    The handler hands its cleanup over at the cleanup bound; the
+    continuation inherits the outstanding call (or pull), keeps aborting
+    while it awaits it through the settlement of ``drain`` or ``stop``,
+    then sends the final awaited abort and only then closes the generator,
+    beginning no new pull.
+    """
+    env = await files_env()
+    guarded = GuardedCall(env.service)
+    stream: TrackedStream | None = None
+    if phase == "call":
+        block = Block(then=Return(transcription_response("late")))
+        env.service.script(block)
+        exchange = env.request().start()
+        await asyncio.wait_for(block.entered.wait(), 2)
+        finish_outstanding = block.release
+    else:
+        pull = asyncio.Event()
+        stream = TrackedStream(
+            [sse({"n": 0}), sse({"n": 1}), sse({"n": 2})],
+            engine=env.engine,
+            blocks={1: pull},
+        )
+        env.service.script(Return(stream))
+        exchange = env.request([("stream", "true")]).start()
+        await until(lambda: stream.pulling == 1, what="second pull")
+        finish_outstanding = pull.set
+    exchange.disconnect()
+    await until(lambda: env.engine.aborted, what="abort")
+    await env.clock.advance(env.plugin.config.session_cleanup_timeout + 0.1)
+    await exchange.finish()
+    (record,) = env.plugin.registry.records.values()
+    assert record.continuation is not None
+    assert not record.continuation.done()
+    pulls = stream.pulls if stream is not None else 0
+
+    ended = start_drain(env) if shutdown == "drain" else start_stop(env)
+    await env.clock.settle()
+    assert not ended.done(), "the settlement did not await the continuation"
+    retries = len(env.engine.aborted)
+    await env.clock.advance(ABORT_PERIOD)
+    await until(
+        lambda: len(env.engine.aborted) > retries,
+        what="the continuation keeps aborting during the settlement",
+    )
+    assert guarded.cancelled == 0, "core's call was cancelled"
+    if stream is not None:
+        assert stream.pull_cancelled == 0, "the outstanding pull was cancelled"
+        assert not stream.closed, "closed while a pull was running"
+
+    before = len(env.engine.aborted)
+    finish_outstanding()
+    await asyncio.wait_for(ended, 5)
+    assert len(env.engine.aborted) > before, "no final abort"
+    assert set(env.engine.aborted) == {env.calls[0].request_id}
+    assert guarded.cancelled == 0
+    if stream is not None:
+        assert stream.closed
+        assert stream.aborts_at_close is not None
+        assert stream.aborts_at_close > before, "closed before the final abort"
+        assert stream.pulls == pulls, "a new pull began after the cause"
+        assert stream.max_active == 1
+    else:
+        assert guarded.returned == 1
+    assert not env.plugin.registry.records
+    assert env.plugin.file_gate.in_flight == 0
+
+
+# @spec ING-FILE-078
+@pytest.mark.parametrize(
+    "context", ["running", "core-draining", "drain-started"]
+)
+async def test_cleanup_deadline_fixed_at_cause_selection(files_env, context):
+    """The cleanup deadline starts at the cause and nothing moves it.
+
+    The cause (the execution deadline) is selected long after the request
+    began, so a deadline that started earlier would expire earlier. Core's
+    ``state.draining`` with no ``drain`` call leaves it unclipped
+    (``session_cleanup_timeout``), and a ``drain`` that begins after the
+    cause neither restarts nor extends it.
+    """
+    env = await files_env()
+    block = Block()
+    env.service.script(block)
+    exchange = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    cleanup = env.plugin.config.session_cleanup_timeout
+    await env.clock.advance(env.plugin.config.file_execution_timeout + 0.1)
+    await until(lambda: env.engine.aborted, what="abort at the deadline")
+    selected = env.clock.monotonic()
+    drain: asyncio.Future | None = None
+    await env.clock.advance(cleanup / 2)
+    if context == "core-draining":
+        env.state.draining = True
+    elif context == "drain-started":
+        drain = start_drain(env, timeout=10 * cleanup)
+    await env.clock.settle()
+    await env.clock.advance(selected + cleanup - 0.5 - env.clock.monotonic())
+    assert exchange.status is None, "the cleanup deadline expired early"
+    await env.clock.advance(1.0)
+    await until(lambda: exchange.status is not None, what="answer at the bound")
+    assert_core_error(exchange, 504, "request_timeout")
+    # The expiry is not taken to mean the children settled.
+    assert env.plugin.file_gate.in_flight == 1
+    block.release()
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+    await exchange.finish()
+    if drain is not None:
+        await env.clock.advance(20 * cleanup)
+        await asyncio.wait_for(drain, 5)
+
+
+# @spec ING-FILE-078
+@pytest.mark.parametrize("context", ["running", "graceful", "drain-after"])
+async def test_owner_cleanup_deadline_is_clipped_to_d_at_selection_only(
+    files_env, context
+):
+    """The owner's cleanup deadline, read where the route cannot hide it.
+
+    A ``Recognize`` owner runs on the plugin (its ``lifecycle``, the source
+    of the drain state) but under a registry of its own, so no settle-point
+    or settlement cancellation reaches it and only its cleanup deadline ends
+    its wait: ``run`` returns when that deadline expires (the handler
+    answers, ING-FILE-078) while core's call still runs. The cause is the
+    execution deadline, selected at ``t0 + 4`` with ``session_cleanup_timeout``
+    30 s:
+
+    * ``running``: no drain; the deadline is ``t0 + 34``;
+    * ``graceful``: a ``drain(20)`` call began at ``t0 + 1`` (``D = t0 +
+      16``, graceful work until its settle point), so the deadline is the
+      smaller of 30 s and the time left to ``D``: ``D`` itself;
+    * ``drain-after``: core's ``state.draining`` with no ``drain`` call at
+      the selection (unclipped, ``t0 + 34``); a ``drain(20)`` begun at
+      ``t0 + 5`` with ``D = t0 + 20`` neither clips nor restarts it.
+    """
+    from support.app import drain_plugin
+    from support.audio import pcm16_sine, wav_pcm16
+
+    from vllm_riva_frontend import files
+    from vllm_riva_frontend.admission import OwnerKind
+    from vllm_riva_frontend.lifecycle import OwnerRegistry
+
+    env = await files_env(
+        riva_frontend={
+            "session_cleanup_timeout": 30.0,
+            "file_execution_timeout": 4.0,
+        }
+    )
+    plugin, clock = env.plugin, env.clock
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    registry = OwnerRegistry()
+    wav = wav_pcm16(pcm16_sine(0.5))
+
+    async def run() -> object:
+        record = registry.register(OwnerKind.recognize, asyncio.current_task())
+        owner = files.FileRequestOwner(
+            service=env.service,
+            engine_client=env.engine,
+            config=plugin.config,
+            clock=clock,
+            registry=registry,
+            record=record,
+            catalog=files._catalog(plugin),
+            gate=files.FileGate(1, clock=clock),
+            lifecycle=plugin,
+            state=env.state,
+        )
+        owners.append(owner)
+        request = files._recognize_request(wav, "en-US", env.service)
+        return await owner.run(wav, request, files.build_raw_request())
+
+    owners: list[object] = []
+    t0 = clock.monotonic()
+    task = asyncio.ensure_future(run())
+    drain: asyncio.Future | None = None
+    try:
+        await asyncio.wait_for(block.entered.wait(), 2)
+        if context == "graceful":
+            await clock.advance(1.0)
+            drain = asyncio.ensure_future(drain_plugin(plugin, env.state, 20))
+            expected = t0 + 1 + 20 - 5  # D
+        else:
+            expected = t0 + 4 + 30
+            if context == "drain-after":
+                env.state.draining = True
+        await clock.advance(t0 + 4.1 - clock.monotonic())
+        await until(lambda: env.engine.aborted, what="the deadline's abort")
+        (owner,) = owners
+        assert owner.cause is not None and owner.cause.kind == "deadline"
+        selected = owner.cause
+        if context == "drain-after":
+            await clock.advance(t0 + 5 - clock.monotonic())
+            drain = asyncio.ensure_future(drain_plugin(plugin, env.state, 20))
+        await clock.advance(expected - 0.5 - clock.monotonic())
+        assert not task.done(), "the cleanup deadline expired early"
+        await clock.advance(1.0)
+        await until(lambda: task.done(), what="the answer at the deadline")
+        # The expiry is not taken to mean core's call settled.
+        assert not block.released.is_set()
+    finally:
+        block.release()
+        await clock.settle()
+        if not task.done():
+            await asyncio.wait({task}, timeout=5)
+        if drain is not None:
+            for _ in range(60):
+                if drain.done():
+                    break
+                await clock.advance(1.0)
+            await asyncio.wait({drain}, timeout=5)
+    (owner,) = owners
+    # The owner returned normally (no exception, not cancelled) with the
+    # deadline cause it selected, which nothing later replaced; ``Recognize``
+    # projects that cause, and core's result is never taken.
+    assert not task.cancelled(), "the owner ended cancelled"
+    assert task.exception() is None, task.exception()
+    assert task.result() is None, task.result()
+    assert owner.cause is selected, owner.cause
+    continuation = owner.continuation
+    assert continuation is not None
+    await until(lambda: continuation.done(), what="the continuation's end")
+    # The cleanup continuation also ended normally.
+    assert not continuation.cancelled(), "the continuation ended cancelled"
+    assert continuation.exception() is None, continuation.exception()
+    assert continuation.result() is None
+    assert owner.cause is selected, owner.cause
+
+
+# @spec ING-FILE-079, ING-FILE-090
+@pytest.mark.parametrize("shutdown", ["drain", "stop"])
+async def test_continuation_owns_cleanup_and_settlement_awaits_it(
+    files_env, shutdown
+):
+    env = await files_env(load_tracking=True)
+    guarded, block, exchange = await _handover(env)
+    assert exchange.done
+    (record,) = env.plugin.registry.records.values()
+    assert record.continuation is not None
+    assert not record.continuation.done()
+
+    ended = start_drain(env) if shutdown == "drain" else start_stop(env)
+    await env.clock.settle()
+    assert not ended.done(), "the settlement did not await the continuation"
+    # The continuation still holds the record and every count.
+    assert list(env.plugin.registry.records.values()) == [record]
+    assert env.plugin.file_gate.in_flight == 1
+    assert env.plugin.ingress.file_count == 1
+    assert env.state.server_load_metrics == 1
+    retries = len(env.engine.aborted)
+    await env.clock.advance(ABORT_PERIOD)
+    await until(
+        lambda: len(env.engine.aborted) > retries, what="continued retries"
+    )
+
+    before = len(env.engine.aborted)
+    block.release()
+    await asyncio.wait_for(ended, 5)
+    assert record.continuation.done()
+    assert len(env.engine.aborted) > before, "no final abort"
+    assert guarded.cancelled == 0
+    assert guarded.returned == 1
+    assert not env.plugin.registry.records
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.ingress.file_count == 0
+    assert env.state.server_load_metrics == 0
+
+
 # ------------------------------------------------------- load accounting
 
 
-# @spec ING-FILE-072
+class _ForbiddenCalls:
+    """A profiler that records every run of core's ``load_aware_call``.
+
+    Both the decorator itself and the ``wrapper`` it returns are matched by
+    code object, so any use (decorating at run time, or calling anything it
+    decorated, core's own route function included) is seen.
+    """
+
+    def __init__(self) -> None:
+        import types
+
+        from vllm.entrypoints.serve.utils import api_utils
+
+        decorator = api_utils.load_aware_call.__code__
+        inner = [
+            const
+            for const in decorator.co_consts
+            if isinstance(const, types.CodeType) and const.co_name == "wrapper"
+        ]
+        assert inner, "core's load_aware_call has no wrapper"
+        self._codes = {decorator, *inner}
+        self.hits: list[str] = []
+
+    def __enter__(self) -> _ForbiddenCalls:
+        import sys
+
+        self._previous = sys.getprofile()
+
+        def profile(frame, event, arg):
+            if event == "call" and frame.f_code in self._codes:
+                self.hits.append(frame.f_code.co_name)
+            if self._previous is not None:
+                self._previous(frame, event, arg)
+
+        sys.setprofile(profile)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        import sys
+
+        sys.setprofile(self._previous)
+
+
+# @spec ING-FILE-090
+async def test_file_route_does_not_use_core_load_aware_call(files_env):
+    """A forbidden-call spy: the frontend's route never runs core's wrapper.
+
+    A control first decorates and calls a function with core's
+    ``load_aware_call`` under the spy, showing it sees both; the frontend's
+    file route, with load tracking on, must then run neither.
+    """
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.serve.utils import api_utils
+
+    env = await files_env(load_tracking=True)
+
+    async def handler(*args, **kwargs):
+        return None
+
+    raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    with _ForbiddenCalls() as control:
+        await api_utils.load_aware_call(handler)(None, raw)
+    assert control.hits == ["load_aware_call", "wrapper"], control.hits
+
+    env.service.script(Return(transcription_response("frontend route")))
+    with _ForbiddenCalls() as spy:
+        exchange = await env.request().finish()
+    assert exchange.status == 200
+    assert spy.hits == [], "the frontend's route used core's load_aware_call"
+    await until(lambda: env.state.server_load_metrics == 0, what="decrement")
+
+
+# @spec ING-FILE-090
 async def test_server_load_counts_one_per_route_request(files_env):
     env = await files_env(load_tracking=True)
     block = Block()
@@ -640,7 +1140,7 @@ async def test_server_load_counts_one_per_route_request(files_env):
     await until(lambda: env.state.server_load_metrics == 0, what="decrement")
 
 
-# @spec ING-FILE-072
+# @spec ING-FILE-090
 async def test_server_load_is_decremented_once_after_a_failed_send(
     files_env,
 ):
@@ -653,7 +1153,7 @@ async def test_server_load_is_decremented_once_after_a_failed_send(
     assert env.state.server_load_metrics == 0
 
 
-# @spec ING-FILE-072
+# @spec ING-FILE-090
 async def test_server_load_is_untouched_when_tracking_is_off(files_env):
     env = await files_env(load_tracking=False)
     block = Block()
@@ -663,6 +1163,31 @@ async def test_server_load_is_untouched_when_tracking_is_off(files_env):
     assert env.state.server_load_metrics == 0
     block.release()
     await exchange.finish()
+    assert env.state.server_load_metrics == 0
+
+
+# @spec ING-FILE-090, ING-FILE-087
+async def test_server_load_counted_once_after_settlement_and_reraise(
+    files_env,
+):
+    env = await files_env(load_tracking=True)
+    env.service.script(Raise(RuntimeError("core failed")))
+    exchange = env.request()
+    watcher = SlowWatcherCancel(exchange)
+    exchange.start()
+    await asyncio.wait_for(watcher.cancelled.wait(), 2)
+    await env.clock.settle()
+    assert env.state.server_load_metrics == 1, "decremented before settlement"
+    await env.clock.advance(env.plugin.config.session_cleanup_timeout + 0.1)
+    await exchange.finish()
+    # Core's exception handlers answered the re-raised exception ...
+    assert exchange.status == 500, exchange.body
+    # ... and the count stays until the frontend's children have settled.
+    assert env.state.server_load_metrics == 1
+    watcher.release()
+    await until(lambda: not env.plugin.registry.records, what="unregistered")
+    assert env.state.server_load_metrics == 0
+    await env.clock.advance(1)
     assert env.state.server_load_metrics == 0
 
 
@@ -683,6 +1208,7 @@ async def _reference(behaviour, fields=(), file=b"RIFF-not-really-audio"):
         app,
         [("content-type", content_type()), ("content-length", str(len(body)))],
         chunked(body),
+        path=CORE_ROUTE,
     )
     await exchange.finish()
     return exchange, service
@@ -692,7 +1218,7 @@ def _same(behaviour_factory):
     return behaviour_factory(), behaviour_factory()
 
 
-# @spec ING-FILE-066
+# @spec ING-FILE-066, ING-FILE-087, ING-FILE-081
 @pytest.mark.parametrize(
     "make",
     [
@@ -732,3 +1258,224 @@ async def test_route_returns_core_event_stream_as_core_route_does(
         "text/event-stream"
     )
     assert exchange.body == expected.body
+
+
+# @spec ING-FILE-087
+async def test_reraised_exception_left_to_core_handlers_continuation_keeps_accounting(  # noqa: E501
+    files_env,
+):
+    env = await files_env(load_tracking=True)
+    env.service.script(Raise(RuntimeError("unexpected")))
+    exchange = env.request()
+    watcher = SlowWatcherCancel(exchange)
+    exchange.start()
+    await asyncio.wait_for(watcher.cancelled.wait(), 2)
+    await env.clock.advance(env.plugin.config.session_cleanup_timeout + 0.1)
+    await exchange.finish()
+    # Core's application exception handlers delivered the response, exactly
+    # as for core's own route; the frontend sent nothing of its own.
+    expected, _ = await _reference(Raise(RuntimeError("unexpected")))
+    assert exchange.status == expected.status
+    assert exchange.json() == expected.json()
+    assert len(exchange.starts) == 1
+    # The continuation keeps the record, permit, file-owner slot and load
+    # count until the frontend's children have settled.
+    (record,) = env.plugin.registry.records.values()
+    assert record.continuation is not None
+    assert env.plugin.file_gate.in_flight == 1
+    assert env.plugin.ingress.file_count == 1
+    assert env.state.server_load_metrics == 1
+    watcher.release()
+    await until(lambda: not env.plugin.registry.records, what="unregistered")
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.ingress.file_count == 0
+    assert env.state.server_load_metrics == 0
+
+
+# @spec ING-FILE-087, ING-FILE-091
+async def test_returned_error_response_is_delivered_under_the_send_bound(
+    files_env,
+):
+    env = await files_env()
+    env.service.script(
+        Return(error_response("bad language", 400, param="language"))
+    )
+    exchange = env.request(block_send=0).start()
+    await asyncio.wait_for(exchange.send_blocked.wait(), 2)
+    timeout = env.plugin.config.response_send_timeout
+    await env.clock.advance(timeout - 1)
+    assert env.plugin.file_gate.in_flight == 1
+    await env.clock.advance(2)
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+    assert env.engine.aborted == []
+    exchange.unblock_send()
+    await exchange.finish()
+    assert not exchange.completed, "a send started after its bound"
+
+
+# ------------------------------------------------------------ send bound
+
+
+# @spec ING-FILE-091
+@pytest.mark.parametrize("shutdown", ["drain", "stop"])
+async def test_response_send_bound_and_terminal_attempt(files_env, shutdown):
+    """Once the bound counts as passed, the response gets one attempt.
+
+    Core's service completed normally and the response's first send is
+    stalled within its bound. When ``drain`` skips its graceful steps, or
+    after the plugin is torn down, every send bound counts as passed: the
+    stalled send is the single terminal attempt and is cut at its
+    suspension, no other send starts, nothing is aborted (the service had
+    completed) and the permit is released after settlement.
+    """
+    env = await files_env()
+    exchange = env.request(block_send=0).start()
+    await asyncio.wait_for(exchange.send_blocked.wait(), 2)
+    assert env.plugin.file_gate.in_flight == 1
+    ended = start_drain(env) if shutdown == "drain" else start_stop(env)
+    await until(
+        ended.done,
+        timeout=5,
+        what="the settlement ended without waiting for the stalled send",
+    )
+    assert env.engine.aborted == []
+    assert not env.plugin.registry.records
+    assert env.plugin.file_gate.in_flight == 0
+    exchange.unblock_send()
+    await exchange.finish()
+    assert exchange.messages == [], "a send was made after the attempt"
+
+
+# ------------------------------------------------------- core's contract
+
+
+def _core_serving():
+    from vllm.entrypoints.speech_to_text.transcription.serving import (
+        OpenAIServingTranscription,
+    )
+
+    return OpenAIServingTranscription
+
+
+# @spec ING-FILE-084
+def test_core_state_construction_builds_the_service_attribute():
+    from argparse import Namespace
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from starlette.datastructures import State
+    from vllm.entrypoints.speech_to_text import factories
+    from vllm.entrypoints.speech_to_text.transcription import api_router
+
+    state = State()
+    state.openai_serving_models = object()
+    with (
+        mock.patch(
+            "vllm.entrypoints.speech_to_text.transcription.serving."
+            "OpenAIServingTranscription"
+        ) as serving,
+        mock.patch(
+            "vllm.entrypoints.speech_to_text.translation.serving."
+            "OpenAIServingTranslation"
+        ),
+    ):
+        factories.init_speech_to_text_state(
+            object(),
+            state,
+            Namespace(enable_force_include_usage=False),
+            None,
+            ("transcription",),
+        )
+    assert state.openai_serving_transcription is serving.return_value
+    # Core's own route reads the service from the same attribute.
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    assert api_router.transcription(request) is serving.return_value
+
+
+# @spec ING-FILE-084
+def test_core_create_transcription_signature():
+    method = _core_serving().create_transcription
+    assert inspect.iscoroutinefunction(method)
+    parameters = inspect.signature(method).parameters
+    assert list(parameters) == ["self", "audio_data", "request", "raw_request"]
+    assert parameters["raw_request"].default is None
+
+
+# @spec ING-FILE-084
+def test_core_request_model_carries_the_fields_the_frontend_sets():
+    from fastapi import UploadFile
+    from vllm.entrypoints.speech_to_text.transcription.protocol import (
+        TranscriptionRequest,
+    )
+
+    fields = TranscriptionRequest.model_fields
+    for name in (
+        "file",
+        "model",
+        "language",
+        "response_format",
+        "stream",
+        "vllm_xargs",
+        "use_beam_search",
+        "max_completion_tokens",
+    ):
+        assert name in fields, name
+    request = TranscriptionRequest(
+        file=UploadFile(io.BytesIO(b"RIFF"), filename="a.wav"),
+        language="en",
+        response_format="json",
+        vllm_xargs={"locale": "en-US"},
+    )
+    assert request.vllm_xargs == {"locale": "en-US"}
+    assert request.stream is False
+    assert request.use_beam_search is False
+    assert request.max_completion_tokens is None
+
+
+# @spec ING-FILE-084
+async def test_core_read_upload_with_limit_reads_an_in_memory_upload():
+    from fastapi import UploadFile
+    from vllm.entrypoints.speech_to_text.base.utils import (
+        read_upload_with_limit,
+    )
+    from vllm.exceptions import VLLMValidationError
+
+    assert list(inspect.signature(read_upload_with_limit).parameters) == [
+        "file",
+        "max_size_mb",
+    ]
+    data = b"a" * 4096
+    upload = UploadFile(io.BytesIO(data), filename="a.wav")
+    assert await read_upload_with_limit(upload) == data
+    over = UploadFile(io.BytesIO(b"a" * (MiB + 1)), filename="a.wav")
+    with pytest.raises(VLLMValidationError):
+        await read_upload_with_limit(over, max_size_mb=1)
+
+
+# @spec ING-FILE-084
+def test_core_derives_the_engine_request_id_from_x_request_id():
+    from starlette.requests import Request
+    from vllm.entrypoints.serve.engine.serving import BaseServing
+    from vllm.entrypoints.speech_to_text.base.serving import (
+        SpeechToTextBaseServing,
+    )
+
+    request = Request({"type": "http", "headers": [(b"x-request-id", b"abc")]})
+    assert BaseServing._base_request_id(request) == "abc"
+    bare = Request({"type": "http", "headers": []})
+    assert BaseServing._base_request_id(bare) != "abc"
+    # The engine request ID is ``<task type>-<base ID>``, with the
+    # transcription service's task type ``transcribe``.
+    source = inspect.getsource(SpeechToTextBaseServing._create_speech_to_text)
+    assert 'f"{self.task_type}-{self._base_request_id(raw_request)}"' in source
+    init = inspect.getsource(_core_serving().__init__)
+    assert 'task_type="transcribe"' in init
+
+
+# @spec ING-FILE-084
+def test_core_engine_client_abort_signature():
+    from vllm.engine.protocol import EngineClient
+
+    assert inspect.iscoroutinefunction(EngineClient.abort)
+    parameters = list(inspect.signature(EngineClient.abort).parameters)
+    assert parameters == ["self", "request_id"]

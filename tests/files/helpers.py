@@ -7,13 +7,17 @@ service in ways only the file ownership tests need: ``GuardedCall`` wraps
 ``create_transcription`` and ``TrackedStream`` is an event generator that
 records pull overlap and the close order. ``SlowWatcherCancel`` makes the
 route's disconnect watcher slow to settle when it is cancelled.
+``ListenerStopHook`` runs a callback when the plugin begins stopping its gRPC
+listener, and ``start_drain``/``start_stop`` run core's shutdown steps as
+tasks.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 from support.fake_engine import FakeEngineClient
 from support.fake_transcription import FakeTranscriptionServing
@@ -137,6 +141,54 @@ class SlowWatcherCancel:
 
     def release(self) -> None:
         self._hold.set()
+
+
+class ListenerStopHook:
+    """Stands in for the plugin's gRPC server and observes its stop.
+
+    Every attribute is the wrapped server's, except ``stop``: it calls
+    ``on_stop()`` first (the moment the plugin began stopping the listener)
+    and then the server's own ``stop``. ``install`` replaces
+    ``plugin.server`` with the hook.
+    """
+
+    def __init__(self, server: Any, on_stop: Callable[[], None]) -> None:
+        self._server = server
+        self._on_stop = on_stop
+        self.stops: list[float | None] = []
+
+    @classmethod
+    def install(
+        cls, plugin: Any, on_stop: Callable[[], None]
+    ) -> ListenerStopHook:
+        assert plugin.server is not None, "the plugin has no gRPC listener"
+        hook = cls(plugin.server, on_stop)
+        plugin.server = hook
+        return hook
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._server, name)
+
+    async def stop(self, grace: float | None) -> None:
+        self.stops.append(grace)
+        self._on_stop()
+        await self._server.stop(grace)
+
+
+def start_drain(env: Any, timeout: float = 1.0) -> asyncio.Future[Any]:
+    """Start the plugin's ``drain`` as core calls it, as a task.
+
+    A 1 s budget is within the engine reserve, so ``drain`` skips its
+    graceful steps and runs the settlement at once (ING-EP-075, ING-EP-093).
+    """
+    from support.app import drain_plugin
+
+    return asyncio.ensure_future(drain_plugin(env.plugin, env.state, timeout))
+
+
+def start_stop(env: Any) -> asyncio.Future[Any]:
+    """Start core's ``stop_endpoint_plugins`` (the plugin's ``stop``)."""
+    return asyncio.ensure_future(env.served.stop(timeout=30))
 
 
 def is_uuid(text: str) -> bool:

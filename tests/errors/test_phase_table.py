@@ -147,7 +147,7 @@ async def test_server_side_refusals_are_internal(
 # ------------------------------------------------------- protocol order
 
 
-# @spec ING-ERR-016, ING-ERR-011, ING-ERR-029
+# @spec ING-ERR-016, ING-ERR-011, ING-ERR-064
 async def test_wrong_first_message_is_protocol_order(
     surface, started, stream, fake_factory, helpers
 ) -> None:

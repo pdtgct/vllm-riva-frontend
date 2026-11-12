@@ -66,12 +66,17 @@ def failure_text(exc: BaseException) -> str:
 
 
 @pytest.fixture
-def fake_factory(clock) -> FakeSessionFactory:
+async def fake_factory(clock):
     """The published factory, on the plugin's clock.
 
-    Its ``flush`` returns ``"final words"``.
+    Its ``flush`` returns ``"final words"``; what is still running at the
+    end of the test is cancelled.
     """
-    return FakeSessionFactory(final_text="final words", clock=clock)
+    factory = FakeSessionFactory(final_text="final words", clock=clock)
+    try:
+        yield factory
+    finally:
+        await factory.aclose()
 
 
 # ``riva_options``, ``fake_engine``, ``entry_points``, ``plugin`` and

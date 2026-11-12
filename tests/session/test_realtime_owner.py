@@ -1,7 +1,8 @@
 """The stream owner behind the Realtime adapter.
 
-Sessions are claimed through the test app's dispatcher
-(``/v1/realtime?intent=transcription``) and driven with
+Sessions connect to the frontend's Realtime route
+(``support.realtime.REALTIME_URL``, under ``/plugins/riva/v1``) and are
+driven with
 ``support.realtime.RealtimeClient``; the first update is the public default
 session object with a language set.
 """
@@ -17,6 +18,7 @@ from support.asgi import BlockingSendWebSocket
 from support.audio import pcm16_bytes, pcm16_sine
 from support.fake_session import Block, Raise, Return, failed
 from support.realtime import (
+    BOOTSTRAP_PATH,
     COMPLETED,
     CREATED,
     DELTA,
@@ -27,6 +29,9 @@ from support.realtime import (
 )
 
 PIECE = pcm16_bytes(pcm16_sine(0.1))
+#: Virtual time past the old one-second wait of ``stop``: ``stop`` now
+#: awaits what it settles with no fixed time limit (ING-EP-093).
+STOP_WAIT_PAST = 5.0
 
 
 def _lease(fake_factory):
@@ -301,9 +306,7 @@ async def test_the_bootstrap_post_creates_no_owner_and_no_timer(
 
     sleepers = clock.sleepers
     async with http_client(test_app) as client:
-        response = await client.post(
-            "/v1/realtime/transcription_sessions", json={}
-        )
+        response = await client.post(BOOTSTRAP_PATH, json={})
 
     assert response.status_code == 200
     assert len(started.registry.records) == 0
@@ -381,7 +384,7 @@ class TestSendBound:
     def riva_options(self):
         return {"response_send_timeout": 5}
 
-    # @spec ING-LIFE-051
+    # @spec ING-LIFE-061
     async def test_a_stalled_send_ends_the_owner_as_a_transport_failure(
         self, realtime, first_update, fake_factory, test_app
     ):
@@ -425,7 +428,7 @@ async def test_realtime_engine_expired_is_idle_timeout(
 # ------------------------------------------------------- sends and drain
 
 
-# @spec ING-LIFE-051, ING-LIFE-053
+# @spec ING-LIFE-061, ING-LIFE-053
 async def test_a_send_stalled_when_the_drain_begins_ends_by_d(
     realtime, first_update, fake_factory, test_app, drain_trigger, clock
 ):
@@ -449,7 +452,7 @@ async def test_a_send_stalled_when_the_drain_begins_ends_by_d(
     assert ws.stalled == 1  # no further sends, the close included
 
 
-# @spec ING-LIFE-051, ING-ERR-059
+# @spec ING-LIFE-061, ING-ERR-062
 async def test_a_send_starting_after_d_to_a_stalled_transport_does_not_wait(
     realtime, first_update, fake_factory, test_app, drain_trigger, clock
 ):
@@ -477,7 +480,7 @@ async def test_a_send_starting_after_d_to_a_stalled_transport_does_not_wait(
 # ------------------------------------------------------ cleanup ownership
 
 
-# @spec ING-LIFE-058, ING-EP-060, ING-EP-059
+# @spec ING-LIFE-063, ING-LIFE-064, ING-EP-106, ING-EP-093
 async def test_a_second_cancellation_waits_for_cleanup(
     realtime, first_update, fake_factory, started
 ):
@@ -512,7 +515,7 @@ async def test_a_second_cancellation_waits_for_cleanup(
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-058, ING-LIFE-035, ING-EP-060
+# @spec ING-LIFE-063, ING-LIFE-035, ING-EP-106
 async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     realtime, first_update, fake_factory, started
 ):
@@ -544,6 +547,92 @@ async def test_a_continuation_holds_the_record_and_admission_after_the_answer(
     assert lease.names() == ["feed", "abort", "release"]
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-064, ING-EP-079, ING-CORE-032
+@pytest.mark.parametrize("state", ["open", "flushed", "open_pending"])
+async def test_settlement_cancel_takes_shutdown_row_and_cleans_by_lease_state(
+    realtime, first_update, fake_factory, started, app_state, state
+):
+    from support.app import stop_plugins
+
+    opening = Block()
+    if state == "open_pending":
+        session = await _connected(realtime)
+        fake_factory.script("open", opening)
+        await session.update(first_update())
+        await asyncio.wait_for(opening.entered.wait(), 2)
+    else:
+        session, _ = await _configured(realtime, first_update)
+        if state == "flushed":
+            lease = _lease(fake_factory)
+            lease.script("finish", Block())
+            await session.done_event()
+            await session.settle()
+            assert "finish" in lease.names()
+    (record,) = started.registry.records.values()
+    owner = record.owner
+
+    # ``stop`` (the plugin torn down) cancels the owner in its settlement.
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await session.settle()
+        await asyncio.wait_for(asyncio.shield(stopper), 2)
+    finally:
+        opening.release()
+        await session.settle()
+
+    # The selected cause and the cleanup, not what the client receives.
+    assert owner.cause is not None
+    assert owner.cause.code == "service_unavailable"
+    if state == "open":
+        assert _lease(fake_factory).names() == ["abort", "release"]
+    elif state == "flushed":
+        assert _lease(fake_factory).names() == ["flush", "finish", "release"]
+    else:
+        assert [
+            c for c in fake_factory.calls if c.target.startswith("lease:")
+        ] == []
+    for each in fake_factory.leases:
+        assert "teardown" not in each.names()
+        assert each.teardown_calls == 0
+    assert len(started.registry.records) == 0
+    assert started.ingress.count == 0
+
+
+# @spec ING-LIFE-061, ING-LIFE-064, ING-ERR-062
+async def test_interrupted_send_takes_shutdown_row_not_transport_failure(
+    realtime, first_update, fake_factory, test_app, started, app_state
+):
+    from support.app import stop_plugins
+
+    ws = BlockingSendWebSocket(test_app, REALTIME_URL)
+    session = await _connected(realtime, ws)
+    ws.block = True
+    await session.update(first_update())
+    await session.settle()
+    assert ws.stalled == 1  # the acknowledgement, well within its bound
+    lease = _lease(fake_factory)
+    (record,) = started.registry.records.values()
+    owner = record.owner
+
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await session.settle()
+        await asyncio.wait_for(asyncio.shield(stopper), 2)
+    finally:
+        ws.unblocked.set()
+        await session.settle()
+
+    assert owner.cause is not None
+    assert owner.cause.code == "service_unavailable", "a transport failure"
+    # The shutdown abort row's error was offered, as its one attempt.
+    assert ws.stalled == 2
+    terminal = json.loads(ws.parked[1]["text"])
+    assert terminal["type"] == ERROR
+    assert error_code(terminal) == "service_unavailable"
+    assert lease.names() == ["abort", "release"]
+    assert len(started.registry.records) == 0
 
 
 # ------------------------------------- terminal sends, refusals and the drain
@@ -597,7 +686,7 @@ async def _final_stalled(realtime, first_update, fake_factory, ws):
     return session, lease
 
 
-# @spec ING-LIFE-051, ING-EP-060
+# @spec ING-LIFE-061, ING-EP-106
 async def test_a_final_stalled_before_the_drain_ends_by_d(
     realtime, first_update, fake_factory, test_app, drain_trigger, started
 ):
@@ -618,7 +707,7 @@ async def test_a_final_stalled_before_the_drain_ends_by_d(
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-058
+# @spec ING-LIFE-061, ING-EP-093, ING-EP-106, ING-LIFE-063
 async def test_a_terminal_error_stalled_before_the_drain_ends_by_d(
     realtime, first_update, fake_factory, test_app, drain_trigger, started
 ):
@@ -651,7 +740,7 @@ async def test_a_terminal_error_stalled_before_the_drain_ends_by_d(
     assert len(started.registry.records) == 0
 
 
-# @spec ING-LIFE-051, ING-NIMWS-016, ING-ERR-015
+# @spec ING-LIFE-061, ING-NIMWS-028, ING-ERR-015
 async def test_a_blocked_refusal_ends_by_an_earlier_d(
     realtime, test_app, drain_trigger, started
 ):
@@ -676,7 +765,7 @@ async def test_a_blocked_refusal_ends_by_an_earlier_d(
     assert ws.stalled == 1  # the 1013 close was not sent after it
 
 
-# @spec ING-LIFE-051
+# @spec ING-LIFE-061
 async def test_a_final_due_after_d_is_not_started(
     realtime, first_update, fake_factory, test_app, drain_trigger, started
 ):
@@ -703,7 +792,7 @@ async def test_a_final_due_after_d_is_not_started(
     assert ws.stalled == 0
 
 
-# @spec ING-LIFE-051
+# @spec ING-LIFE-061
 async def test_an_acknowledgement_due_after_d_is_not_started(
     realtime, first_update, fake_factory, test_app, app_state, started
 ):
@@ -735,7 +824,7 @@ async def test_an_acknowledgement_due_after_d_is_not_started(
             await drain
 
 
-# @spec ING-LIFE-051, ING-EP-059, ING-EP-060, ING-LIFE-037
+# @spec ING-LIFE-061, ING-LIFE-063, ING-EP-079, ING-EP-093, ING-EP-106
 async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
     realtime, first_update, fake_factory, test_app, started, app_state
 ):
@@ -757,14 +846,21 @@ async def test_a_send_delaying_its_cancellation_fails_at_its_bound(
     (record,) = started.registry.records.values()
     (unsettled,) = record.unsettled_sends
     assert unsettled in record.children and not unsettled.done()
-    assert started.ingress.count == 1
+    # Held only by the unsettled send, the record takes no ingress-cap count.
+    assert started.ingress.count == 0
 
-    # ``stop`` reaches the unsettled send through the record.
+    # ``stop`` reaches the unsettled send through the record and awaits it.
     from support.app import stop_plugins
 
-    await stop_plugins(app_state)
-    await session.settle()
-    assert unsettled.cancelled()
+    stopper = asyncio.ensure_future(stop_plugins(app_state))
+    try:
+        await session.advance(STOP_WAIT_PAST)
+        assert not stopper.done(), "stop returned with a send unsettled"
+    finally:
+        ws.settled.set()
+        await session.settle()
+    await asyncio.wait_for(stopper, 2)
+    assert unsettled.done()
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
     assert ws.stalled == 1
@@ -775,7 +871,7 @@ class TestLateSend:
     def riva_options(self):
         return {"response_send_timeout": 5}
 
-    # @spec ING-LIFE-051
+    # @spec ING-LIFE-061
     async def test_a_send_completing_after_its_bound_has_failed(
         self, realtime, first_update, fake_factory, test_app, started
     ):
@@ -804,8 +900,8 @@ class TestLateSend:
         assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-051, ING-EP-059, ING-EP-043
-async def test_after_stop_a_resisting_send_neither_waits_nor_leaks(
+# @spec ING-LIFE-061, ING-LIFE-064, ING-EP-079, ING-EP-093
+async def test_after_stop_a_resisting_send_is_awaited_and_cleanup_aborts(
     realtime, first_update, fake_factory, test_app, started, app_state
 ):
     ws = StubbornSendWebSocket(test_app, REALTIME_URL)
@@ -815,7 +911,8 @@ async def test_after_stop_a_resisting_send_neither_waits_nor_leaks(
     await session.settle()
     assert ws.stalled == 1
     lease = _lease(fake_factory)
-    before = asyncio.all_tasks()
+    (record,) = started.registry.records.values()
+    owner = record.owner
 
     from support.app import stop_plugins
 
@@ -825,26 +922,27 @@ async def test_after_stop_a_resisting_send_neither_waits_nor_leaks(
 
         # No clock time passed: every send bound counted as passed.
         assert ws.done, "the handler waited after stop"
-        # The terminal error got its one attempt; its close never started.
+        # Interrupted by the plugin's cancellation, the acknowledgement is no
+        # transport failure: the shutdown abort row's error got its one
+        # attempt (its close never started), and cleanup went by lease state.
+        assert owner.cause is not None
+        assert owner.cause.code == "service_unavailable"
         assert ws.stalled == 2
         assert json.loads(ws.parked[1]["text"])["type"] == ERROR
-        assert "abort" not in lease.names()
-        assert lease.state == "torn_down"
-        await session.advance(1.1)  # ``stop``'s one bounded wait
-        assert stopper.done()
-        # Every task started since ``stop`` is done or was cancelled.
-        leftover = [
-            task for task in asyncio.all_tasks() - before if not task.done()
-        ]
-        assert all(task.cancelling() for task in leftover), leftover
+        assert lease.names() == ["abort", "release"]
+        assert "teardown" not in lease.names()
+        # ``stop`` awaits the sends that resist, with no time limit.
+        await session.advance(STOP_WAIT_PAST)
+        assert not stopper.done(), "stop returned with sends unsettled"
     finally:
         ws.settled.set()
         await session.settle()
+    await asyncio.wait_for(stopper, 2)
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
 
 
-# @spec ING-LIFE-051
+# @spec ING-LIFE-061
 async def test_a_send_suppressing_its_cancellation_still_failed(
     realtime, first_update, fake_factory, test_app, started
 ):
@@ -872,7 +970,8 @@ async def test_a_send_suppressing_its_cancellation_still_failed(
 # ------------------------- an established send failure and a cancellation
 
 
-# @spec ING-LIFE-051, ING-ERR-051, ING-LIFE-038, ING-EP-059, ING-EP-060
+# @spec ING-LIFE-061, ING-ERR-051, ING-LIFE-038, ING-LIFE-063, ING-EP-093
+# @spec ING-EP-106
 async def test_a_cancellation_while_a_failed_send_is_abandoned(
     realtime, first_update, fake_factory, test_app, started, app_state
 ):
@@ -891,6 +990,7 @@ async def test_a_cancellation_while_a_failed_send_is_abandoned(
     lease = _lease(fake_factory)
     (record,) = started.registry.records.values()
 
+    stopper = None
     try:
         await session.advance(started.config.response_send_timeout + 0.1)
 
@@ -903,27 +1003,30 @@ async def test_a_cancellation_while_a_failed_send_is_abandoned(
         assert lease.names() == ["abort", "release"]
         assert record.owner.cause.code == "internal"
         assert record.owner.cause.phase == "transport"
-        # The unsettled send holds the record and stays reachable by
-        # ``stop``.
+        # The unsettled send holds the record (with no ingress-cap count)
+        # and stays reachable by ``stop``, which awaits it.
         assert list(started.registry.records.values()) == [record]
         (unsettled,) = record.unsettled_sends
         assert unsettled in record.children and not unsettled.done()
-        assert started.ingress.count == 1
+        assert started.ingress.count == 0
 
         from support.app import stop_plugins
 
-        await stop_plugins(app_state)
-        await session.settle()
-        assert unsettled.cancelled()
+        stopper = asyncio.ensure_future(stop_plugins(app_state))
+        await session.advance(STOP_WAIT_PAST)
+        assert not stopper.done(), "stop returned with a send unsettled"
     finally:
         ws.settled.set()
         await session.settle()
+    assert stopper is not None
+    await asyncio.wait_for(stopper, 2)
+    assert unsettled.done()
     assert len(started.registry.records) == 0
     assert started.ingress.count == 0
     assert ws.stalled == 1
 
 
-# @spec ING-LIFE-051, ING-ERR-051, ING-ERR-059
+# @spec ING-LIFE-061, ING-ERR-051, ING-ERR-062
 async def test_a_cancellation_while_a_failed_terminal_error_is_abandoned(
     realtime, first_update, fake_factory, test_app, drain_trigger, started
 ):

@@ -12,7 +12,6 @@ body chunks, disconnect and individual sends the test controls.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +24,7 @@ from support.fake_transcription import FakeTranscriptionServing
 from support.grpc_harness import free_port
 from support.http import HttpExchange, file_request
 from support.state import make_args
+from support.teardown import stop_served
 
 # --------------------------------------------------------------- the server
 
@@ -104,6 +104,6 @@ async def files_env(clock):
     yield make
 
     for env in envs:
-        # Teardown must not mask the test's result.
-        with contextlib.suppress(Exception):
-            await env.served.stop()
+        # Teardown must not mask the test's result, but a stop that does not
+        # end within ``STOP_BOUND`` real seconds fails it (``await_stop``).
+        await stop_served(env.served)

@@ -17,8 +17,6 @@ import pytest
 from support.audio import pcm16_sine, wav_pcm16
 from support.fake_transcription import error_response
 
-pytestmark = pytest.mark.engine
-
 
 def _classify(exc: BaseException):
     from vllm_riva_frontend.errors import classify_core_exception
@@ -154,22 +152,7 @@ def test_cores_unsupported_audio_error_is_invalid_audio(monkeypatch) -> None:
     assert _classify(exc).code == "invalid_audio"
 
 
-# ------------------------------------------------- token budget, fallback
-
-
-# @spec ING-ERR-054
-def test_model_token_budget_refusal_is_request_too_large() -> None:
-    from vllm_riva_frontend.errors import MODEL_LEN_PREFIX
-
-    assert MODEL_LEN_PREFIX == "file exceeds max_model_len: "
-    exc = ValueError(MODEL_LEN_PREFIX + "84000 tokens > 76800")
-    assert _classify(exc).code == "request_too_large"
-
-
-# @spec ING-ERR-054, ING-ERR-039
-def test_budget_prefix_must_lead_the_message() -> None:
-    exc = ValueError("model said: file exceeds max_model_len: 1 > 0")
-    assert _classify(exc).code == "invalid_config_field"
+# --------------------------------------------------------------- fallback
 
 
 # @spec ING-ERR-039
@@ -178,6 +161,9 @@ def test_budget_prefix_must_lead_the_message() -> None:
     [
         "Unsupported language: 'xx'",
         "prompt is not supported by this model",
+        # no length refusal is projected (ING-FILE-081): core's own message
+        # about the model length is one more unmatched ``ValueError``
+        "file exceeds max_model_len: 84000 tokens > 76800",
         "",
     ],
 )

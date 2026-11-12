@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi import APIRouter
+from support.app import PLUGIN_PREFIX
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_api_key(monkeypatch) -> None:
+    """``VLLM_API_KEY`` from the shell must not configure a key here."""
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+
 
 # --------------------------------------------------------------- order
 
@@ -21,7 +30,298 @@ async def _expect_failure(helpers, plugin, engine, **kw) -> list[str]:
     return list(info.value.failures)
 
 
-# @spec ING-EP-023, ING-VEH-026
+async def _init(
+    clock: Any,
+    constructor: Any,
+    *,
+    options: dict[str, Any] | None = None,
+    args: Any = None,
+    models: Any = None,
+    auth_registrations: tuple[dict[str, Any], ...] = (),
+    extra_plugins: tuple[Any, ...] = (),
+    **engine_kw: Any,
+) -> Any:
+    """Attach, fill the state and run ``init_state`` with these inputs.
+
+    Returns the plugin; ``init_state``'s exception propagates.
+    """
+    from support.app import build_app
+    from support.fake_session import fake_entry_points
+    from support.state import make_args
+
+    from vllm_riva_frontend.lifecycle import RivaFrontendPlugin
+
+    from .conftest import engine_with, prepare_state, run_init
+
+    plugin = RivaFrontendPlugin(
+        clock=clock, entry_points=fake_entry_points(nemotron=constructor)
+    )
+    engine = engine_with(options=options, **engine_kw)
+    app = build_app(
+        [plugin, *extra_plugins],
+        args=args if args is not None else make_args(),
+        auth_registrations=auth_registrations,
+    )
+    await run_init(app, engine, prepare_state(app, engine, models=models))
+    return plugin
+
+
+async def _init_failures(clock: Any, constructor: Any, **kw: Any) -> list[str]:
+    from vllm_riva_frontend.lifecycle import StartupError
+
+    with pytest.raises(StartupError) as info:
+        await _init(clock, constructor, **kw)
+    return list(info.value.failures)
+
+
+def _args(**overrides: Any) -> Any:
+    from support.state import make_args
+
+    return make_args(**overrides)
+
+
+#: Signals the authentication decision compares (ING-EP-086).
+_AUTH_WORDS = ("api_key", "api-key", "authenticat", "AuthenticationMiddleware")
+#: A registration of core's authentication with no configured key: the
+#: authentication step fails (ING-EP-086).
+_STRAY_REGISTRATION = ({"tokens": ["registered-only"]},)
+
+
+def _mentions_auth(failures: list[str]) -> bool:
+    return any(
+        word.lower() in text.lower()
+        for text in failures
+        for word in _AUTH_WORDS
+    )
+
+
+#: One case per step of ING-EP-068: the inputs make that step and the next
+#: one fail; ``first`` must be named, ``later`` must not be, and the session
+#: factory (the last step) is never constructed.
+ORDER_CASES = {
+    "configuration-before-identity": dict(
+        inputs=dict(
+            options={"surprise": 1, "another": 2},
+            models=SimpleNamespace(model_name=lambda: ""),
+        ),
+        first=("surprise", "another"),
+        later=(),
+    ),
+    "identity-before-deadlines": dict(
+        inputs=dict(
+            models=SimpleNamespace(model_name=lambda: ""),
+            stream_admission={"never_fed_timeout": -1},
+        ),
+        first=(),
+        later=("never_fed_timeout",),
+    ),
+    "deadlines-before-capacity": dict(
+        inputs=dict(
+            stream_admission={"draining_timeout": 0}, num_gpu_blocks=None
+        ),
+        first=("draining_timeout",),
+        later=("num_gpu_blocks",),
+    ),
+    "capacity-before-complete-file-service": dict(
+        inputs=dict(num_gpu_blocks=None, options={"max_concurrent_files": 50}),
+        first=("num_gpu_blocks",),
+        later=("max_concurrent_files",),
+    ),
+    "complete-file-service-before-api-server-count": dict(
+        inputs=dict(
+            options={"max_concurrent_files": 50},
+            args=_args(api_server_count=2),
+        ),
+        first=("max_concurrent_files",),
+        later=("api_server_count",),
+    ),
+    "api-server-count-before-authentication": dict(
+        inputs=dict(
+            args=_args(api_server_count=2),
+            auth_registrations=_STRAY_REGISTRATION,
+        ),
+        first=("api_server_count",),
+        later=("<authentication>",),
+    ),
+    "authentication-before-route-table": dict(
+        inputs=dict(
+            auth_registrations=_STRAY_REGISTRATION,
+            route_override=f"{PLUGIN_PREFIX}/metadata",
+        ),
+        first=("<authentication>",),
+        later=(f"{PLUGIN_PREFIX}/metadata",),
+    ),
+    "route-table-before-session-factory": dict(
+        inputs=dict(route_override=f"{PLUGIN_PREFIX}/version"),
+        first=(f"{PLUGIN_PREFIX}/version",),
+        later=(),
+    ),
+}
+
+
+# @spec ING-EP-068
+@pytest.mark.parametrize("case", list(ORDER_CASES))
+async def test_check_order_reports_the_first_failing_step(
+    clock, fake_factory, helpers, case
+) -> None:
+    from support.fake_transcription import FakeServingModels
+
+    spec = ORDER_CASES[case]
+    inputs = dict(spec["inputs"])
+    override = inputs.pop("route_override", None)
+    if override is not None:
+        inputs["extra_plugins"] = (_Overrider(override),)
+    counted = FakeServingModels("served")
+    if "models" not in inputs:
+        inputs["models"] = counted
+    constructor = helpers.counting(fake_factory.constructor)
+    failures = await _init_failures(clock, constructor, **inputs)
+    for needle in spec["first"]:
+        if needle == "<authentication>":
+            assert _mentions_auth(failures), failures
+        else:
+            assert helpers.mentions(failures, needle), (needle, failures)
+    for needle in spec["later"]:
+        if needle == "<authentication>":
+            assert not _mentions_auth(failures), failures
+        else:
+            assert not helpers.mentions(failures, needle), (needle, failures)
+    if case == "configuration-before-identity":
+        assert inputs["models"] is not counted
+    elif inputs["models"] is counted:
+        assert counted.model_name_calls == 1
+    assert constructor.calls == 0
+    assert fake_factory.names("factory") == []
+
+
+# @spec ING-EP-068
+async def test_configuration_failure_reads_no_identity(
+    clock, fake_factory
+) -> None:
+    from support.fake_transcription import FakeServingModels
+
+    models = FakeServingModels("served")
+    failures = await _init_failures(
+        clock,
+        fake_factory.constructor,
+        options={"surprise": 1},
+        models=models,
+    )
+    assert any("surprise" in text for text in failures)
+    assert models.model_name_calls == 0
+
+
+# @spec ING-EP-081
+@pytest.mark.parametrize(
+    "count, passes",
+    [(None, True), ("absent", True), (1, True), (0, False), (2, False)],
+    ids=["none", "absent", "one", "headless-zero", "two"],
+)
+async def test_api_server_count_must_count_one(
+    clock, fake_factory, count, passes
+) -> None:
+    from support.state import ABSENT
+
+    args = _args(api_server_count=ABSENT if count == "absent" else count)
+    if passes:
+        plugin = await _init(clock, fake_factory.constructor, args=args)
+        assert plugin.factory is fake_factory
+    else:
+        failures = await _init_failures(
+            clock, fake_factory.constructor, args=args
+        )
+        assert any("api_server_count" in text for text in failures), failures
+        assert fake_factory.names("factory") == []
+
+
+def _declining(engine_client, model_config):
+    return None
+
+
+def _raising(engine_client, model_config):
+    raise RuntimeError("constructor failed")
+
+
+#: ING-EP-107: an invalid configuration, a failed capacity check, or a
+#: failed discovery or selection each fails startup, naming the cause.
+STARTUP_FAILURES = {
+    "unknown-option": dict(options={"surprise": 1}, named=("surprise",)),
+    "null-option": dict(
+        options={"preconfiguration_timeout": None},
+        named=("preconfiguration_timeout",),
+    ),
+    "no-state-pages": dict(num_gpu_blocks=0, named=("num_gpu_blocks",)),
+    "unknown-state-pages": dict(num_gpu_blocks=None, named=("num_gpu_blocks",)),
+    "unreadable-active-limit": dict(
+        unreadable_limit=True, named=("max_num_seqs",)
+    ),
+    "no-accepting-constructor": dict(
+        factories=("declining", "declining"), named=("first", "second")
+    ),
+    "two-accepting-constructors": dict(
+        factories=("accepting", "accepting"), named=("first", "second")
+    ),
+    "constructor-raises": dict(
+        factories=("accepting", "raising"), named=("second",)
+    ),
+    "named-constructor-absent": dict(
+        factories=("accepting", "accepting"),
+        options={"session_factory": "missing"},
+        named=("missing",),
+    ),
+    "named-constructor-declines": dict(
+        factories=("accepting", "declining"),
+        options={"session_factory": "second"},
+        named=("second",),
+    ),
+}
+
+
+# @spec ING-EP-107
+@pytest.mark.parametrize("case", list(STARTUP_FAILURES))
+async def test_init_state_fails_on_config_capacity_or_discovery(
+    clock, helpers, case
+) -> None:
+    from support.fake_session import FakeSessionFactory
+
+    from vllm_riva_frontend.lifecycle import StartupError
+
+    spec = dict(STARTUP_FAILURES[case])
+    named = spec.pop("named")
+    kinds = spec.pop("factories", ("accepting",))
+    unreadable = spec.pop("unreadable_limit", False)
+    built: list[FakeSessionFactory] = []
+
+    def constructor(kind: str) -> Any:
+        if kind == "declining":
+            return _declining
+        if kind == "raising":
+            return _raising
+        built.append(FakeSessionFactory())
+        return built[-1].constructor
+
+    names = ("first", "second") if len(kinds) == 2 else ("nemotron",)
+    plugin = helpers.make_frontend(
+        clock,
+        factories={
+            name: constructor(kind)
+            for name, kind in zip(names, kinds, strict=True)
+        },
+    )
+    engine = helpers.engine_with(**spec)
+    if unreadable:
+        del engine.vllm_config.scheduler_config.max_num_seqs
+        del engine.vllm_config.scheduler_config.max_num_active_seqs
+    with pytest.raises(StartupError) as info:
+        await helpers.initialize(plugin, engine)
+    for needle in named:
+        assert helpers.mentions(info.value.failures, needle), (
+            needle,
+            info.value.failures,
+        )
+
+
+# @spec ING-EP-068, ING-VEH-026
 async def test_configuration_is_checked_before_identity(
     clock, fake_factory, helpers
 ) -> None:
@@ -37,7 +337,7 @@ async def test_configuration_is_checked_before_identity(
     assert models.model_name_calls == 0
 
 
-# @spec ING-EP-023
+# @spec ING-EP-068
 async def test_identity_is_checked_before_engine_deadlines(
     clock, fake_factory, helpers
 ) -> None:
@@ -50,7 +350,7 @@ async def test_identity_is_checked_before_engine_deadlines(
     assert not helpers.mentions(failures, "never_fed_timeout")
 
 
-# @spec ING-EP-023
+# @spec ING-EP-068
 async def test_deadlines_are_checked_before_capacity(
     clock, fake_factory, helpers
 ) -> None:
@@ -64,7 +364,7 @@ async def test_deadlines_are_checked_before_capacity(
     assert not helpers.mentions(failures, "data_parallel")
 
 
-# @spec ING-EP-023
+# @spec ING-EP-068
 async def test_capacity_is_checked_before_complete_file_service(
     clock, fake_factory, helpers
 ) -> None:
@@ -78,7 +378,7 @@ async def test_capacity_is_checked_before_complete_file_service(
     assert not helpers.mentions(failures, "max_concurrent_files")
 
 
-# @spec ING-EP-023, ING-EP-031
+# @spec ING-EP-068, ING-EP-070
 async def test_route_table_is_checked_before_the_factory(
     clock, fake_factory, helpers
 ) -> None:
@@ -86,12 +386,15 @@ async def test_route_table_is_checked_before_the_factory(
     plugin = helpers.make_frontend(clock, factories={"nemotron": constructor})
     engine = helpers.engine_with()
     await _expect_failure(
-        helpers, plugin, engine, extra_plugins=[_Overrider("/v1/metadata")]
+        helpers,
+        plugin,
+        engine,
+        extra_plugins=[_Overrider(f"{PLUGIN_PREFIX}/metadata")],
     )
     assert constructor.calls == 0
 
 
-# @spec ING-EP-023, ING-EP-003
+# @spec ING-EP-068, ING-EP-107
 @pytest.mark.parametrize(
     "engine_kw",
     [
@@ -113,7 +416,7 @@ async def test_the_factory_is_constructed_only_after_every_other_check(
     assert fake_factory.teardown_calls == 0
 
 
-# @spec ING-EP-003
+# @spec ING-EP-107
 async def test_init_state_succeeds_when_every_check_holds(
     initialized, fake_factory, fake_engine
 ) -> None:
@@ -129,7 +432,7 @@ async def test_init_state_succeeds_when_every_check_holds(
     assert plugin.servicer is not None
 
 
-# @spec ING-EP-003
+# @spec ING-EP-107
 @pytest.mark.parametrize("accepting", [0, 2])
 async def test_startup_fails_unless_exactly_one_factory_accepts(
     clock, fake_factory, helpers, accepting
@@ -180,7 +483,6 @@ async def test_capability_failure_of_the_factory_constructor_fails_startup(
 
 
 # @spec ING-EP-021
-@pytest.mark.engine
 async def test_no_vllm_version_is_checked(
     monkeypatch, clock, fake_factory, helpers
 ) -> None:
@@ -194,21 +496,103 @@ async def test_no_vllm_version_is_checked(
     assert plugin.factory is fake_factory
 
 
-# @spec ING-EP-024
-async def test_failure_after_factory_construction_tears_the_factory_down(
+def _settled(factory: Any) -> bool:
+    """Whether ``factory`` went through exactly one factory settlement.
+
+    ING-EP-096: ``drain(math.inf)``, then ``teardown_all``, then one more
+    ``drain`` at a finite deadline (now).
+    """
+    return (
+        factory.names("factory") == ["drain", "teardown_all", "drain"]
+        and factory.drains[0] == math.inf
+        and math.isfinite(factory.drains[1])
+    )
+
+
+# @spec ING-EP-069
+@pytest.mark.parametrize(
+    "named, discarded",
+    [("second", ["first", "third"]), ("first", ["second", "third"])],
+)
+async def test_discarded_factories_are_settled_when_discarded(
+    clock, helpers, named, discarded
+) -> None:
+    from support.fake_session import FakeSessionFactory
+
+    factories = {
+        name: FakeSessionFactory() for name in ("first", "second", "third")
+    }
+    plugin = helpers.make_frontend(
+        clock,
+        factories={
+            name: factory.constructor for name, factory in factories.items()
+        },
+    )
+    engine = helpers.engine_with(options={"session_factory": named})
+    await helpers.initialize(plugin, engine)
+    assert plugin.factory is factories[named]
+    for name in discarded:
+        assert _settled(factories[name]), (name, factories[name].names())
+    assert factories[named].names("factory") == []
+
+
+# @spec ING-EP-069
+async def test_several_accepting_without_a_name_settles_each_and_fails(
     clock, helpers
 ) -> None:
     from support.fake_session import FakeSessionFactory
 
-    # The factory does not serve the 560ms streaming cadence: the cadence
-    # check after construction fails.
-    factory = FakeSessionFactory(served_cadences=("1120ms",))
+    first, second = FakeSessionFactory(), FakeSessionFactory()
     plugin = helpers.make_frontend(
-        clock, factories={"nemotron": factory.constructor}
+        clock,
+        factories={"first": first.constructor, "second": second.constructor},
     )
     await _expect_failure(helpers, plugin, helpers.engine_with())
-    assert factory.teardown_calls == 1
-    assert factory.names("factory") == ["teardown_all"]
+    assert _settled(first), first.names()
+    assert _settled(second), second.names()
+
+
+# @spec ING-EP-069, ING-EP-097
+@pytest.mark.parametrize(
+    "case",
+    ["unserved-cadence", "later-constructor-raises", "discard-then-fail"],
+)
+async def test_failed_init_state_settles_every_constructed_factory(
+    clock, helpers, case
+) -> None:
+    """A failed ``init_state`` settles each constructed factory, once."""
+    from support.fake_session import FakeSessionFactory
+
+    def raising(engine_client, model_config):
+        raise RuntimeError("constructor failed")
+
+    if case == "unserved-cadence":
+        # The factory does not serve the 560ms streaming cadence: the
+        # cadence check after construction fails.
+        built = [FakeSessionFactory(served_cadences=("1120ms",))]
+        factories = {"nemotron": built[0].constructor}
+        options: dict[str, Any] = {}
+    elif case == "later-constructor-raises":
+        built = [FakeSessionFactory()]
+        factories = {"first": built[0].constructor, "second": raising}
+        options = {}
+    else:
+        # "first" is discarded (and settled then); the named "second"
+        # fails the cadence check and is settled when startup fails.
+        built = [
+            FakeSessionFactory(),
+            FakeSessionFactory(served_cadences=("1120ms",)),
+        ]
+        factories = {
+            "first": built[0].constructor,
+            "second": built[1].constructor,
+        }
+        options = {"session_factory": "second"}
+    plugin = helpers.make_frontend(clock, factories=factories)
+    await _expect_failure(helpers, plugin, helpers.engine_with(options=options))
+    for factory in built:
+        assert _settled(factory), factory.names()
+        assert factory.running_tasks() == set()
 
 
 # @spec ING-EP-025
@@ -406,14 +790,14 @@ class _Overrider:
         return None
 
 
-# @spec ING-EP-031
+# @spec ING-EP-070
 @pytest.mark.parametrize(
     "path, method",
     [
-        ("/v1/metadata", "GET"),
-        ("/v1/health/ready", "GET"),
-        ("/v1/realtime/transcription_sessions", "POST"),
-        ("/v1/audio/transcriptions", "POST"),
+        (f"{PLUGIN_PREFIX}/metadata", "GET"),
+        (f"{PLUGIN_PREFIX}/health/ready", "GET"),
+        (f"{PLUGIN_PREFIX}/realtime/transcription_sessions", "POST"),
+        (f"{PLUGIN_PREFIX}/audio/transcriptions", "POST"),
     ],
 )
 async def test_a_later_plugin_overriding_a_frontend_path_fails_startup(
@@ -431,7 +815,7 @@ async def test_a_later_plugin_overriding_a_frontend_path_fails_startup(
     assert helpers.mentions(failures, path)
 
 
-# @spec ING-EP-031
+# @spec ING-EP-070
 async def test_a_later_plugin_on_other_paths_does_not_fail_startup(
     clock, fake_factory, helpers
 ) -> None:

@@ -19,9 +19,17 @@ from typing import Any
 from support.asgi import AsgiWebSocket
 from support.fake_engine import DEFAULT_MODEL
 
-REALTIME_PATH = "/v1/realtime"
-REALTIME_URL = "/v1/realtime?intent=transcription"
-BOOTSTRAP_PATH = "/v1/realtime/transcription_sessions"
+#: The frontend's Realtime routes, under the plugin namespace (ING-NIMWS-025,
+#: ING-NIMWS-026). The stock client, given ``--server host:port/plugins/riva``,
+#: reaches them with its default endpoint and query.
+PLUGIN_BASE = "/plugins/riva"
+REALTIME_PATH = f"{PLUGIN_BASE}/v1/realtime"
+REALTIME_QUERY = "intent=transcription"
+REALTIME_URL = f"{REALTIME_PATH}?{REALTIME_QUERY}"
+BOOTSTRAP_PATH = f"{PLUGIN_BASE}/v1/realtime/transcription_sessions"
+#: Core's own Realtime route, which the frontend leaves untouched.
+CORE_REALTIME_PATH = "/v1/realtime"
+CORE_REALTIME_URL = "/v1/realtime?intent=transcription"
 
 #: The marker event ``RealtimeClient.next`` returns for the close.
 CLOSE = "websocket.close"
@@ -177,10 +185,20 @@ class RealtimeClient:
         url: str = REALTIME_URL,
         headers: Iterable[tuple[str, str]] = (),
         ws: AsgiWebSocket | None = None,
+        denial_response: bool = False,
+        root_path: str = "",
     ) -> None:
         self.clock = clock
         self.ws = (
-            ws if ws is not None else AsgiWebSocket(app, url, headers=headers)
+            ws
+            if ws is not None
+            else AsgiWebSocket(
+                app,
+                url,
+                headers=headers,
+                denial_response=denial_response,
+                root_path=root_path,
+            )
         )
         self.events: list[dict[str, Any]] = []
         self.close_code: int | None = None

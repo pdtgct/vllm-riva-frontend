@@ -25,6 +25,7 @@ from support.fake_engine import FakeEngineClient
 from support.fake_session import FakeSessionFactory, fake_entry_points
 from support.grpc_harness import free_port
 from support.riva import StreamingCall, rasr
+from support.teardown import stop_served
 
 SERVED = "nvidia/nemotron-asr-streaming-test"
 PRE_SUBMIT = 1600
@@ -87,7 +88,9 @@ async def serving(
     try:
         yield served
     finally:
-        await served.stop()
+        # A stop that does not end within ``STOP_BOUND`` real seconds fails
+        # the test instead of stalling the run (``await_stop``).
+        await stop_served(served, propagate=True)
 
 
 @pytest.fixture

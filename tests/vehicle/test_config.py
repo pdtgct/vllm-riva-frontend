@@ -142,7 +142,7 @@ def test_all_failures_are_reported_together() -> None:
         assert any(option in f for f in failures), option
 
 
-# @spec ING-EP-018, ING-EP-003
+# @spec ING-EP-018, ING-EP-107
 async def test_init_state_fails_on_invalid_configuration(
     clock, fake_factory, helpers
 ) -> None:
@@ -242,7 +242,7 @@ def test_session_factory_defaults_to_unset_and_reads_a_name() -> None:
     assert parse({"session_factory": "nemotron"}).session_factory == "nemotron"
 
 
-# @spec ING-ADM-017
+# @spec ING-ADM-018
 def test_ingress_cap_default_is_64() -> None:
     assert parse({}).load_shed_max_sessions == 64
 

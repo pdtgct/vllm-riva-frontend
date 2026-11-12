@@ -266,7 +266,7 @@ async def test_unknown_locale_is_refused_before_core(files_env):
     assert env.calls == []
 
 
-# @spec ING-FILE-013
+# @spec ING-FILE-085, ING-FILE-013
 @pytest.mark.parametrize(
     ("locale", "language"),
     [
@@ -275,10 +275,17 @@ async def test_unknown_locale_is_refused_before_core(files_env):
         ("haw-US", "haw"),
         ("zh-Hans-CN", "zh"),
         ("es", "es"),
+        ("fil", "fil"),
+        ("de-de", "de"),
         ("auto", None),
         ("e-US", None),
         ("abcd-EF", None),
         ("EN-US", None),
+        ("en_US", None),
+        ("en1-US", None),
+        ("\u00e9s-ES", None),
+        ("-US", None),
+        ("", None),
     ],
 )
 def test_locale_language_rule(locale, language):
@@ -322,7 +329,7 @@ async def test_recognize_locale_equals_the_stream_locale(
 # ----------------------------------------------------------- request ID
 
 
-# @spec ING-FILE-027
+# @spec ING-FILE-027, ING-FILE-084
 async def test_recognize_fixes_its_engine_id_with_a_minimal_request(
     files_env,
 ):
@@ -349,6 +356,127 @@ def test_build_raw_request_without_scope_is_minimal():
     request = build_raw_request()
     assert request.scope["type"] == "http"
     assert [k for k, _ in request.scope["headers"]] == [b"x-request-id"]
+
+
+# ------------------------------------------------------------ step order
+
+
+# @spec ING-FILE-088
+async def test_recognize_step_order(files_env):
+    """Files-enabled check, ingress cap and sub-cap, validation, permit, core.
+
+    Each step is shown to run before the next by making both fail (or
+    wait) and observing which one answers.
+    """
+    from vllm_riva_frontend.admission import OwnerKind
+
+    invalid = recognize_request(b"\x00\x00" * 100, language_code="xx-XX")
+
+    async def call(env, request=invalid):
+        return await asyncio.wait_for(
+            recognize(env.plugin.servicer, request, FakeServicerContext()), 5
+        )
+
+    # 1. The files-enabled check precedes the ingress cap and validation.
+    disabled = await files_env(engine={"num_gpu_blocks": 2})
+    disabled.plugin.ingress.close()
+    outcome = await call(disabled)
+    assert outcome.status is grpc.StatusCode.UNIMPLEMENTED, outcome.details
+    assert outcome.details.startswith("unsupported_capability:")
+
+    # 2. The ingress cap precedes validation.
+    env = await files_env()
+    env.plugin.ingress.close()
+    outcome = await call(env)
+    assert outcome.status is grpc.StatusCode.UNAVAILABLE, outcome.details
+    assert outcome.details.startswith("service_unavailable:")
+    assert env.calls == []
+
+    # 3. The file-owner sub-cap precedes validation.
+    env = await files_env()
+    held = [
+        env.plugin.ingress.try_admit(OwnerKind("recognize"))
+        for _ in range(env.plugin.config.max_file_owners)
+    ]
+    assert all(admission is not None for admission in held)
+    outcome = await call(env)
+    assert outcome.status is grpc.StatusCode.RESOURCE_EXHAUSTED, outcome.details
+    assert outcome.details.startswith("busy:")
+    for admission in held:
+        admission.release()
+
+    # 4. Validation precedes the permit: a full gate is never waited for.
+    gate = await _held_gate(env)
+    outcome = await call(env)
+    assert outcome.status is grpc.StatusCode.INVALID_ARGUMENT, outcome.details
+    assert outcome.details.startswith("unknown_locale:")
+    assert env.plugin.file_gate.waiting == 0
+
+    # 5. The converted request waits for the permit before core is called.
+    rpc = asyncio.ensure_future(
+        call(env, recognize_request(pcm16_bytes(pcm16_sine(0.2))))
+    )
+    await until(lambda: env.plugin.file_gate.waiting == 1, what="waiting")
+    assert env.calls == []
+    gate.release()
+    outcome = await rpc
+    assert outcome.response is not None, outcome.details
+    (call_made,) = env.calls
+    fmt, _ = _wav_samples(call_made.audio_data)
+    assert fmt["rate"] == 16_000
+
+
+# @spec ING-FILE-088, ING-FILE-001
+async def test_recognize_validates_before_converting_to_wav(
+    files_env, monkeypatch
+):
+    """The WAV conversion is observed directly: after validation only.
+
+    A spy on the audio frontend's WAV encoder records each conversion with
+    the gate and core state at that instant. A request that fails
+    validation (an unknown locale, a decoded duration over the bound) is
+    never converted; a valid one is converted once, before it waits for a
+    permit and before core is called.
+    """
+    from vllm_riva_frontend import frontend
+
+    env = await files_env()
+    conversions: list[tuple[int, int]] = []
+    encode = frontend.encode_wav16
+
+    def spy(samples):
+        conversions.append((env.plugin.file_gate.waiting, len(env.calls)))
+        return encode(samples)
+
+    monkeypatch.setattr(frontend, "encode_wav16", spy)
+
+    async def call(request):
+        return await asyncio.wait_for(
+            recognize(env.plugin.servicer, request, FakeServicerContext()), 5
+        )
+
+    unknown = recognize_request(b"\x00\x00" * 100, language_code="xx-XX")
+    outcome = await call(unknown)
+    assert outcome.status is grpc.StatusCode.INVALID_ARGUMENT, outcome.details
+    assert conversions == [], "an invalid locale was converted"
+
+    too_long = recognize_request(
+        b"\xff" * (8_000 * 601), encoding="MULAW", sample_rate_hertz=8_000
+    )
+    outcome = await call(too_long)
+    assert outcome.status is grpc.StatusCode.RESOURCE_EXHAUSTED, outcome.details
+    assert conversions == [], "an over-long request was converted"
+
+    gate = await _held_gate(env)
+    rpc = asyncio.ensure_future(
+        call(recognize_request(pcm16_bytes(pcm16_sine(0.2))))
+    )
+    await until(lambda: env.plugin.file_gate.waiting == 1, what="waiting")
+    assert conversions == [(0, 0)], "not converted once before the permit"
+    gate.release()
+    outcome = await rpc
+    assert outcome.response is not None, outcome.details
+    assert len(conversions) == 1
 
 
 # ------------------------------------------------ validation before permit
@@ -569,7 +697,7 @@ async def test_rpc_deadline_during_execution_aborts_without_response(
     await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
 
 
-# @spec ING-FILE-065, ING-ERR-056, ING-FILE-067
+# @spec ING-FILE-065, ING-ERR-056, ING-FILE-089
 async def test_rpc_deadline_due_with_a_core_failure_wins(files_env):
     env = await files_env()
     block = Block(then=Raise(RuntimeError("core failed at the deadline")))
@@ -618,7 +746,7 @@ async def test_execution_bound_expiry_is_request_timeout(files_env):
     assert outcome.details.startswith("request_timeout:")
 
 
-# @spec ING-FILE-068, ING-FILE-029, ING-FILE-074
+# @spec ING-FILE-068, ING-FILE-077, ING-FILE-080
 async def test_cancelled_recognize_aborts_and_settles_before_release(
     files_env,
 ):
@@ -653,20 +781,68 @@ async def test_cancelled_recognize_aborts_and_settles_before_release(
 # ------------------------------------------------------------- errors
 
 
-# @spec ING-FILE-047
-async def test_token_budget_refusal_is_request_too_large(files_env):
-    from vllm_riva_frontend.errors import MODEL_LEN_PREFIX
+# @spec ING-FILE-081
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: Raise(ValueError("file exceeds max_model_len: 80000 > 76800")),
+        lambda: Raise(
+            ValueError(
+                "This model's maximum context length is 128 tokens. However, "
+                "your request has 4096 input tokens."
+            )
+        ),
+    ],
+    ids=["model-len-prefix", "context-length"],
+)
+async def test_no_length_relation_and_no_finish_reason_inspection(
+    files_env, make
+):
+    """No length refusal is projected for a file.
 
-    assert MODEL_LEN_PREFIX == "file exceeds max_model_len: "
+    A length-worded ``ValueError`` from core is classified like any other
+    raised ``ValueError`` (ING-FILE-050), not as ``request_too_large``.
+    """
     env = await files_env()
-    env.service.script(Raise(ValueError(MODEL_LEN_PREFIX + "80000 > 76800")))
+    env.service.script(make())
     outcome = await recognize(
         env.plugin.servicer,
         recognize_request(pcm16_bytes(pcm16_sine(0.2))),
         FakeServicerContext(),
     )
-    assert outcome.status is grpc.StatusCode.RESOURCE_EXHAUSTED
-    assert outcome.details.startswith("request_too_large:")
+    assert outcome.response is None
+    assert not outcome.details.startswith("request_too_large:"), outcome.details
+    assert outcome.status is grpc.StatusCode.INVALID_ARGUMENT, outcome.details
+    assert outcome.details.startswith("invalid_config_field:")
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+
+
+# @spec ING-FILE-081
+async def test_recognize_inspects_no_finish_reason(files_env):
+    """A transcript that ended on a length finish is returned as given."""
+    from vllm.entrypoints.speech_to_text.transcription.protocol import (
+        TranscriptionResponse,
+        TranscriptionUsageAudio,
+    )
+
+    env = await files_env(engine={"max_model_len": 128})
+    assert env.plugin.files_enabled is True
+    # Core's response model accepts extra fields; a finish reason carried on
+    # it must not change what the frontend returns.
+    partial = TranscriptionResponse(
+        text="partial",
+        usage=TranscriptionUsageAudio(seconds=0),
+        finish_reason="length",
+    )
+    env.service.script(Return(partial))
+    outcome = await recognize(
+        env.plugin.servicer,
+        recognize_request(pcm16_bytes(pcm16_sine(0.2))),
+        FakeServicerContext(),
+    )
+    assert outcome.abort is None, outcome.details
+    (result,) = outcome.response.results
+    assert result.alternatives[0].transcript == "partial"
 
 
 # @spec ING-FILE-050
@@ -816,7 +992,6 @@ async def test_recognize_samples_equal_the_stream_side_samples(
 
 
 # @spec ING-FILE-058
-@pytest.mark.engine
 def test_core_decoder_reads_the_wav_as_int16_over_32768():
     from vllm.multimodal.media.audio import load_audio
 

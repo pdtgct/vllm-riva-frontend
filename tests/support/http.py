@@ -19,7 +19,10 @@ from typing import Any
 
 from support.clock import settle, until
 
-ROUTE = "/v1/audio/transcriptions"
+#: The frontend's file route, under the plugin namespace (ING-FILE-075).
+ROUTE = "/plugins/riva/v1/audio/transcriptions"
+#: Core's own transcription route, which the frontend leaves to core.
+CORE_ROUTE = "/v1/audio/transcriptions"
 BOUNDARY = b"support-multipart-boundary"
 MiB = 1024 * 1024
 
@@ -296,6 +299,7 @@ def assert_core_error(
 __all__ = [
     "BOUNDARY",
     "MiB",
+    "CORE_ROUTE",
     "ROUTE",
     "HttpExchange",
     "assert_core_error",

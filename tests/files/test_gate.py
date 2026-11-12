@@ -6,12 +6,23 @@ import asyncio
 
 import grpc
 import pytest
-from support.fake_transcription import Block, Return, sse
+from support.fake_transcription import (
+    Block,
+    Return,
+    sse,
+    transcription_response,
+)
 from support.grpc_harness import FakeServicerContext
 from support.http import assert_core_error, error_of, until
 from support.riva import recognize, recognize_request
 
-from .helpers import TrackedStream
+from .helpers import (
+    GuardedCall,
+    ListenerStopHook,
+    TrackedStream,
+    start_drain,
+    start_stop,
+)
 
 
 def _pcm(seconds: float = 0.5) -> bytes:
@@ -23,7 +34,7 @@ def _pcm(seconds: float = 0.5) -> bytes:
 # ------------------------------------------------------------- gate units
 
 
-# @spec ING-FILE-074
+# @spec ING-FILE-080
 async def test_gate_caps_in_flight_and_releases_exactly_once(clock):
     from vllm_riva_frontend.files import FileGate
 
@@ -93,14 +104,19 @@ async def test_closed_gate_refuses_new_waiters(clock):
 # ---------------------------------------------------- one gate, two paths
 
 
-# @spec ING-FILE-074
-async def test_one_gate_covers_route_and_recognize(files_env):
+# @spec ING-FILE-080
+async def test_one_gate_covers_route_and_recognize_and_releases_once(
+    files_env,
+):
+    from support.http import CORE_ROUTE, file_request
+
     env = await files_env(riva_frontend={"max_concurrent_files": 1})
+    gate = env.plugin.file_gate
     block = Block(then=Return())
     env.service.script(block)
     route = env.request([("model", env.models.model_name())]).start()
     await asyncio.wait_for(block.entered.wait(), 2)
-    assert env.plugin.file_gate.in_flight == 1
+    assert gate.in_flight == 1
 
     rpc = asyncio.ensure_future(
         recognize(
@@ -109,19 +125,43 @@ async def test_one_gate_covers_route_and_recognize(files_env):
             FakeServicerContext(),
         )
     )
-    await until(lambda: env.plugin.file_gate.waiting == 1, what="rpc waits")
+    await until(lambda: gate.waiting == 1, what="rpc waits")
     assert len(env.calls) == 1, "Recognize passed a full gate"
+
+    # A file sent to core's own route is outside the gate: it neither waits
+    # for a permit nor takes one.
+    core_block = Block(then=Return())
+    env.service.script(core_block)
+    core = file_request(env.app, path=CORE_ROUTE).start()
+    await until(
+        lambda: core_block.entered.is_set() or core.done, what="core's call"
+    )
+    assert core_block.entered.is_set(), (core.status, core.body)
+    assert gate.in_flight == 1 and gate.waiting == 1
+    core_block.release()
+    await core.finish()
+    assert core.status == 200, core.body
 
     block.release()
     await route.finish()
     assert route.status == 200
     outcome = await asyncio.wait_for(rpc, 2)
     assert outcome.response is not None, outcome.details
-    assert len(env.calls) == 2
-    assert env.plugin.file_gate.in_flight == 0
+    assert len(env.calls) == 3
+    await until(lambda: gate.in_flight == 0, what="release")
+
+    # Each permit was released exactly once: the gate admits one file again
+    # and makes the next wait.
+    held = await gate.acquire(env.clock.monotonic() + 3600)
+    extra = asyncio.ensure_future(gate.acquire(env.clock.monotonic() + 3600))
+    await until(lambda: gate.waiting == 1, what="second waits")
+    assert not extra.done(), "a permit was released twice"
+    held.release()
+    (await asyncio.wait_for(extra, 1)).release()
+    assert gate.in_flight == 0
 
 
-# @spec ING-FILE-074
+# @spec ING-FILE-080
 async def test_route_permit_is_held_until_the_body_is_sent(files_env):
     env = await files_env(riva_frontend={"max_concurrent_files": 1})
     route = env.request(block_send=1).start()  # stall the body send
@@ -134,7 +174,7 @@ async def test_route_permit_is_held_until_the_body_is_sent(files_env):
     await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
 
 
-# @spec ING-FILE-074
+# @spec ING-FILE-080
 async def test_stream_permit_is_held_until_the_last_event_is_sent(
     files_env,
 ):
@@ -158,7 +198,7 @@ async def test_stream_permit_is_held_until_the_last_event_is_sent(
     assert env.engine.aborted == []
 
 
-# @spec ING-FILE-074
+# @spec ING-FILE-080
 async def test_full_gate_does_not_reserve_or_refuse_stream_capacity(
     files_env,
 ):
@@ -224,18 +264,7 @@ async def test_recognize_gate_wait_expiry_is_busy(files_env):
 # ------------------------------------------------------------- shutdown
 
 
-async def _drain(env, timeout: float = 1.0) -> asyncio.Future:
-    """Start ``drain``; a 1 s budget is below the engine reserve.
-
-    So ``drain`` skips the settle point and cancels every owner at once
-    (vehicle design, ``drain``).
-    """
-    from support.app import drain_plugin
-
-    return asyncio.ensure_future(drain_plugin(env.plugin, env.state, timeout))
-
-
-# @spec ING-FILE-048
+# @spec ING-FILE-086, ING-FILE-082
 async def test_shutdown_cancels_route_file_with_503_before_headers(
     files_env,
 ):
@@ -244,7 +273,7 @@ async def test_shutdown_cancels_route_file_with_503_before_headers(
     env.service.script(block)
     route = env.request().start()
     await asyncio.wait_for(block.entered.wait(), 2)
-    drain = await _drain(env)
+    drain = start_drain(env)
     await until(lambda: route.status is not None, what="503 sent")
     assert_core_error(route, 503, "service_unavailable")
     block.release()
@@ -252,7 +281,7 @@ async def test_shutdown_cancels_route_file_with_503_before_headers(
     await asyncio.wait_for(drain, 5)
 
 
-# @spec ING-FILE-048, ING-FILE-035
+# @spec ING-FILE-086, ING-FILE-035
 async def test_shutdown_terminates_the_event_stream_after_headers(
     files_env,
 ):
@@ -265,7 +294,7 @@ async def test_shutdown_terminates_the_event_stream_after_headers(
     route = env.request([("stream", "true")]).start()
     await until(lambda: stream.pulling == 1, what="second pull")
     assert route.status == 200
-    drain = await _drain(env)
+    drain = start_drain(env)
     await until(lambda: env.engine.aborted, what="abort")
     pull.set()
     await route.finish()
@@ -274,7 +303,7 @@ async def test_shutdown_terminates_the_event_stream_after_headers(
     await asyncio.wait_for(drain, 5)
 
 
-# @spec ING-FILE-048
+# @spec ING-FILE-086, ING-FILE-082
 async def test_shutdown_cancels_recognize_with_unavailable(files_env):
     env = await files_env()
     block = Block()
@@ -287,13 +316,196 @@ async def test_shutdown_cancels_recognize_with_unavailable(files_env):
         )
     )
     await asyncio.wait_for(block.entered.wait(), 2)
-    drain = await _drain(env)
+    drain = start_drain(env)
     block.release()
     outcome = await asyncio.wait_for(rpc, 5)
     assert outcome.status is grpc.StatusCode.UNAVAILABLE
     assert outcome.details.startswith("service_unavailable:")
     assert outcome.response is None
     await asyncio.wait_for(drain, 5)
+
+
+# @spec ING-FILE-086, ING-FILE-089, ING-FILE-082
+@pytest.mark.parametrize("shutdown", ["drain", "stop"])
+async def test_shutdown_cancellation_selects_shutdown_cause(
+    files_env, shutdown
+):
+    """An RPC termination after the listener stop began counts as shutdown.
+
+    The client's RPC is terminated at the moment the plugin begins stopping
+    its gRPC listener, with no cause selected before: the owner selects
+    shutdown, not the RPC cancellation. As the spec requires of a listener
+    stop test, this asserts the selected cause (projected on the fake
+    context, which has no transport to lose the status) and the cleanup, not
+    what a real client would receive.
+    """
+    env = await files_env()
+    guarded = GuardedCall(env.service)
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    context = FakeServicerContext()
+    hook = ListenerStopHook.install(env.plugin, context.cancel)
+    try:
+        rpc = asyncio.ensure_future(
+            recognize(env.plugin.servicer, recognize_request(_pcm()), context)
+        )
+        await asyncio.wait_for(block.entered.wait(), 2)
+        request_id = env.calls[0].request_id
+        assert env.engine.aborted == []
+
+        ended = start_drain(env) if shutdown == "drain" else start_stop(env)
+        await until(lambda: hook.stops, what="the listener stop began")
+        assert context.cancelled()
+        await asyncio.wait({rpc}, timeout=5)
+        assert rpc.done(), "Recognize did not answer the shutdown at once"
+        assert not rpc.cancelled(), (
+            "Recognize ended cancelled (no response),"
+            " not with the shutdown cause"
+        )
+        outcome = rpc.result()
+        # The cause: shutdown, projected as UNAVAILABLE ``service_unavailable``,
+        # not the RPC cancellation (which would produce no status).
+        assert outcome.response is None
+        assert outcome.status is grpc.StatusCode.UNAVAILABLE, outcome.details
+        assert outcome.details.startswith("service_unavailable:")
+
+        # The cleanup: the engine request is aborted while core's call runs,
+        # the call is never cancelled, and the settlement waits for it.
+        await until(lambda: env.engine.aborted, what="abort")
+        assert set(env.engine.aborted) == {request_id}
+        assert not ended.done(), "the settlement did not wait for core's call"
+        assert env.plugin.file_gate.in_flight == 1
+        before = len(env.engine.aborted)
+        block.release()
+        await asyncio.wait_for(ended, 5)
+        assert len(env.engine.aborted) > before, "no final abort"
+        assert guarded.cancelled == 0, "the owner cancelled core's call"
+        assert guarded.returned == 1
+        assert not env.plugin.registry.records
+        assert env.plugin.file_gate.in_flight == 0
+        assert env.plugin.ingress.file_count == 0
+    finally:
+        block.release()
+
+
+class _HeldCancelTask(asyncio.tasks._PyTask):  # type: ignore[name-defined]
+    """A task whose cancellations wait while ``held`` is set.
+
+    The plugin's own cancellation of the owner is held back, so the RPC
+    termination the listener stop delivers (``terminate``) is the first
+    cancellation the owner meets; ``deliver()`` then lets the held ones
+    through.
+    """
+
+    def __init__(self, coro, *, loop) -> None:
+        super().__init__(coro, loop=loop)
+        self.held = True
+        self.held_requests = 0
+
+    def cancel(self, msg=None) -> bool:
+        if self.held:
+            self.held_requests += 1
+            return not self.done()
+        return super().cancel(msg)
+
+    def terminate(self) -> None:
+        """The transport's termination of the RPC: cancels at once."""
+        super().cancel()
+
+    def deliver(self) -> None:
+        self.held = False
+        for _ in range(self.held_requests):
+            super().cancel()
+
+
+# @spec ING-FILE-086, ING-LIFE-064
+@pytest.mark.parametrize("shutdown", ["drain", "stop"])
+async def test_listener_stop_termination_first_selects_shutdown(
+    files_env, shutdown, monkeypatch
+):
+    """The listener stop's termination is the first cause ``Recognize`` meets.
+
+    Unlike ``test_shutdown_cancellation_selects_shutdown_cause``, the
+    plugin's own cancellation of the owner is held back until the owner has
+    met the RPC's termination, which the listener stop delivers the moment
+    the plugin begins stopping the listener (the transport cancels the
+    handler and fires the context's callbacks). That termination counts as
+    the plugin's cancellation: the owner selects shutdown, never the RPC
+    cancellation of ING-FILE-089. As the spec requires of a listener stop
+    test, this asserts the selected cause (projected on the fake context,
+    which has no transport to lose the status) and the cleanup.
+    """
+    from vllm_riva_frontend import files
+
+    # Every file owner the servicer builds, so the hook can read its cause.
+    owners: list[files.FileRequestOwner] = []
+    init = files.FileRequestOwner.__init__
+
+    def recording_init(self, *args, **kwargs) -> None:
+        init(self, *args, **kwargs)
+        owners.append(self)
+
+    monkeypatch.setattr(files.FileRequestOwner, "__init__", recording_init)
+    env = await files_env()
+    guarded = GuardedCall(env.service)
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    context = FakeServicerContext()
+    loop = asyncio.get_running_loop()
+    rpc = _HeldCancelTask(
+        recognize(env.plugin.servicer, recognize_request(_pcm()), context),
+        loop=loop,
+    )
+    # The causes the owner holds the moment the listener stop terminates
+    # the RPC, read inside the hook immediately before the termination and
+    # asserted below (an assertion raised in the hook would surface in the
+    # plugin's stop, not here).
+    causes_at_stop: list[object] = []
+
+    def terminate() -> None:
+        causes_at_stop.extend(owner.cause for owner in owners)
+        context.cancel()
+        rpc.terminate()
+
+    hook = ListenerStopHook.install(env.plugin, terminate)
+    try:
+        await asyncio.wait_for(block.entered.wait(), 2)
+        request_id = env.calls[0].request_id
+        assert len(owners) == 1, "Recognize did not build one file owner"
+        ended = start_drain(env) if shutdown == "drain" else start_stop(env)
+        await until(lambda: hook.stops, what="the listener stop began")
+        # No cause was selected before the termination: a shutdown cause
+        # chosen early (by drain or stop before the listener stop) would
+        # satisfy the assertions below without the termination counting.
+        assert causes_at_stop == [None], causes_at_stop
+        assert context.cancelled()
+        # The owner meets the termination first and starts its cleanup.
+        await until(lambda: env.engine.aborted, what="abort")
+        assert set(env.engine.aborted) == {request_id}
+        rpc.deliver()
+        await asyncio.wait({rpc}, timeout=5)
+        assert rpc.done(), "Recognize did not answer the shutdown at once"
+        assert not rpc.cancelled(), (
+            "Recognize ended cancelled (the RPC cancellation, no response),"
+            " not with the shutdown cause"
+        )
+        outcome = rpc.result()
+        assert outcome.response is None
+        assert outcome.status is grpc.StatusCode.UNAVAILABLE, outcome.details
+        assert outcome.details.startswith("service_unavailable:")
+        # The cleanup: core's call is never cancelled and is awaited.
+        assert not ended.done(), "the settlement did not wait for core's call"
+        block.release()
+        await asyncio.wait_for(ended, 5)
+        assert guarded.cancelled == 0, "the owner cancelled core's call"
+        assert guarded.returned == 1
+        assert not env.plugin.registry.records
+        assert env.plugin.file_gate.in_flight == 0
+        assert env.plugin.ingress.file_count == 0
+    finally:
+        block.release()
+        rpc.deliver()
+        await asyncio.wait({rpc}, timeout=5)
 
 
 # ------------------------------------------------------- ingress order

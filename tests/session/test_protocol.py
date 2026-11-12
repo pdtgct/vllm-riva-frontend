@@ -9,6 +9,7 @@ fake factory and lease while real streams run on both surfaces.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 from pathlib import Path
 from typing import Any
@@ -30,8 +31,9 @@ FACTORY_MEMBERS = frozenset(
         "teardown_all",
     }
 )
+#: The lease members the frontend uses: ``teardown()`` is not one of them.
 LEASE_MEMBERS = frozenset(
-    {"feed", "update_locale", "flush", "finish", "abort", "release", "teardown"}
+    {"feed", "update_locale", "flush", "finish", "abort", "release"}
 )
 MODEL_PLUGIN_EXCEPTIONS = frozenset(
     {"SessionRefused", "SessionFailed", "SessionError"}
@@ -66,7 +68,7 @@ def _members(protocol: type) -> set[str]:
 # ------------------------------------------------------------------ static
 
 
-# @spec ING-CORE-013
+# @spec ING-CORE-033
 def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
     offenders = []
     for path, tree in _modules():
@@ -88,12 +90,13 @@ def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
     assert offenders == []
 
 
-# @spec ING-CORE-013
-def test_the_protocols_declare_exactly_the_seam_members():
+# @spec ING-CORE-033
+def test_frontend_uses_only_the_structural_protocol_without_teardown():
     from vllm_riva_frontend.lease import SessionFactory, SessionLease
 
     assert _members(SessionFactory) == set(FACTORY_MEMBERS)
     assert _members(SessionLease) == set(LEASE_MEMBERS)
+    assert "teardown" not in _members(SessionLease)
     update = inspect.signature(SessionLease.update_locale)
     assert update.return_annotation in (None, "None", type(None))
     feed = inspect.signature(SessionLease.feed)
@@ -103,7 +106,7 @@ def test_the_protocols_declare_exactly_the_seam_members():
         assert opener.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-# @spec ING-CORE-013
+# @spec ING-CORE-033
 def test_seam_error_reads_the_two_attributes_with_getattr():
     from vllm_riva_frontend.errors import seam_error
 
@@ -154,7 +157,7 @@ def test_there_is_no_remote_provider_mode_or_websocket_loopback():
             parse_config({"riva_frontend": {key: "remote"}})
 
 
-# @spec ING-CORE-009, ING-CORE-010, ING-CORE-018
+# @spec ING-CORE-009, ING-CORE-032, ING-CORE-018
 def test_the_stream_owner_takes_no_provider_batcher_or_cadence_argument():
     from vllm_riva_frontend.lease import StreamOwner
 
@@ -230,7 +233,7 @@ class TestOnlyProtocolMembers:
         for call in update:
             assert call.kwargs == {}
 
-    # @spec ING-CORE-009, ING-CORE-010, ING-CORE-013, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_riva_stream_touches_only_protocol_members(
         self, riva, fake_factory, access_log, test_app
     ):
@@ -245,7 +248,7 @@ class TestOnlyProtocolMembers:
         self._check_calls(fake_factory)
         assert getattr(test_app.state, "core_realtime_scopes", []) == []
 
-    # @spec ING-CORE-009, ING-CORE-010, ING-CORE-013, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_realtime_session_touches_only_protocol_members(
         self, realtime, first_update, fake_factory, access_log, test_app
     ):
@@ -261,5 +264,43 @@ class TestOnlyProtocolMembers:
 
         assert access_log == []
         self._check_calls(fake_factory)
-        # The claimed scope never reached core's /v1/realtime route.
+        # The claimed scope never reached core's own Realtime route.
         assert getattr(test_app.state, "core_realtime_scopes", []) == []
+
+    # @spec ING-CORE-032
+    @pytest.mark.parametrize("surface", ["riva", "realtime"])
+    async def test_surfaces_drive_only_feed_update_flush_finish_abort_release_never_teardown(  # noqa: E501
+        self,
+        riva,
+        realtime,
+        first_update,
+        fake_factory,
+        access_log,
+        app_state,
+        surface,
+    ):
+        from support.app import stop_plugins
+
+        if surface == "riva":
+            call = riva()
+            call.configure()
+            call.audio(pcm16_bytes(pcm16_sine(0.5)))
+            await call.settle()
+        else:
+            session = realtime()
+            assert await session.connect()
+            assert (await session.next())["type"] == CREATED
+            await session.update(first_update("en-US"))
+            await session.next()
+            await session.append(pcm16_bytes(pcm16_sine(0.5)))
+            await session.settle()
+        assert fake_factory.leases, "no lease was opened"
+        lease = fake_factory.leases[0]
+
+        # ``stop`` ends the open stream through the lease's own calls.
+        await asyncio.wait_for(stop_plugins(app_state), 5)
+
+        assert access_log == [], "a non-protocol member was touched"
+        assert "teardown" not in lease.names()
+        assert lease.teardown_calls == 0
+        assert lease.names()[-2:] == ["abort", "release"]

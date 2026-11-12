@@ -343,7 +343,7 @@ async def test_finish_failure_on_the_normal_path_emits_no_final(served):
 
 
 # @spec ING-GRPC-015
-# @spec ING-ERR-059
+# @spec ING-ERR-062
 async def test_failed_shutdown_finalization_is_unavailable_with_no_final(
     served_through_drain,
 ):

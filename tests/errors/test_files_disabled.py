@@ -29,11 +29,12 @@ async def test_route_with_files_disabled_is_501_unsupported_capability(
     started, test_app, fake_transcription
 ) -> None:
     from support.app import http_client
+    from support.http import ROUTE
 
     assert started.files_enabled is False
     async with http_client(test_app) as client:
         response = await client.post(
-            "/v1/audio/transcriptions",
+            ROUTE,
             files={"file": ("a.wav", wav_bytes(pcm16_bytes(pcm16_sine(0.1))))},
             data={"model": MODEL},
         )

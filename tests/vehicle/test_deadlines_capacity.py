@@ -52,7 +52,7 @@ async def test_present_unreadable_deadline_fails_startup(
     assert helpers.mentions(failures, key)
 
 
-# @spec ING-EP-013, ING-EP-023
+# @spec ING-EP-013, ING-EP-068
 async def test_init_state_reads_deadlines_from_additional_config(
     initialized,
 ) -> None:
@@ -64,9 +64,10 @@ async def test_init_state_reads_deadlines_from_additional_config(
     ) == (15, 60, 40)
 
 
-# @spec ING-EP-034
+# @spec ING-EP-071
 @pytest.mark.engine
 def test_copied_defaults_are_pinned_against_the_core_build() -> None:
+    """The one frontend test that needs RFC 1 (ING-EP-072 checks that)."""
     from vllm.v1.core.stream_admission import StreamAdmissionConfig
 
     from vllm_riva_frontend.config import DEFAULT_STREAM_DEADLINES
