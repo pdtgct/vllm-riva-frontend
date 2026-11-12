@@ -253,7 +253,7 @@ def file_cap_failures(
 
 
 # @spec ING-EP-018, ING-EP-046, ING-EP-047, ING-EP-048, ING-EP-049
-# @spec ING-EP-050, ING-EP-051, ING-EP-053, ING-EP-032, ING-ADM-017
+# @spec ING-EP-050, ING-EP-051, ING-EP-053, ING-EP-032, ING-ADM-018
 # @spec ING-NIMWS-012
 def parse_config(additional_config: Mapping[str, Any] | None) -> FrontendConfig:
     """Read and validate the ``riva_frontend`` options.
@@ -469,7 +469,7 @@ class DeploymentProvenance:
     resampler: str
 
 
-# @spec ING-SHIM-002, ING-SHIM-012
+# @spec ING-SHIM-019, ING-SHIM-012, ING-SHIM-027
 def build_deployment_provenance(config: FrontendConfig) -> DeploymentProvenance:
     """Build the provenance from exactly its four typed, validated options."""
     return DeploymentProvenance(

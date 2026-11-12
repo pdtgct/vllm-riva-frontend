@@ -62,7 +62,7 @@ STREAM_CADENCE = "560ms"
 # ------------------------------------------------------------------ protocol
 
 
-# @spec ING-CORE-013
+# @spec ING-CORE-033
 @runtime_checkable
 class SessionLease(Protocol):
     """One engine stream the model plugin's factory opened."""
@@ -90,11 +90,8 @@ class SessionLease(Protocol):
     async def release(self) -> None:
         """Return the slot; returns after it retired."""
 
-    def teardown(self) -> None:
-        """Synchronous, engine-free teardown for a stopped plugin."""
 
-
-# @spec ING-CORE-013
+# @spec ING-CORE-033
 @runtime_checkable
 class SessionFactory(Protocol):
     """What the frontend uses of the model plugin's session factory."""
@@ -123,20 +120,13 @@ def _startup_error(failures: list[str]) -> Exception:
     return StartupError(failures)
 
 
-def _close_factory(factory: object) -> None:
-    """Tear down a factory that will not be used, so it leaves no task."""
-    teardown = getattr(factory, "teardown_all", None)
-    if callable(teardown):
-        with contextlib.suppress(Exception):
-            teardown()
-
-
 # @spec ING-CORE-012, ING-CORE-017, ING-CORE-014
 def discover_session_factory(
     engine_client: Any,
     *,
     selected: str | None,
     entry_points: Callable[..., Iterable[Any]],
+    discard: Callable[[object], None],
 ) -> object:
     """Find the one session factory that serves the engine's model.
 
@@ -147,7 +137,8 @@ def discover_session_factory(
     the model. Exactly one must accept, unless ``selected`` names an entry
     point, whose result alone is then used. The chosen factory must serve
     ``STREAM_CADENCE``. Every failure is a ``StartupError`` naming the entry
-    points; a factory built and then not used is torn down.
+    points; a factory built and then not used is handed to ``discard``,
+    which the plugin uses to settle it (ING-EP-069).
     """
     points = list(entry_points(group=SESSION_FACTORIES_GROUP))
     names = ", ".join(point.name for point in points) or "none"
@@ -176,16 +167,16 @@ def discover_session_factory(
 
     if failures:
         for _, factory in accepted:
-            _close_factory(factory)
+            discard(factory)
         raise _startup_error(failures) from first_error
     if selected is not None:
         unused = [factory for name, factory in accepted if name != selected]
         accepted = [item for item in accepted if item[0] == selected]
         for factory in unused:
-            _close_factory(factory)
+            discard(factory)
     if len(accepted) != 1:
         for _, factory in accepted:
-            _close_factory(factory)
+            discard(factory)
         if selected is not None and not accepted:
             problem = f"session factory {selected!r} does not serve this model"
         elif selected is not None:
@@ -210,7 +201,7 @@ def discover_session_factory(
     name, factory = accepted[0]
     cadences = getattr(factory, "served_cadences", frozenset[str]())
     if STREAM_CADENCE not in cadences:
-        _close_factory(factory)
+        discard(factory)
         raise _startup_error(
             [
                 f"session factory {name!r} does not serve the streaming "
@@ -273,7 +264,6 @@ class LeaseState(enum.StrEnum):
     failed = "failed"
     aborted = "aborted"
     released = "released"
-    torn_down = "torn_down"
 
 
 #: Phases that are deadlines; ``Cause.deadline`` is set for these.
@@ -381,7 +371,7 @@ class Timer:
             self.suspended = None
 
 
-# @spec ING-LIFE-057
+# @spec ING-LIFE-062
 @dataclass
 class Bounds:
     """The owner's timers (session design, Bounds)."""
@@ -465,20 +455,21 @@ def _close(awaitable: object) -> None:
 # -------------------------------------------------------------------- owner
 
 
-# @spec ING-LIFE-058, ING-LIFE-056, ING-CORE-009, ING-CORE-010, ING-CORE-018
+# @spec ING-LIFE-063, ING-LIFE-056, ING-CORE-009, ING-CORE-032, ING-CORE-018
 class StreamOwner:
     """The one serialized owner of one live stream.
 
     It makes every lease call itself, one at a time, each as a child task of
     its registry record so a call can be cancelled without cancelling the
     surface. Exactly one terminal cause is selected; cleanup runs once, in
-    one shielded task, as the lease's state allows, and it unregisters the
-    record when it ends, unless the surface's handler holds the record
-    (``held_by_handler``) and removes it itself. A cancelled call that has
-    not settled when the cleanup bound expires does not hold the stream's
-    answer: the cleanup task becomes the record's continuation, which waits
-    for the call before it makes any other lease call and runs the rest of
-    the cleanup.
+    one shielded task, as the lease's state allows (never the lease's
+    ``teardown()``, whether or not the plugin is stopping), and it
+    unregisters the record when it ends, unless the surface's handler holds
+    the record (``held_by_handler``) and removes it itself. A cancelled call
+    that has not settled when the cleanup bound expires does not hold the
+    stream's answer: the cleanup task becomes the record's continuation,
+    which waits for the call before it makes any other lease call and runs
+    the rest of the cleanup.
     """
 
     def __init__(
@@ -527,11 +518,12 @@ class StreamOwner:
         self._changed = asyncio.Event()
         self._receiving: set[asyncio.Future[Any]] = set()
         self._trigger: Any = None
+        # Resolved once the owner has acted on the trigger (ING-EP-074).
+        self._trigger_taken: asyncio.Future[None] | None = None
         self._shutdown = False
         self._finalization: str | None = None
         self._transcript: str | None = None
         self._rpc_deadline: float | None = None
-        self._torn = False
         self._clients_suspended = False
         self._handed_over = False
         # The record names this owner as its shutdown observer, so the
@@ -594,6 +586,28 @@ class StreamOwner:
     def shutdown_observed(self) -> bool:
         """Whether the shutdown trigger reached this owner."""
         return self._trigger is not None
+
+    @property
+    def trigger_taken(self) -> asyncio.Future[None] | None:
+        """Resolved once the owner has acted on the shutdown trigger.
+
+        ``None`` before the trigger. Resolved when the owner's finalization
+        has a lease call in flight, a cause is selected, or the stream is
+        terminal, so the vehicle's graceful listener stop finds every stream
+        owner inside its shutdown finalization (ING-EP-074, ING-LIFE-064).
+        """
+        return self._trigger_taken
+
+    def _mark_taken(self) -> None:
+        taken = self._trigger_taken
+        if taken is None or taken.done():
+            return
+        if (
+            self._cause is not None
+            or self._state is OwnerState.terminal
+            or (self._finalization is not None and self._call is not None)
+        ):
+            taken.set_result(None)
 
     @property
     def handed_over(self) -> bool:
@@ -663,7 +677,7 @@ class StreamOwner:
         return await self._guarded(self._finalize())
 
     # @spec ING-LIFE-026, ING-LIFE-035, ING-LIFE-036, ING-LIFE-038
-    # @spec ING-ERR-014
+    # @spec ING-ERR-014, ING-LIFE-064
     async def fail(self, cause: Cause) -> None:
         """Select ``cause`` (unless one is already selected) and clean up.
 
@@ -673,13 +687,10 @@ class StreamOwner:
         once the cleanup bound expired with a cancelled call unsettled; the
         record's continuation then owns the rest.
         """
-        if self._is_torn_down():
-            self.teardown()
-            return
         self._select(cause)
         await self._join_cleanup()
 
-    # @spec ING-LIFE-057, ING-LIFE-022, ING-LIFE-040, ING-LIFE-043
+    # @spec ING-LIFE-062, ING-LIFE-022, ING-LIFE-040, ING-LIFE-043
     # @spec ING-ERR-056, ING-LIFE-034, ING-LIFE-052
     async def receive(self, awaitable: Awaitable[T]) -> T:
         """Wait for one client message under the owner's current bound.
@@ -696,7 +707,7 @@ class StreamOwner:
         return await self._guarded(self._receive(awaitable))
 
     # @spec ING-LIFE-053, ING-LIFE-054, ING-LIFE-055, ING-LIFE-031
-    # @spec ING-LIFE-048, ING-ERR-059
+    # @spec ING-LIFE-048, ING-ERR-062
     def observe_shutdown(self, trigger: Any) -> None:
         """Observe the drain's shutdown trigger (deadline ``D``).
 
@@ -709,34 +720,13 @@ class StreamOwner:
         if self._trigger is not None or self._state is OwnerState.terminal:
             return
         self._trigger = trigger
+        self._trigger_taken = asyncio.get_running_loop().create_future()
         if self._cause is None and self._finalization is None:
             self._shutdown = True
         for task in list(self._receiving):
             task.cancel()
         self._notify()
-
-    # @spec ING-EP-043
-    def teardown(self) -> None:
-        """The stopped plugin's path: the lease's synchronous ``teardown``.
-
-        No ``abort`` or ``release`` follows; in-flight calls and cleanup are
-        cancelled and the owner ends.
-        """
-        self._torn = True
-        lease = self._lease
-        if lease is not None and self._lease_state not in (
-            LeaseState.released,
-            LeaseState.torn_down,
-        ):
-            self.calls.append("teardown")
-            self._lease_state = LeaseState.torn_down
-            with contextlib.suppress(Exception):
-                lease.teardown()
-        current = asyncio.current_task()
-        for task in (self._call, self._cleanup):
-            if task is not None and task is not current and not task.done():
-                task.cancel()
-        self._end()
+        self._mark_taken()
 
     # -- operation bodies ---------------------------------------------------
 
@@ -752,7 +742,14 @@ class StreamOwner:
         if self._cause is None and task.cancelled():
             self._select(Cause("service_unavailable", "shutdown"))
         elif self._cause is None and task.exception() is not None:
-            self._select(self._failure(task.exception(), "factory"))
+            error = task.exception()
+            assert error is not None
+            if self._retryable_refusal(error):
+                # ING-ERR-063: the session stays unconfigured, under its
+                # original preconfiguration bound, for a corrected update.
+                self._call = self._call_name = None
+                raise project_seam_error(error)
+            self._select(self._failure(error, "factory"))
         if self._cause is not None:
             await self._join_cleanup()
             raise self._error()
@@ -762,6 +759,19 @@ class StreamOwner:
         self.bounds.first_audio.arm(now)
         self.bounds.duration.arm(now)
         self._notify()
+
+    # @spec ING-ERR-063
+    def _retryable_refusal(self, error: BaseException) -> bool:
+        """A Realtime ``open`` refused for its locale: no cause, retry open.
+
+        On the Realtime adapter the client may correct the locale with a
+        further ``transcription_session.update``; on gRPC the refusal ends
+        the stream like any other.
+        """
+        return self.surface == "realtime" and seam_error(error) == (
+            "refused",
+            "locale",
+        )
 
     async def _feed(self, samples: npt.ArrayLike) -> list[str]:
         await self._check_streaming()
@@ -942,6 +952,7 @@ class StreamOwner:
             self.calls.append(name)
         task = self._spawn(name, start())
         self._call, self._call_name = task, name
+        self._mark_taken()
         await self._settle(task, kind)
         return task
 
@@ -1020,8 +1031,6 @@ class StreamOwner:
                 self._lease_state = LeaseState.open
             return
         state = self._lease_state
-        if state is LeaseState.torn_down:
-            return
         if name in ("feed", "update_locale"):
             refused = error is not None and seam_error(error)[0] == "refused"
             if error is not None and not refused and state is LeaseState.open:
@@ -1072,6 +1081,7 @@ class StreamOwner:
             cause = Cause("service_unavailable", "shutdown")
         self._cause = cause
         self._notify()
+        self._mark_taken()
         return True
 
     async def _end_with(self, cause: Cause) -> None:
@@ -1117,45 +1127,64 @@ class StreamOwner:
             if failure is not None:
                 raise failure
 
-    # @spec ING-LIFE-037, ING-LIFE-035, ING-LIFE-020, ING-LIFE-027
-    # @spec ING-ERR-005, ING-ERR-035
+    # @spec ING-LIFE-059, ING-LIFE-060, ING-LIFE-035, ING-LIFE-020
+    # @spec ING-LIFE-027, ING-LIFE-064, ING-ERR-005, ING-ERR-035
     async def _terminate(self) -> None:
         """The one terminal cleanup, as the lease's state allows.
 
         The current call is cancelled and settles first. An open or failed
         lease takes ``abort`` then ``release``; a flushed or aborted one
-        ``release`` only; a torn-down plugin only the synchronous
-        ``teardown``. The settlement, ``abort`` and ``release`` share one
-        cleanup budget (clipped to ``D`` while draining). A call the budget
-        cannot wait for is still started and runs to its first suspension
-        before it is cancelled, so a cancelled ``release`` hands the session
-        to the factory's cleanup. A cancelled call still unsettled when the
-        budget ends detaches this task as the record's continuation: the
-        stream is answered, and the task waits for the call before the next
-        lease call, until the cleanup ends or ``stop`` cancels it.
+        ``release`` only; a pending ``open`` is cancelled with no lease
+        call. The lease's ``teardown()`` is never called, also while the
+        plugin stops. The settlement, ``abort`` and ``release`` share one
+        cleanup bound fixed now (``_arm_cleanup``). A call the bound cannot
+        wait for is still started and runs to its first suspension before
+        it is cancelled, so a cancelled ``release`` hands the session to the
+        factory's cleanup, and it is awaited. A cancelled call still
+        unsettled when the bound ends detaches this task as the record's
+        continuation: the stream is answered, and the task waits for the
+        call before the next lease call, until the cleanup ends.
         """
         try:
-            self.bounds.cleanup.arm(self._clock.monotonic())
+            self._arm_cleanup()
             await self._quiesce()
-            if self._is_torn_down():
-                self.teardown()
-                return
-            if self._lease is None or self._lease_state in (
-                LeaseState.released,
-                LeaseState.torn_down,
-            ):
+            if self._lease is None or self._lease_state is LeaseState.released:
                 return
             if self._lease_state in (LeaseState.open, LeaseState.failed):
                 await self._cleanup_call("abort")
             await self._cleanup_call("release")
-            if self._lease_state is not LeaseState.released:
+            # Read through the property: the calls above changed the state.
+            if self.lease_state is not LeaseState.released:
                 self._select(Cause("internal", "cleanup"))
-        except asyncio.CancelledError:
-            if self._is_torn_down():
-                self.teardown()
-            raise
         finally:
             self._end()
+
+    def _arm_cleanup(self) -> None:
+        """Fix the cleanup bound once, as cleanup begins.
+
+        While a ``drain`` call runs its graceful work (``D`` set and not
+        passed) it is the time remaining to ``D``, not capped by
+        ``session_cleanup_timeout``; at any other time (core draining with
+        no ``drain`` call, after ``D``, in the settlement, in ``stop``) it is
+        ``session_cleanup_timeout`` from now. Neither ``D`` passing nor a
+        later cancellation of the owner moves it.
+        """
+        now = self._clock.monotonic()
+        timer = self.bounds.cleanup
+        drain_deadline = self._graceful_deadline()
+        if drain_deadline is not None and now < drain_deadline:
+            timer.suspended = None
+            timer.deadline = drain_deadline
+        else:
+            timer.arm(now)
+
+    def _graceful_deadline(self) -> float | None:
+        """``D`` while a ``drain`` call runs its graceful work, or ``None``."""
+        registry = self._registry
+        if bool(getattr(registry, "send_bounds_passed", False)):
+            return None
+        deadline = getattr(registry, "drain_deadline", None)
+        return None if deadline is None else float(deadline)
 
     async def _quiesce(self) -> None:
         """Cancel the in-flight call and wait until it settled."""
@@ -1197,8 +1226,9 @@ class StreamOwner:
         """Answer the stream while a cancelled call is still unsettled.
 
         The cleanup task becomes the record's continuation, which keeps the
-        record registered until the cleanup ends or ``stop`` cancels it. On
-        an otherwise normal path the expiry is the cleanup cause.
+        record registered until the cleanup ends (the vehicle's settlement
+        awaits it). On an otherwise normal path the expiry is the cleanup
+        cause.
         """
         if self._detached:
             return
@@ -1218,17 +1248,14 @@ class StreamOwner:
     async def _shielded(self, awaitable: Awaitable[Any]) -> None:
         """Await one cleanup step, shielded from cancellation.
 
-        Only a stopped plugin's cancellation interrupts cleanup; any other
-        is absorbed, and the step's own awaitable is closed or cancelled.
+        Every cancellation is absorbed, the plugin's settlement included:
+        cleanup ends by its own bound, never by a cancellation.
         """
         step = self._child(awaitable)
         while not step.done():
             try:
                 await asyncio.wait({step})
             except asyncio.CancelledError:
-                if self._is_torn_down():
-                    step.cancel()
-                    raise
                 _uncancel()
 
     async def _cleanup_call(self, name: str) -> None:
@@ -1254,11 +1281,8 @@ class StreamOwner:
                 self._select(Cause(projected.code, "engine", error=projected))
 
     def _cleanup_deadline(self) -> float | None:
-        deadline = self.bounds.cleanup.deadline
-        if self._trigger is not None:
-            limit = self._trigger.deadline
-            deadline = limit if deadline is None else min(deadline, limit)
-        return deadline
+        """The cleanup bound fixed at its start; never clipped afterwards."""
+        return self.bounds.cleanup.deadline
 
     def _conclude(self, *, keep_cleanup: bool = False) -> None:
         """Make the stream terminal: timers stopped, pending reads cancelled.
@@ -1269,6 +1293,7 @@ class StreamOwner:
         if self._state is OwnerState.terminal:
             return
         self._state = OwnerState.terminal
+        self._mark_taken()
         for timer in self.bounds.timers():
             if not (keep_cleanup and timer is self.bounds.cleanup):
                 timer.disarm()
@@ -1290,13 +1315,6 @@ class StreamOwner:
             with contextlib.suppress(KeyError, ValueError):
                 self._registry.unregister(self._record)
         self._mark_answered()
-
-    def _is_torn_down(self) -> bool:
-        return (
-            self._torn
-            or bool(getattr(self._registry, "torn_down", False))
-            or bool(getattr(self._record, "torn_down", False))
-        )
 
     def _escalate(self, error: BaseException) -> None:
         self.escalations.append(error)
@@ -1360,12 +1378,22 @@ class StreamOwner:
         ]
         if self._rpc_deadline is not None:
             candidates.append((self._rpc_deadline, 1, "rpc_deadline"))
-        if self._trigger is not None:
+        if self._clipped_to_d():
             candidates.append((self._trigger.deadline, 2, "drain"))
         if not candidates:
             return None
         deadline, _, phase = min(candidates)
         return deadline, phase
+
+    def _clipped_to_d(self) -> bool:
+        """Whether the owner's waits clip to the trigger's ``D``.
+
+        From the trigger until the vehicle's settlement begins, when the
+        clipping ends for the rest of the ``drain`` call (ING-EP-110).
+        """
+        return self._trigger is not None and not bool(
+            getattr(self._registry, "send_bounds_passed", False)
+        )
 
     async def _until(
         self, futures: set[asyncio.Future[Any]], deadline: float | None
@@ -1459,26 +1487,20 @@ class StreamOwner:
         if self._state is OwnerState.configured:
             self._state = OwnerState.streaming
 
+    # @spec ING-LIFE-064
     async def _guarded(self, operation: Awaitable[T]) -> T:
         """Run one owner operation; the owner's own cancellation ends it.
 
-        A cancellation the owner did not ask for is the server's: the stream
-        ends with ``service_unavailable`` and the shielded cleanup, or, on a
-        stopped plugin, with the lease's synchronous ``teardown``.
+        A cancellation the owner did not ask for is the plugin's (the
+        vehicle's settlement in ``drain`` or ``stop``): the owner keeps a
+        cause it already selected and otherwise takes the shutdown abort
+        row, and cleans up by lease state under its cleanup bound.
         """
         try:
             return await operation
         except asyncio.CancelledError:
-            if self._is_torn_down():
-                self.teardown()
-                raise
             self._select(Cause("service_unavailable", "shutdown"))
-            try:
-                await self._join_cleanup()
-            except asyncio.CancelledError:
-                if self._is_torn_down():
-                    self.teardown()
-                raise
+            await self._join_cleanup()
             # The cancellation became the stream's cause; it is consumed.
             _uncancel()
             raise self._error() from None

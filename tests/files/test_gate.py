@@ -561,3 +561,52 @@ async def test_valid_request_waits_for_the_permit_before_calling_core(
     await exchange.finish()
     assert exchange.status == 200
     assert len(env.calls) == 1
+
+
+# @spec ING-FILE-053, ING-EP-082, ING-EP-102
+async def test_core_draining_refuses_an_admitted_upload_at_the_gate(
+    files_env,
+):
+    """Core's ``state.draining`` alone, with no ``drain`` call, closes the gate.
+
+    The upload is admitted while core serves and is still sending its body
+    when core sets ``state.draining``; it then reaches the full gate and is
+    refused with ``service_unavailable``, and the slot freed afterwards
+    grants it no permit (core is never called for it).
+    """
+    env = await files_env(riva_frontend={"max_concurrent_files": 1})
+    block = Block()
+    env.service.script(block)
+    running = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    upload = env.request(stall_before=0).start()
+    await until(lambda: env.plugin.ingress.file_count == 2, what="admitted")
+    env.state.draining = True  # core's flag; no plugin drain call
+    upload.resume()
+    await until(lambda: upload.status is not None, what="the refusal")
+    assert_core_error(upload, 503, "service_unavailable")
+    assert env.plugin.file_gate.waiting == 0
+    block.release()
+    await running.finish()
+    await upload.finish()
+    assert len(env.calls) == 1, "the refused upload reached core"
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.drain_deadline is None
+
+
+# @spec ING-FILE-053, ING-EP-082
+async def test_gate_reads_core_draining_directly(clock):
+    from vllm_riva_frontend.errors import FrontendError
+    from vllm_riva_frontend.files import FileGate
+
+    draining = [False]
+    gate = FileGate(2, clock=clock, serving=lambda: not draining[0])
+    held = await gate.acquire(clock.monotonic() + 30)
+    draining[0] = True
+    assert gate.closed
+    with pytest.raises(FrontendError) as raised:
+        await asyncio.wait_for(gate.acquire(clock.monotonic() + 30), 1)
+    assert raised.value.code == "service_unavailable"
+    assert gate.in_flight == 1
+    held.release()
+    assert gate.in_flight == 0

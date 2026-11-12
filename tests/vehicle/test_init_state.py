@@ -552,6 +552,53 @@ async def test_several_accepting_without_a_name_settles_each_and_fails(
     assert _settled(second), second.names()
 
 
+# @spec ING-EP-069, ING-EP-064, ING-EP-076
+async def test_cancelled_discovery_settles_every_factory_then_re_raises(
+    clock, helpers
+) -> None:
+    """A cancellation during a discarded factory's settlement is re-raised.
+
+    The settlement of the discarded factory finishes uninterrupted, the
+    selected factory is settled as well (``init_state`` does not complete),
+    and only then does the cancellation propagate: the plugin holds no
+    factory and no factory keeps a task.
+    """
+    from support.fake_session import FakeSessionFactory
+
+    discarded, selected = FakeSessionFactory(), FakeSessionFactory()
+    entered, release = asyncio.Event(), asyncio.Event()
+    inner = discarded.drain
+
+    async def blocked_drain(deadline):
+        entered.set()
+        await release.wait()
+        return await inner(deadline)
+
+    discarded.drain = blocked_drain  # type: ignore[method-assign]
+    plugin = helpers.make_frontend(
+        clock,
+        factories={
+            "first": discarded.constructor,
+            "second": selected.constructor,
+        },
+    )
+    engine = helpers.engine_with(options={"session_factory": "second"})
+    init = asyncio.ensure_future(helpers.initialize(plugin, engine))
+    await asyncio.wait_for(entered.wait(), 2)
+    init.cancel()
+    await asyncio.sleep(0)
+    assert not init.done(), "the cancellation cut the settlement short"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(init, 5)
+    assert _settled(discarded), discarded.names()
+    assert _settled(selected), selected.names()
+    assert plugin.factory is None
+    assert plugin.servicer is None
+    for factory in (discarded, selected):
+        assert factory.running_tasks() == set()
+
+
 # @spec ING-EP-069, ING-EP-097
 @pytest.mark.parametrize(
     "case",

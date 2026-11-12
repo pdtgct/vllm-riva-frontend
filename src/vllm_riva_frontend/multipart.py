@@ -15,9 +15,11 @@ as a path or persisted.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import string
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import typing
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -55,9 +57,13 @@ _WHITESPACE = " \t"
 class _Clock(Protocol):
     def monotonic(self) -> float: ...
 
-    async def wait_for(self, awaitable: Awaitable[Any], deadline: float) -> Any:
-        """Await ``awaitable`` until the absolute ``deadline``."""
+    async def sleep(self, seconds: float) -> None:
+        """Suspend the caller for ``seconds``."""
         ...
+
+
+#: Starts a task; an owner passes one that keeps it under its record.
+Spawn = Callable[[Coroutine[Any, Any, Any]], asyncio.Future[Any]]
 
 
 @dataclass(frozen=True)
@@ -570,6 +576,7 @@ def _parser(boundary: bytes, builder: _FormBuilder) -> MultipartParser:
 
 
 # @spec ING-FILE-004, ING-FILE-037, ING-FILE-038, ING-HTTP-007, ING-HTTP-011
+# @spec ING-EP-106
 async def parse_multipart(
     receive: Callable[[], Awaitable[Mapping[str, Any]]],
     boundary: bytes,
@@ -577,6 +584,7 @@ async def parse_multipart(
     *,
     deadline: float,
     clock: _Clock,
+    spawn: Spawn | None = None,
 ) -> MultipartForm:
     """Read and parse the request body from ASGI ``receive``.
 
@@ -584,7 +592,9 @@ async def parse_multipart(
     a running count bounded by ``envelope_max_bytes``; the whole read is
     bounded by the absolute ``deadline`` on ``clock``. Truncated input or a
     disconnect is never a success, and what was buffered is dropped with
-    the parser.
+    the parser. The read and its timer run as two tasks started by
+    ``spawn``, so an owner keeps both under its registry record; a
+    cancellation of the caller cancels both and propagates.
 
     Raises:
         FrontendError: ``malformed_request`` for bad framing, a truncated
@@ -594,18 +604,34 @@ async def parse_multipart(
             ``request_timeout`` when the read outlasts ``deadline``.
         ClientDisconnect: The client disconnected before the body ended.
     """
+    start = spawn or asyncio.ensure_future
+    reader = start(_read(receive, boundary, limits))
+    timer = start(clock.sleep(max(0.0, deadline - clock.monotonic())))
+    try:
+        await asyncio.wait({reader, timer}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        timer.cancel()
+        if not reader.done():
+            reader.cancel()
+    if not reader.done() or reader.cancelled():
+        raise FrontendError(
+            "request_timeout",
+            "the request body was not received within http_body_read_timeout",
+        )
+    return typing.cast(MultipartForm, reader.result())
+
+
+async def _read(
+    receive: Callable[[], Awaitable[Mapping[str, Any]]],
+    boundary: bytes,
+    limits: MultipartLimits,
+) -> MultipartForm:
+    """The body read of ``parse_multipart``, without its deadline."""
     builder = _FormBuilder(limits)
     parser = _parser(boundary, builder)
     total = 0
     while True:
-        try:
-            message = await clock.wait_for(receive(), deadline)
-        except TimeoutError:
-            raise FrontendError(
-                "request_timeout",
-                "the request body was not received within "
-                "http_body_read_timeout",
-            ) from None
+        message = await receive()
         kind = message.get("type")
         if kind == "http.disconnect":
             raise ClientDisconnect()

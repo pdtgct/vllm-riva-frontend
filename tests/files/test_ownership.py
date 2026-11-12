@@ -1479,3 +1479,211 @@ def test_core_engine_client_abort_signature():
     assert inspect.iscoroutinefunction(EngineClient.abort)
     parameters = list(inspect.signature(EngineClient.abort).parameters)
     assert parameters == ["self", "request_id"]
+
+
+# ------------------------------------------------ cancellation origin
+
+
+# @spec ING-FILE-089, ING-FILE-086, ING-EP-082, ING-EP-111, ING-LIFE-061
+@pytest.mark.parametrize("window", ["core_draining", "fault", "d_set"])
+async def test_client_cancellation_while_draining_is_a_client_disconnect(
+    files_env, window
+):
+    """Only the plugin's own cancellation of the owner selects shutdown.
+
+    Core's ``state.draining``, a recorded fault (which closes admission)
+    and a ``drain`` call that has announced ``D`` but not reached its settle
+    point are not the plugin cancelling anything: a cancellation of the
+    handler by its transport in those windows is the client leaving, which
+    wins with no response and aborts the engine request.
+    """
+    from support.app import drain_plugin
+
+    env = await files_env()
+    drain: asyncio.Future | None = None
+    guarded = GuardedCall(env.service)
+    block = Block(then=Return(transcription_response("late")))
+    env.service.script(block)
+    exchange = env.request().start()
+    await asyncio.wait_for(block.entered.wait(), 2)
+    request_id = env.calls[0].request_id
+    if window == "core_draining":
+        env.state.draining = True
+    elif window == "fault":
+        env.plugin.escalate(RuntimeError("a recorded fault"))
+        assert not env.plugin.admission_open
+    else:
+        # D is announced; the settle point (and its cancellation of file
+        # requests) is still ahead, as the clock does not move.
+        drain = asyncio.ensure_future(drain_plugin(env.plugin, env.state, 20))
+        await until(
+            lambda: env.plugin.drain_deadline is not None, what="D announced"
+        )
+        assert not env.plugin.send_bounds_passed
+    assert exchange.task is not None
+    exchange.task.cancel()
+    await until(lambda: env.engine.aborted, what="abort")
+    assert set(env.engine.aborted) == {request_id}
+    block.release()
+    await exchange.finish()
+    assert exchange.status is None, "a response after the client left"
+    assert exchange.messages == []
+    assert guarded.cancelled == 0, "the owner cancelled core's call"
+    assert env.plugin.file_gate.in_flight == 0
+    assert env.plugin.ingress.file_count == 0
+    if drain is not None:
+        assert not drain.done(), "the drain ended before its settle point"
+        for _ in range(60):
+            if drain.done():
+                break
+            await env.clock.advance(1.0)
+        await asyncio.wait_for(drain, 5)
+
+
+# --------------------------------------------- a send completing late
+
+
+# @spec ING-FILE-091, ING-LIFE-061, ING-ERR-056
+async def test_route_send_completing_after_its_bound_has_failed(files_env):
+    """Headers released past their bound: that send failed, nothing follows.
+
+    The clock jumps past ``response_send_timeout`` and the stalled reader
+    takes the response start in the same moment: the start completed late,
+    so it has failed and the body is never sent.
+    """
+    env = await files_env()
+    exchange = env.request(block_send=0).start()
+    await asyncio.wait_for(exchange.send_blocked.wait(), 2)
+    timeout = env.plugin.config.response_send_timeout
+    env.clock.set(env.clock.monotonic() + timeout + 1)
+    exchange.unblock_send()
+    await until(lambda: env.plugin.file_gate.in_flight == 0, what="release")
+    await exchange.finish()
+    assert len(exchange.starts) == 1
+    assert not exchange.completed, "a send started after a late one"
+    assert env.engine.aborted == []
+
+
+# @spec ING-FILE-091, ING-ERR-056
+async def test_owner_send_completing_after_its_bound_selects_send_timeout():
+    from types import SimpleNamespace
+
+    from support.clock import FakeClock
+
+    from vllm_riva_frontend.config import FrontendConfig
+    from vllm_riva_frontend.errors import catalog
+    from vllm_riva_frontend.files import FileRequestOwner
+    from vllm_riva_frontend.lifecycle import OwnerRegistry, RivaFrontendPlugin
+
+    clock = FakeClock()
+    plugin = RivaFrontendPlugin(clock=clock)
+    registry = OwnerRegistry()
+    record = registry.register("file_route", asyncio.current_task())
+    owner = FileRequestOwner(
+        service=None,
+        engine_client=None,
+        config=FrontendConfig(),
+        clock=clock,
+        registry=registry,
+        record=record,
+        catalog=catalog(),
+        lifecycle=plugin,
+        state=SimpleNamespace(draining=False),
+    )
+    release: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    sent: list[str] = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            await release
+        sent.append(message["type"])
+
+    owner._asgi_send = send
+    task = asyncio.ensure_future(
+        owner._send(
+            [
+                {"type": "http.response.start", "status": 200, "headers": []},
+                {"type": "http.response.body", "body": b"ok"},
+            ],
+            phase=False,
+            terminal=True,
+        )
+    )
+    await clock.settle()
+    clock.set(clock.monotonic() + FrontendConfig().response_send_timeout + 1)
+    release.set_result(None)
+    delivered = await asyncio.wait_for(task, 2)
+    assert delivered is False
+    assert sent == ["http.response.start"], "the body followed a late start"
+    assert owner.cause is not None
+    assert owner.cause.kind == "send"
+    assert owner.cause.error is not None
+    assert owner.cause.error.code == "request_timeout"
+
+
+# @spec ING-FILE-091, ING-EP-110, ING-LIFE-061
+async def test_owner_send_completing_as_the_settlement_begins_has_failed():
+    """Headers released in the turn the settlement begins: no body follows.
+
+    The response start is stalled within its numeric bound. The vehicle's
+    settlement begins (every send bound now counts as passed) and the
+    reader takes the start in the same turn of the event loop: the start
+    completed after its bound came to count as passed, so the send has
+    failed, the body never starts, ``_send`` reports the failure and the
+    send-bound cause is selected.
+    """
+    from types import SimpleNamespace
+
+    from support.clock import FakeClock
+
+    from vllm_riva_frontend.config import FrontendConfig
+    from vllm_riva_frontend.errors import catalog
+    from vllm_riva_frontend.files import FileRequestOwner
+    from vllm_riva_frontend.lifecycle import OwnerRegistry, RivaFrontendPlugin
+
+    clock = FakeClock()
+    plugin = RivaFrontendPlugin(clock=clock)
+    registry = OwnerRegistry()
+    plugin.registry = registry
+    record = registry.register("file_route", asyncio.current_task())
+    owner = FileRequestOwner(
+        service=None,
+        engine_client=None,
+        config=FrontendConfig(),
+        clock=clock,
+        registry=registry,
+        record=record,
+        catalog=catalog(),
+        lifecycle=plugin,
+        state=SimpleNamespace(draining=False),
+    )
+    release: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    sent: list[str] = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            await release
+        sent.append(message["type"])
+
+    owner._asgi_send = send
+    task = asyncio.ensure_future(
+        owner._send(
+            [
+                {"type": "http.response.start", "status": 200, "headers": []},
+                {"type": "http.response.body", "body": b"ok"},
+            ],
+            phase=False,
+        )
+    )
+    await clock.settle()
+    assert sent == [], "the start was not stalled"
+    # The settlement begins and the reader takes the start in one turn.
+    registry.send_bounds_passed = True
+    release.set_result(None)
+    delivered = await asyncio.wait_for(task, 2)
+    assert delivered is False
+    assert sent == ["http.response.start"], "the body followed the latch"
+    assert owner.cause is not None
+    assert owner.cause.kind == "send"
+    assert owner.cause.error is not None
+    assert owner.cause.error.code == "request_timeout"

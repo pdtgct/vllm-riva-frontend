@@ -1,7 +1,9 @@
 """The ingress cap: one bounded count of transport owners, with a file sub-cap.
 
 The cap counts active owners of ``StreamingRecognize``, ``Recognize``, the
-Riva Realtime WebSocket and the file route together. A handler asks it once,
+Riva Realtime WebSocket route and the frontend's file route under
+``/plugins/riva/v1/`` together; core's own routes are outside it. A
+handler asks it once,
 before it reads its first message or body, and either gets an ``Admission``
 to hold until its last cleanup step or a refusal it answers at once.
 """
@@ -54,7 +56,8 @@ class IngressCap:
     """The finite ingress cap and the file-owner sub-cap inside it.
 
     Constructed closed: ``try_admit`` refuses until ``open`` is called, which
-    the plugin's ``start`` does as its last step; ``drain`` closes it again.
+    the plugin's ``start`` does as its last step; ``drain``, a recorded
+    fault and ``stop`` close it again.
     """
 
     def __init__(
@@ -98,7 +101,7 @@ class IngressCap:
         """Active file owners (``Recognize`` and the file route)."""
         return self._file_count
 
-    # @spec ING-EP-035
+    # @spec ING-EP-080
     def open(self) -> None:
         """Open admission."""
         self._open = True
@@ -110,7 +113,7 @@ class IngressCap:
     def _serving_now(self) -> bool:
         return self._open and (self._serving is None or self._serving())
 
-    # @spec ING-ADM-017, ING-ADM-011, ING-ADM-012, ING-ADM-010
+    # @spec ING-ADM-018, ING-ADM-011, ING-ADM-012, ING-ADM-010
     def try_admit(self, kind: OwnerKind | str) -> Admission | None:
         """Atomically check serving state and count, and admit one owner.
 

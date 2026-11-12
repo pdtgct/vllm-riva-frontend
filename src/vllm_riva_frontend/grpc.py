@@ -290,7 +290,7 @@ def register_aio_services(
     return health_servicer
 
 
-# @spec ING-GRPC-031
+# @spec ING-GRPC-034
 def build_server(
     config: FrontendConfig, servicer: RivaServicer
 ) -> tuple[grpc.aio.Server, health.aio.HealthServicer]:
@@ -298,8 +298,10 @@ def build_server(
 
     The receive cap is ``grpc_receive_max_bytes`` for every request message
     of both RPCs; keepalive is on only when ``grpc_keepalive_seconds`` is
-    set. The caller binds the address and starts the server.
+    set. The caller binds the address and starts the server. The server
+    applies neither ``--api-key`` nor ``VLLM_API_KEY``.
     """
+    # @spec ING-EP-090
     options: list[tuple[str, Any]] = [
         ("grpc.max_receive_message_length", int(config.grpc_receive_max_bytes)),
     ]
@@ -328,7 +330,6 @@ async def _abort(
     error: errors.FrontendError,
     *,
     rpc_deadline: float | None,
-    owner: Any = None,
     record: Any = None,
 ) -> NoReturn:
     """End the RPC with ``error``'s status under the send bound.
@@ -342,7 +343,6 @@ async def _abort(
         await surfaces.bounded_send(
             plugin,
             context.abort(status, error.grpc_details()),
-            owner=owner,
             record=record,
             rpc_deadline=rpc_deadline,
             terminal=True,
@@ -435,24 +435,33 @@ class _RivaStream:
 
     # ------------------------------------------------------------ signals
 
-    # @spec ING-LIFE-039
+    # @spec ING-LIFE-039, ING-LIFE-038
     def arm(self) -> None:
         self._context.add_done_callback(self._on_done)
 
+    # @spec ING-LIFE-064, ING-ERR-062
     def _on_done(self, context: Any) -> None:
+        """The RPC was terminated: a client disconnect, or the plugin's stop.
+
+        A termination observed after the plugin began stopping the gRPC
+        listener (its graceful or forced stop) is the plugin's cancellation
+        of the owner and takes the shutdown abort row, never a client
+        disconnect; the owner keeps a cause it already selected.
+        """
         if self.gone or not context.cancelled():
             return
         self.gone = True
         if self._owner.state != "terminal":
-            cause = lease.Cause("internal", "transport", None)
+            if getattr(self._plugin, "listener_stopping", False):
+                cause = lease.Cause("service_unavailable", "shutdown", None)
+            else:
+                cause = lease.Cause("internal", "transport", None)
             self._tasks.append(
                 surfaces.child(self.record, self._owner.fail(cause))
             )
 
     async def close(self) -> None:
-        await surfaces.join(
-            self._tasks, stopped=lambda: surfaces.torn_down(self._plugin)
-        )
+        await surfaces.join(self._tasks)
 
     # ------------------------------------------------------------- writes
 
@@ -468,7 +477,6 @@ class _RivaStream:
             await surfaces.bounded_send(
                 self._plugin,
                 self._context.write(response),
-                owner=self._owner,
                 record=self.record,
                 rpc_deadline=self._owner.rpc_deadline,
             )
@@ -483,7 +491,6 @@ class _RivaStream:
             self._context,
             error,
             rpc_deadline=self._owner.rpc_deadline,
-            owner=self._owner,
             record=self.record,
         )
 
@@ -624,12 +631,15 @@ class _RivaStream:
             sample_rate_hz=config.sample_rate_hertz,
         )
 
-    # @spec ING-CORE-019
+    # @spec ING-CORE-019, ING-LIFE-065
     async def _audio(self, data: bytes) -> None:
         """Decode one message in bounded slices and feed each in turn.
 
-        Reads stay paused while a slice is fed. After the shutdown trigger
-        no further slice is handed over: the stream is finalizing.
+        Reads stay paused while a slice is fed. A message already read and
+        validated when the shutdown trigger arrives is fed to its end, each
+        slice under its bound clipped to ``D``; the next read then observes
+        the trigger and the stream enters shutdown finalization, reading no
+        further message.
         """
         owner = self._owner
         if self._riff is not None:
@@ -654,8 +664,6 @@ class _RivaStream:
                 self._hypothesis = text
                 if self._interim:
                     await self._write(_streaming_response(text, final=False))
-            if owner.shutdown_observed:
-                return
 
     async def _resolve_header(self, data: bytes) -> bytes | None:
         """Buffer deferred-header bytes; return the audio once resolved."""
@@ -691,7 +699,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         """Serve ``plugin``'s factory, gate, registry, clock and catalog."""
         self._plugin = plugin
 
-    # @spec ING-GRPC-001, ING-GRPC-015, ING-ERR-029, ING-ERR-042
+    # @spec ING-GRPC-001, ING-GRPC-015, ING-ERR-064, ING-ERR-060
     async def StreamingRecognize(  # noqa: N802 - the generated stub's name
         self,
         request_iterator: AsyncIterator[rasr.StreamingRecognizeRequest],
@@ -712,6 +720,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         except _Abandoned:
             raise asyncio.CancelledError from None
 
+    # @spec ING-EP-095, ING-ADM-018, ING-LIFE-063
     async def _streaming(
         self,
         request_iterator: AsyncIterator[rasr.StreamingRecognizeRequest],
@@ -724,6 +733,8 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
             return
         admitted = plugin.ingress.try_admit(admission.OwnerKind.stream)
         if admitted is None:
+            # A refusal that creates no owner: its handler awaits the status
+            # inline (ING-EP-095).
             await _abort(
                 plugin,
                 context,
@@ -756,7 +767,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
             except _Abandoned:
                 # Cleaned up as for a disconnect; nothing further is sent.
                 await surfaces.settle_shielded(
-                    plugin, record, owner, _TRANSPORT_GONE, "transport"
+                    record, owner, _TRANSPORT_GONE, "transport"
                 )
                 raise
         finally:
@@ -770,7 +781,6 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         self, stream: _RivaStream, owner: Any, context: Any
     ) -> None:
         """Run the stream, then project its one terminal error, if any."""
-        plugin = self._plugin
         error: errors.FrontendError | None = None
         try:
             await stream.run()
@@ -787,12 +797,13 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
                 "internal", f"unexpected failure: {unexpected!r}"
             )
             await surfaces.settle_shielded(
-                plugin, stream.record, owner, error, "transport"
+                stream.record, owner, error, "transport"
             )
             error = surfaces.selected_error(owner, error)
         if error is not None and not stream.gone:
             await stream.abort(error)
 
+    # @spec ING-LIFE-064, ING-LIFE-061, ING-ERR-062
     async def _cancelled(
         self, stream: _RivaStream, owner: Any, context: Any
     ) -> errors.FrontendError | None:
@@ -808,7 +819,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
             "service_unavailable", "the server is shutting down"
         )
         await surfaces.settle_shielded(
-            self._plugin, stream.record, owner, shutdown, "shutdown"
+            stream.record, owner, shutdown, "shutdown"
         )
         if context.cancelled() or stream.gone:
             raise asyncio.CancelledError
@@ -818,7 +829,7 @@ class RivaServicer(rasr_grpc.RivaSpeechRecognitionServicer):  # type: ignore[mis
         return surfaces.selected_error(owner, shutdown)
 
     # @spec ING-GRPC-001, ING-GRPC-010, ING-GRPC-029, ING-GRPC-021
-    # @spec ING-GRPC-032, ING-FILE-014, ING-ADM-017, ING-ADM-011
+    # @spec ING-GRPC-032, ING-FILE-014, ING-ADM-018, ING-ADM-011
     async def Recognize(  # noqa: N802 - the generated stub's name
         self, request: rasr.RecognizeRequest, context: Any
     ) -> rasr.RecognizeResponse:

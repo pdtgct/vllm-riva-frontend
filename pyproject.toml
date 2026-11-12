@@ -24,7 +24,7 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/pdtgct/vllm-riva-frontend"
 
-# @spec ING-EP-001, ING-CLI-004 (one entry point, no client script)
+# @spec ING-EP-001, ING-CLI-005 (one entry point, no client script)
 [project.entry-points."vllm.endpoint_plugins"]
 riva_frontend = "vllm_riva_frontend:plugin"
 

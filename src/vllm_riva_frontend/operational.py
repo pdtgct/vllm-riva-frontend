@@ -1,28 +1,33 @@
 """The NIM operational routes: readiness, liveness, version and metadata.
 
-The routes carry no inference behaviour. Readiness answers from the plugin's
-own ``ready(state)`` predicate, the one core's ``/health`` reads, so the two
-cannot disagree about the plugin.
+They live under the plugin's prefix (``/plugins/riva/v1/health/ready`` and so
+on), keeping NIM's ``v1/...`` suffix so that NIM tooling given the base URL
+``host:port/plugins/riva`` reaches them; core's ``/health``, ``/ready`` and
+``/version`` are core's own. The routes carry no inference behaviour.
+Readiness answers from the plugin's own ``ready(state)`` predicate alone,
+the one core's ``/ready`` aggregates with engine health and
+``state.draining``.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
-from fastapi import APIRouter, Request
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from vllm_riva_frontend.config import DeploymentProvenance
+from vllm_riva_frontend.routes import PLUGIN_PREFIX
 from vllm_riva_frontend.version import __version__
 
 #: The four plugin-owned operational paths (all ``GET``).
 OPERATIONAL_PATHS = (
-    "/v1/health/ready",
-    "/v1/health/live",
-    "/v1/version",
-    "/v1/metadata",
+    f"{PLUGIN_PREFIX}/health/ready",
+    f"{PLUGIN_PREFIX}/health/live",
+    f"{PLUGIN_PREFIX}/version",
+    f"{PLUGIN_PREFIX}/metadata",
 )
 
 
@@ -65,7 +70,7 @@ def version_body() -> dict[str, str]:
     return {"release": __version__, "api": "v1"}
 
 
-# @spec ING-SHIM-002, ING-SHIM-012, ING-SHIM-017
+# @spec ING-SHIM-019, ING-SHIM-012, ING-SHIM-025, ING-SHIM-027
 def metadata_body(
     served_model: str, provenance: DeploymentProvenance
 ) -> dict[str, Any]:
@@ -84,14 +89,16 @@ def metadata_body(
     }
 
 
-# @spec ING-SHIM-007, ING-SHIM-008
-def operational_router(plugin: _OperationalPlugin) -> APIRouter:
-    """Return the router of the four operational ``GET`` routes.
+# @spec ING-SHIM-018, ING-SHIM-024, ING-SHIM-020
+def operational_endpoints(
+    plugin: _OperationalPlugin,
+) -> list[tuple[str, Callable[..., Any]]]:
+    """Return ``(path, handler)`` for the four operational ``GET`` routes.
 
-    The handlers read the plugin when a request arrives, so the router can
-    be attached before ``init_state`` has run.
+    The handlers read the plugin when a request arrives, so the routes can
+    be attached before ``init_state`` has run; metadata reads the plugin's
+    one provenance object each time (ING-SHIM-027).
     """
-    router = APIRouter()
 
     async def health_ready(request: Request) -> JSONResponse:
         try:
@@ -115,15 +122,10 @@ def operational_router(plugin: _OperationalPlugin) -> APIRouter:
             return JSONResponse(body, status_code=status)
         return JSONResponse(metadata_body(served_model, provenance))
 
-    for path, endpoint in zip(
-        OPERATIONAL_PATHS,
-        (health_ready, health_live, version, metadata),
-        strict=True,
-    ):
-        router.add_api_route(
-            path,
-            cast(Callable[..., Any], endpoint),
-            methods=["GET"],
-            response_model=None,
+    return list(
+        zip(
+            OPERATIONAL_PATHS,
+            (health_ready, health_live, version, metadata),
+            strict=True,
         )
-    return router
+    )

@@ -57,6 +57,8 @@ class Clock(Protocol):
         """
         ...
 
+    def timer(self, deadline: float) -> asyncio.Future[None]: ...
+
 
 class RealClock:
     """``time.monotonic`` and asyncio."""
@@ -70,6 +72,16 @@ class RealClock:
     async def wait_for(self, awaitable: Awaitable[T], deadline: float) -> T:
         remaining = max(0.0, deadline - time.monotonic())
         return await asyncio.wait_for(awaitable, remaining)
+
+    def timer(self, deadline: float) -> asyncio.Future[None]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        handle = loop.call_later(
+            max(0.0, deadline - time.monotonic()),
+            lambda: future.done() or future.set_result(None),
+        )
+        future.add_done_callback(lambda _: handle.cancel())
+        return future
 
 
 async def _cancel_for_timeout(task: asyncio.Future[Any]) -> Any:
@@ -120,6 +132,29 @@ class FakeClock:
             await asyncio.sleep(0)
             return
         await self._park(self._now + seconds)
+
+    def timer(self, deadline: float) -> asyncio.Future[None]:
+        """A future resolved when virtual time reaches ``deadline``.
+
+        No task runs it; it counts among ``sleepers`` until it resolves or
+        is cancelled.
+        """
+        future: asyncio.Future[None] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if deadline <= self._now:
+            future.set_result(None)
+            return future
+        entry = (deadline, next(self._order), future)
+        heapq.heappush(self._sleepers, entry)
+
+        def forget(_: asyncio.Future[None]) -> None:
+            if entry in self._sleepers:
+                self._sleepers.remove(entry)
+                heapq.heapify(self._sleepers)
+
+        future.add_done_callback(forget)
+        return future
 
     async def _park(self, wake: float) -> None:
         """Wait until virtual time reaches the absolute ``wake``."""

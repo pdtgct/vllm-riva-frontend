@@ -264,6 +264,199 @@ async def test_after_settle_listener_stop_then_collector_end_then_drain_d(
     assert stop_at < collector_at < drain_at, events
 
 
+# @spec ING-EP-066, ING-EP-100, ING-EP-093
+async def test_a_collector_end_blocked_past_d_does_not_hold_the_settlement(
+    started, fake_factory, clock, helpers, monkeypatch
+) -> None:
+    """The graceful work's wait for the collector's end is bounded by ``D``.
+
+    The collector does not take the graceful work's stop signal: at ``D``
+    the drain stops waiting for it, skips ``factory.drain(D)`` and its
+    settlement begins; the settlement's own signal then ends the collector,
+    which is never cancelled.
+    """
+    plugin, state = started
+    collector = plugin._collector
+    real_request_stop = collector.request_stop
+    signals: list[float] = []
+
+    def request_stop() -> None:
+        signals.append(clock.monotonic())
+        if len(signals) > 1:
+            real_request_stop()  # the settlement's signal is taken
+
+    monkeypatch.setattr(collector, "request_stop", request_stop)
+    events: list[Any] = []
+    spy_factory(fake_factory, monkeypatch, events, clock)
+    watch_collector(plugin, events, clock)
+    t0 = clock.monotonic()
+    deadline = t0 + 15  # timeout 20 less the 5 s reserve
+    task = helpers.begin_drain(plugin, state, 20)
+    await clock.advance(14.5)  # past the settle point at t0 + 11.25
+    await helpers.settle_until(clock, lambda: len(signals) == 1)
+    assert signals[0] < deadline
+    assert not plugin.send_bounds_passed, "the settlement began before D"
+    assert not plugin.fault_collector.done()
+    assert not task.done()
+    await clock.advance(1.0)  # past D
+    await helpers.drive(clock, task)
+    assert len(signals) == 2, "the settlement signals the collector again"
+    assert signals[1] >= deadline, "the settlement began before D"
+    collector_at = first(events, "collector.end")
+    assert events[collector_at][1] is False, "the collector was cancelled"
+    assert events[collector_at][2] >= deadline
+    settle_at = first(events, "factory.drain", arg=math.inf)
+    assert collector_at < settle_at, events
+    assert not any(
+        e[0] == "factory.drain" and e[1] == deadline for e in events
+    ), "factory.drain(D) ran although the collector had not ended"
+    helpers.factory_settlement(fake_factory)
+
+
+# @spec ING-EP-066, ING-EP-093, ING-EP-110
+async def test_a_factory_drain_blocked_past_d_does_not_hold_the_settlement(
+    started, fake_factory, clock, helpers, monkeypatch
+) -> None:
+    """The factory wait of the graceful work is bounded by ``D``.
+
+    ``factory.drain(D)`` does not return: at ``D`` the drain stops waiting
+    for it (it is not cancelled) and its settlement begins, cancelling the
+    owners; the settlement then still awaits the blocked call before the
+    factory settlement runs.
+    """
+    plugin, state = started
+    real_drain = fake_factory.drain
+    entered, release = asyncio.Event(), asyncio.Event()
+    cancelled: list[bool] = []
+    t0 = clock.monotonic()
+    deadline = t0 + 15  # timeout 20 less the 5 s reserve
+
+    async def drain(at):
+        if at == deadline:
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+        return await real_drain(at)
+
+    monkeypatch.setattr(fake_factory, "drain", drain)
+    task = helpers.begin_drain(plugin, state, 20)
+    await clock.advance(12)  # past the settle point at t0 + 11.25
+    await helpers.settle_until(clock, entered.is_set)
+    owner, _ = helpers.register_dummy(plugin, "file_route")
+    await clock.advance(deadline - clock.monotonic() - 0.5)
+    assert not plugin.send_bounds_passed, "the settlement began before D"
+    assert not owner.done()
+    await clock.advance(1.0)  # past D
+    await helpers.settle_until(clock, lambda: plugin.send_bounds_passed)
+    await helpers.settle_until(clock, owner.done)
+    assert owner.cancelled(), "the settlement did not cancel the owners at D"
+    assert not task.done(), "the settlement does not await the blocked call"
+    assert inf_drains(fake_factory) == 0, "factory settled before the call"
+    release.set()
+    await helpers.drive(clock, task)
+    assert cancelled == [], "the factory drain was cancelled"
+    helpers.factory_settlement(fake_factory)
+
+
+# @spec ING-EP-076, ING-EP-093, ING-EP-066
+@pytest.mark.parametrize("late", ["raises", "cancelled"])
+async def test_a_factory_drain_failing_after_d_settles_then_propagates(
+    started, fake_factory, clock, helpers, monkeypatch, late
+) -> None:
+    """A late ``factory.drain(D)`` outcome is kept until settlement ends.
+
+    The call is still running at ``D``, so the settlement begins and awaits
+    it. It then raises, or ends cancelled: the settlement still runs the
+    factory settlement, and only then does ``drain`` propagate that outcome
+    (ING-EP-076).
+    """
+    plugin, state = started
+    real_drain = fake_factory.drain
+    entered, release = asyncio.Event(), asyncio.Event()
+    deadline = clock.monotonic() + 15  # timeout 20 less the 5 s reserve
+
+    async def drain(at):
+        if at == deadline:
+            entered.set()
+            await release.wait()
+            if late == "raises":
+                raise RuntimeError("factory.drain(D) failed late")
+            raise asyncio.CancelledError
+        return await real_drain(at)
+
+    monkeypatch.setattr(fake_factory, "drain", drain)
+    task = helpers.begin_drain(plugin, state, 20)
+    await clock.advance(12)  # past the settle point at t0 + 11.25
+    await helpers.settle_until(clock, entered.is_set)
+    await clock.advance(deadline - clock.monotonic() + 0.5)  # past D
+    await helpers.settle_until(clock, lambda: plugin.send_bounds_passed)
+    assert not task.done(), "the settlement awaits the late call"
+    assert inf_drains(fake_factory) == 0, "factory settled before the call"
+    release.set()
+    expected = RuntimeError if late == "raises" else asyncio.CancelledError
+    with pytest.raises(expected):
+        await helpers.drive(clock, task)
+    helpers.factory_settlement(fake_factory)
+    assert not plugin.registry.records
+
+
+# @spec ING-EP-076, ING-EP-093, ING-EP-066
+async def test_a_late_factory_drain_failure_is_logged_when_drain_is_cancelled(
+    started, fake_factory, clock, helpers, monkeypatch, caplog
+) -> None:
+    """``drain`` cancelled during the settlement re-raises its cancellation.
+
+    The ``factory.drain(D)`` call is still running at ``D``; ``drain`` is
+    cancelled while the settlement awaits it, and the call then raises. The
+    settlement still runs the factory settlement, ``drain`` raises
+    ``CancelledError``, and the late failure is logged once (ING-EP-076).
+    """
+    caplog.set_level(logging.ERROR)
+    plugin, state = started
+    real_drain = fake_factory.drain
+    entered, release = asyncio.Event(), asyncio.Event()
+    deadline = clock.monotonic() + 15  # timeout 20 less the 5 s reserve
+
+    async def drain(at):
+        if at == deadline:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("factory.drain(D) failed late")
+        return await real_drain(at)
+
+    monkeypatch.setattr(fake_factory, "drain", drain)
+    task = helpers.begin_drain(plugin, state, 20)
+    await clock.advance(12)  # past the settle point at t0 + 11.25
+    await helpers.settle_until(clock, entered.is_set)
+    await clock.advance(deadline - clock.monotonic() + 0.5)  # past D
+    await helpers.settle_until(clock, lambda: plugin.send_bounds_passed)
+    assert not task.done(), "the settlement awaits the late call"
+    task.cancel()
+    await clock.settle(5)
+    assert not task.done(), "the cancellation interrupted the settlement"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await helpers.drive(clock, task)
+    helpers.factory_settlement(fake_factory)
+    assert not plugin.registry.records
+    reports = [
+        record
+        for record in caplog.records
+        if "factory.drain(D) failed" in record.getMessage()
+    ]
+    assert len(reports) == 1, [r.getMessage() for r in caplog.records]
+    assert reports[0].exc_info is not None
+    assert isinstance(reports[0].exc_info[1], RuntimeError)
+
+
+def inf_drains(factory: Any) -> int:
+    """How many ``drain(math.inf)`` calls the factory has had."""
+    return sum(1 for at in factory.drains if at == math.inf)
+
+
 # @spec ING-EP-037, ING-EP-066
 @OUTLASTS_DRAIN
 async def test_shutdown_finalization_failing_by_d_aborts_with_unavailable(
@@ -551,6 +744,45 @@ async def test_settlement_ends_clipping_and_makes_send_bounds_passed(
     assert status.code is grpc.StatusCode.UNAVAILABLE
 
 
+# @spec ING-EP-110, ING-LIFE-061
+@pytest.mark.parametrize("graceful", [False, True])
+async def test_send_bounds_pass_only_for_the_rest_of_that_drain_call(
+    started, clock, helpers, graceful
+) -> None:
+    """After ``drain`` returns, a send gets its ordinary bound again.
+
+    The send bounds count as passed for the rest of the ``drain`` call
+    whose settlement began (or that skipped its graceful steps); once that
+    call has returned, a refusal send is bounded by
+    ``response_send_timeout``, until ``stop`` makes every bound pass.
+    """
+    from vllm_riva_frontend import surfaces
+
+    plugin, state = started
+    timeout = 20 if graceful else 4  # 4 s is within the reserve
+    await helpers.drive(clock, helpers.begin_drain(plugin, state, timeout))
+    assert not plugin.send_bounds_passed, "the drain's latch outlived it"
+    assert plugin.drain_deadline is None
+    assert not plugin.drain_announced().done()
+    stalled = asyncio.Event()
+
+    async def send() -> None:
+        await stalled.wait()
+
+    sending = asyncio.ensure_future(
+        surfaces.bounded_send(plugin, send(), terminal=True)
+    )
+    await clock.settle()
+    bound = plugin.config.response_send_timeout
+    await clock.advance(bound - 1)
+    assert not sending.done(), "the send did not get its ordinary bound"
+    await clock.advance(2)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sending, 2)
+    await helpers.drive(clock, plugin.stop(state))
+    assert plugin.send_bounds_passed, "every bound passes from stop on"
+
+
 # @spec ING-EP-110, ING-EP-079
 @pytest.mark.parametrize("surface", ["realtime", "file_route"])
 async def test_terminal_attempt_covers_whole_response(
@@ -566,13 +798,38 @@ async def test_terminal_attempt_covers_whole_response(
     call = CallBlock()
     if surface == "realtime":
         client = RealtimeClient(test_app, clock)
-        await client.open_session(helpers.realtime_update()["session"])
-        await helpers.drive(clock, plugin.stop(state))
-        events = await client.outcome()
+        # Each ASGI message the app sends, with the event-loop pass it left
+        # in: one terminal attempt sends its messages with no wait between.
+        passes = [0]
+        sent: list[tuple[str, int]] = []
+        inner_send = client.ws._send
+
+        async def recording_send(message):
+            sent.append((message["type"], passes[0]))
+            await inner_send(message)
+
+        async def count_passes():
+            while True:
+                passes[0] += 1
+                await asyncio.sleep(0)
+
+        client.ws._send = recording_send  # type: ignore[method-assign]
+        ticker = asyncio.ensure_future(count_passes())
+        try:
+            await client.open_session(helpers.realtime_update()["session"])
+            await helpers.drive(clock, plugin.stop(state))
+            events = await client.outcome()
+        finally:
+            ticker.cancel()
         types = [event["type"] for event in events]
         assert types[-1] == CLOSE, types
         assert types[-2] in (ERROR, FAILED), (
             "the terminal event and its close are one attempt"
+        )
+        (_, error_pass), (close_type, close_pass) = sent[-2:]
+        assert close_type == "websocket.close", sent
+        assert close_pass == error_pass, (
+            "the close waited for its own attempt after the terminal event"
         )
         return
     fake_transcription.script(call)

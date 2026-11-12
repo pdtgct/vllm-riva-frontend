@@ -742,7 +742,7 @@ async def test_a_terminal_error_stalled_before_the_drain_ends_by_d(
 
 # @spec ING-LIFE-061, ING-NIMWS-028, ING-ERR-015
 async def test_a_blocked_refusal_ends_by_an_earlier_d(
-    realtime, test_app, drain_trigger, started
+    realtime, test_app, drain_trigger, started, fake_factory
 ):
     started.ingress.close()  # refused before any drain begins
     ws = BlockingSendWebSocket(test_app, REALTIME_URL)
@@ -754,15 +754,24 @@ async def test_a_blocked_refusal_ends_by_an_earlier_d(
     assert json.loads(ws.parked[0]["text"])["type"] == ERROR
     assert len(started.registry.records) == 0
 
-    # The refusal's own bound (60 s) is far off; a drain then sets D = +3 s.
-    _, deadline = await drain_trigger()
-    assert not ws.done
-    await session.advance(deadline - started.clock.monotonic() + 0.01)
+    # A factory drain kept busy until released keeps the drain in its
+    # graceful work until D (that wait is bounded by D, ING-EP-066), so no
+    # settlement begins earlier: the refusal is ended by its bound clipped
+    # to D.
+    busy = Block()
+    fake_factory.script("drain", busy)
+    try:
+        # The refusal's own bound (60 s) is far off; a drain sets D = +3 s.
+        _, deadline = await drain_trigger()
+        assert not ws.done
+        await session.advance(deadline - started.clock.monotonic() + 0.01)
 
-    assert ws.done, "the refusal outlived D"
-    ws.unblocked.set()
-    await session.settle()
-    assert ws.stalled == 1  # the 1013 close was not sent after it
+        assert ws.done, "the refusal outlived D"
+        ws.unblocked.set()
+        await session.settle()
+        assert ws.stalled == 1  # the 1013 close was not sent after it
+    finally:
+        busy.release()
 
 
 # @spec ING-LIFE-061

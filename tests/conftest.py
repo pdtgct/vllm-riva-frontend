@@ -14,7 +14,9 @@
 from __future__ import annotations
 
 import importlib
+import signal
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -50,6 +52,51 @@ REAL_FACTORY = _importable("vllm_nemotron_asr_streaming.session")
 #: before it fails the test as a settlement hang (generous: a conforming
 #: stop under the fakes ends in well under a second).
 STOP_BOUND = 30.0
+
+
+#: Real seconds a CPU test (setup, call and teardown together) may run
+#: before it fails as a hang. The plugin's settlement has no time limit by
+#: design (ING-EP-093), so a settlement that never ends would otherwise
+#: stall the run instead of failing the test. An expired test leaves tasks
+#: behind that would corrupt later tests, so expiry also stops the session.
+#: GPU and real-factory tests are not bounded.
+TEST_REAL_TIME_BOUND = 120
+
+
+class _RealTimeBoundExceeded(BaseException):
+    """Raised by the alarm; a BaseException so no handler swallows it."""
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    bounded = (
+        hasattr(signal, "SIGALRM")
+        and threading.current_thread() is threading.main_thread()
+        and "gpu" not in item.keywords
+        and "real_factory" not in item.keywords
+    )
+    if not bounded:
+        yield
+        return
+
+    def _expire(signum: int, frame: object) -> None:
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        item.session.shouldstop = (
+            f"{item.nodeid} exceeded the real-time bound; later results "
+            "would be unreliable"
+        )
+        raise _RealTimeBoundExceeded(
+            f"{item.nodeid} ran past {TEST_REAL_TIME_BOUND} s of real time "
+            "(a settlement or wait that never ends)"
+        )
+
+    previous = signal.signal(signal.SIGALRM, _expire)
+    signal.alarm(TEST_REAL_TIME_BOUND)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def pytest_configure(config: pytest.Config) -> None:

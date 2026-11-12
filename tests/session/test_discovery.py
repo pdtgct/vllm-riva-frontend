@@ -12,11 +12,19 @@ from support.fake_session import FakeSessionFactory, fake_entry_points
 from .conftest import failure_text, startup_failure
 
 
+def _teardown(factory):
+    """A ``discard`` that tears the factory down, as the tests observe it."""
+    factory.teardown_all()
+
+
 def _discover(engine, entry_points, selected=None):
     from vllm_riva_frontend.lease import discover_session_factory
 
     return discover_session_factory(
-        engine, selected=selected, entry_points=entry_points
+        engine,
+        selected=selected,
+        entry_points=entry_points,
+        discard=_teardown,
     )
 
 

@@ -17,9 +17,6 @@ from typing import Any
 
 import grpc
 
-#: The prefix with which the model plugin begins its token-budget refusal.
-MODEL_LEN_PREFIX = "file exceeds max_model_len: "
-
 #: Seam reasons that also escalate to a requested shutdown.
 ESCALATES = frozenset({"engine_dead"})
 
@@ -177,7 +174,7 @@ class ErrorCatalog:
         """Every catalog code."""
         return tuple(_ROWS)
 
-    # @spec ING-ERR-031, ING-ERR-042, ING-ERR-043, ING-ERR-046
+    # @spec ING-ERR-031, ING-ERR-060, ING-ERR-043, ING-ERR-046
     def grpc_status(self, code: str) -> grpc.StatusCode:
         """Return the gRPC status of ``code``.
 
@@ -247,7 +244,7 @@ def _http_error_type(status: int) -> str:
 class FrontendError(Exception):
     """A failure carrying one catalog code, projected by every surface."""
 
-    # @spec ING-ERR-003, ING-ERR-042
+    # @spec ING-ERR-003, ING-ERR-060
     def __init__(
         self,
         code: str,
@@ -279,7 +276,7 @@ class FrontendError(Exception):
         """Return ``<code>: <detail>``, the text every dialect leads with."""
         return f"{self.code}: {self._text()}"
 
-    # @spec ING-ERR-029, ING-ERR-003
+    # @spec ING-ERR-064, ING-ERR-003
     def grpc_details(self) -> str:
         """Return ``<code>: <detail>``, then ``(fields: ...)`` when named."""
         if not self.fields:
@@ -320,6 +317,7 @@ def seam_error(exc: BaseException) -> tuple[str | None, str | None]:
     )
 
 
+# @spec ING-ERR-063
 def _refused(reason: str) -> FrontendError:
     if reason == "locale":
         return FrontendError("unknown_locale", "the locale is not served")
@@ -415,7 +413,7 @@ def _is_core_error(exc: BaseException, module: str, name: str) -> bool:
     return isinstance(exc, cls)
 
 
-# @spec ING-ERR-052, ING-ERR-053, ING-ERR-054, ING-ERR-039, ING-ERR-040
+# @spec ING-ERR-052, ING-ERR-053, ING-ERR-039, ING-ERR-040, ING-FILE-081
 def classify_core_exception(exc: BaseException) -> FrontendError:
     """Map an exception raised by core's transcription service to a code."""
     if _is_core_error(exc, "vllm.exceptions", "VLLMValidationError"):
@@ -429,13 +427,13 @@ def classify_core_exception(exc: BaseException) -> FrontendError:
         return FrontendError("service_unavailable", "the engine is dead")
     if isinstance(exc, ValueError):
         message = str(exc)
-        if message.startswith(MODEL_LEN_PREFIX):
-            return FrontendError("request_too_large", message)
         if message.startswith(_DECODE_LIMIT_PREFIXES):
             return FrontendError("request_too_large", message)
         if message.startswith(_DECODE_INVALID_PREFIXES):
             return FrontendError("invalid_audio", message)
-        # Core's own ValueError handler answers 400, never a server error.
+        # No length refusal is projected (ING-FILE-081): a message about the
+        # model length is one more unmatched ValueError. Core's own handler
+        # answers 400, never a server error.
         return FrontendError("invalid_config_field", message)
     return FrontendError("internal", f"unexpected {type(exc).__name__}")
 

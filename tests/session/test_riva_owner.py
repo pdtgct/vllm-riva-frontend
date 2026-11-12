@@ -924,7 +924,7 @@ async def test_a_status_stalled_before_the_drain_ends_by_d(
 
 # @spec ING-LIFE-061, ING-ERR-015
 async def test_a_blocked_refusal_ends_by_an_earlier_d(
-    riva, started, drain_trigger
+    riva, started, drain_trigger, fake_factory
 ):
     started.ingress.close()  # refused before any drain begins
     refused = riva(start=False)
@@ -933,15 +933,24 @@ async def test_a_blocked_refusal_ends_by_an_earlier_d(
     await refused.until(lambda: refused.context.stalled == 1, what="refusal")
     assert len(started.registry.records) == 0
 
-    # The refusal's own bound (60 s) is far off; a drain then sets D = +3 s.
-    _, deadline = await drain_trigger()
-    assert not refused.done
-    await refused.advance(deadline - refused.clock.monotonic() + 0.01)
+    # A factory drain kept busy until released keeps the drain in its
+    # graceful work until D (that wait is bounded by D, ING-EP-066), so no
+    # settlement begins earlier: the refusal is ended by its bound clipped
+    # to D.
+    busy = Block()
+    fake_factory.script("drain", busy)
+    try:
+        # The refusal's own bound (60 s) is far off; a drain sets D = +3 s.
+        _, deadline = await drain_trigger()
+        assert not refused.done
+        await refused.advance(deadline - refused.clock.monotonic() + 0.01)
 
-    assert refused.done, "the refusal outlived D"
-    await refused.wait()
-    assert refused.abandoned and refused.context.aborts == []
-    assert refused.requests.pulls == 0
+        assert refused.done, "the refusal outlived D"
+        await refused.wait()
+        assert refused.abandoned and refused.context.aborts == []
+        assert refused.requests.pulls == 0
+    finally:
+        busy.release()
 
 
 # @spec ING-LIFE-061

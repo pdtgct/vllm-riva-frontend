@@ -1,9 +1,10 @@
-"""The Riva Realtime WebSocket surface: dispatcher, bootstrap and adapter.
+"""The Riva Realtime WebSocket surface: route, bootstrap and adapter.
 
-``RealtimeDispatcher`` is the pure-ASGI middleware ``attach_router`` adds
-inside core's middleware. It claims exactly ``/v1/realtime?intent=
-transcription`` WebSockets and passes every other scope to core unchanged. A
-claimed connection is served by ``RealtimeAdapter``, which translates the
+``RealtimeRoute`` is the ASGI app of the WebSocket route
+``/plugins/riva/v1/realtime`` (``routes.REALTIME_PATH``) and
+``bootstrap_endpoint`` the handler of the bootstrap ``POST``; ``attach_router``
+registers both. The route serves only the exact query
+``intent=transcription``, through ``RealtimeAdapter``, which translates the
 dialect's events straight to one ``lease.StreamOwner`` and projects the
 owner's results and its one terminal cause back as events and a close.
 
@@ -16,10 +17,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
-from enum import Enum
 from types import MappingProxyType
 from typing import Any, TypeVar
 from urllib.parse import unquote_to_bytes
@@ -32,9 +33,6 @@ Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
 Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
-
-BOOTSTRAP_PATH = "/v1/realtime/transcription_sessions"
-REALTIME_PATH = "/v1/realtime"
 
 UPDATE = "transcription_session.update"
 APPEND = "input_audio_buffer.append"
@@ -130,14 +128,7 @@ def _hex_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
-# =============================================================== dispatcher
-
-
-class DispatchDecision(Enum):
-    """What the dispatcher does with one ASGI scope."""
-
-    CLAIM = "claim"
-    PASS = "pass"
+# ==================================================================== route
 
 
 def _strict_unquote(raw: bytes) -> str | None:
@@ -170,57 +161,75 @@ def _query_pairs(query: bytes) -> list[tuple[str, str | None]] | None:
     return pairs
 
 
-# @spec ING-NIMWS-011, ING-NIMWS-019
-def dispatch_decision(scope: Mapping[str, Any]) -> DispatchDecision:
-    """``CLAIM`` only the exact Riva Realtime transcription connection.
-
-    The scope must be a WebSocket at exactly ``/v1/realtime`` (after
-    ``root_path``) whose query decodes strictly to the one pair
-    ``intent=transcription``; everything else is core's.
-    """
-    if scope.get("type") != "websocket":
-        return DispatchDecision.PASS
-    path = str(scope.get("path", ""))
-    root = str(scope.get("root_path", "") or "")
-    if root and path.startswith(root):
-        path = path[len(root) :]
-    if path != REALTIME_PATH:
-        return DispatchDecision.PASS
+def _serves_query(scope: Mapping[str, Any]) -> bool:
+    """Whether the query decodes strictly to just ``intent=transcription``."""
     query = scope.get("query_string", b"")
     if not isinstance(query, bytes | bytearray):
-        return DispatchDecision.PASS
-    pairs = _query_pairs(bytes(query))
-    if pairs == [("intent", "transcription")]:
-        return DispatchDecision.CLAIM
-    return DispatchDecision.PASS
+        return False
+    return _query_pairs(bytes(query)) == [("intent", "transcription")]
 
 
-class RealtimeDispatcher:
-    """Pure-ASGI middleware: claimed scopes go to the adapter, others pass."""
+class RealtimeRoute:
+    """The ASGI app of the WebSocket route ``/plugins/riva/v1/realtime``.
 
-    def __init__(self, app: Callable[..., Awaitable[None]], *, plugin: Any):
-        """Wrap ``app`` (core's stack below this middleware) for ``plugin``."""
-        self.app = app
+    ``attach_router`` registers it under the plugin prefix, so it runs
+    inside core's middleware (WebSocket metrics included); core's own
+    ``/v1/realtime`` route is not touched.
+    """
+
+    def __init__(self, plugin: Any) -> None:
+        """Bind the route to ``plugin``."""
         self.plugin = plugin
 
-    # @spec ING-NIMWS-011, ING-NIMWS-019
+    # @spec ING-NIMWS-026, ING-NIMWS-027, ING-SHIM-022, ING-EP-095
     async def __call__(
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
-        """Serve a claimed scope with the adapter; pass any other unchanged."""
-        if dispatch_decision(scope) is DispatchDecision.CLAIM:
-            adapter = RealtimeAdapter(
-                plugin=self.plugin, scope=scope, receive=receive, send=send
-            )
-            await adapter.run()
+        """Serve a connection with the exact query; refuse any other.
+
+        The query check is the first step, before the ingress cap: any
+        other query is closed with 1008 before accept (the ASGI server's
+        HTTP 403), a refusal send that creates no owner and is one terminal
+        attempt once its bound has passed; nothing is read and no
+        ingress-cap count is taken.
+        """
+        if not _serves_query(scope):
+            close: Message = {"type": "websocket.close", "code": 1008}
+            with contextlib.suppress(Exception):
+                await surfaces.bounded_send(
+                    self.plugin, send(close), terminal=True
+                )
             return
-        await self.app(scope, receive, send)
+        adapter = RealtimeAdapter(
+            plugin=self.plugin, scope=scope, receive=receive, send=send
+        )
+        await adapter.run()
+
+
+def bootstrap_endpoint(plugin: Any) -> Callable[[], Awaitable[Any]]:
+    """The handler of the Realtime bootstrap ``POST`` route."""
+    from fastapi.responses import JSONResponse
+
+    # @spec ING-NIMWS-025, ING-LIFE-045
+    async def realtime_transcription_sessions() -> JSONResponse:
+        """HTTP 200 and the default session object, in any plugin state.
+
+        It creates no owner and starts no timer; a plugin that is not
+        serving refuses on the WebSocket route instead (ING-NIMWS-028).
+        """
+        factory = plugin.factory
+        default_locale = None if factory is None else factory.default_locale
+        return JSONResponse(
+            bootstrap_session(plugin.served_model or "", default_locale)
+        )
+
+    return realtime_transcription_sessions
 
 
 # ================================================================ bootstrap
 
 
-# @spec ING-NIMWS-001, ING-NIMWS-013, ING-NIMWS-020
+# @spec ING-NIMWS-025, ING-NIMWS-013, ING-NIMWS-020
 def bootstrap_session(
     model_name: str, default_locale: str | None
 ) -> dict[str, Any]:
@@ -290,6 +299,7 @@ def _error_object(error: errors.FrontendError) -> dict[str, Any]:
 
 # @spec ING-ERR-016, ING-ERR-017, ING-ERR-018, ING-ERR-019, ING-ERR-020
 # @spec ING-ERR-022, ING-ERR-023, ING-ERR-024, ING-ERR-026, ING-ERR-048
+# @spec ING-ERR-062, ING-ERR-063
 def _ending(
     catalog: Any, error: errors.FrontendError, owner: Any
 ) -> tuple[str, int]:
@@ -298,7 +308,9 @@ def _ending(
     ``service_unavailable`` closes 1012 for the shutdown abort row (the
     owner was in provisional shutdown mode, or the drain deadline came
     first), 1013 for an engine refusal before configuration, and 1011 after
-    a lease-call timeout or ``engine_dead``.
+    a lease-call timeout or ``engine_dead``. A refusal of ``open`` (the
+    factory phase) is an ``error`` event, never ``failed``: ``cadence`` and
+    ``request_id_in_use`` close 1011 with ``internal``.
     """
     code = error.code
     cause = owner.cause if owner is not None else None
@@ -314,7 +326,8 @@ def _ending(
         if phase == "factory":
             return _ERROR, 1013
         return (_FAILED if phase == "engine" else _ERROR), 1011
-    event = _FAILED if code in ("internal", "invalid_audio") else _ERROR
+    failing = code in ("internal", "invalid_audio") and phase != "factory"
+    event = _FAILED if failing else _ERROR
     if code in ("invalid_audio", "unsupported_format"):
         return event, 1008
     if code == "internal":
@@ -679,7 +692,7 @@ class RealtimeAdapter:
 
     # ------------------------------------------------------------- entry
 
-    # @spec ING-NIMWS-016, ING-NIMWS-021, ING-ERR-015, ING-ERR-051
+    # @spec ING-NIMWS-028, ING-NIMWS-029, ING-ERR-015, ING-ERR-051
     async def run(self) -> None:
         """Admit or refuse the connection, then serve it to its one end."""
         plugin = self._plugin
@@ -722,17 +735,39 @@ class RealtimeAdapter:
         finally:
             surfaces.release_owner(registry, record, admitted)
 
+    # @spec ING-NIMWS-028, ING-EP-095, ING-EP-110, ING-LIFE-061
     async def _refuse(self, error: errors.FrontendError) -> None:
-        """Accept, send the one ``error``, close 1013: no owner, no read."""
+        """Accept, send the one ``error``, close 1013: no owner, no read.
+
+        The three messages are one refusal send that creates no owner: one
+        bound (``response_send_timeout``, clipped to ``D``), and once that
+        bound has passed one terminal attempt for the whole sequence. A
+        failed or abandoned refusal starts no further frame.
+        """
+        event = json.dumps(
+            project_event({"type": _ERROR, "error": _error_object(error)})
+        )
+        messages: tuple[Message, ...] = (
+            {"type": "websocket.accept"},
+            {"type": "websocket.send", "text": event},
+            {"type": "websocket.close", "code": 1013},
+        )
+
+        async def sequence() -> None:
+            for message in messages:
+                await self._send(message)
+
         try:
-            await self._send_bounded({"type": "websocket.accept"})
-            await self._emit_error(_ERROR, error, terminal=True)
-            await self._close(1013, terminal=True)
-        except _Gone:
+            await surfaces.bounded_send(self._plugin, sequence(), terminal=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._gone = True
             return
+        self._closed = True
 
     # @spec ING-NIMWS-017, ING-NIMWS-023, ING-ERR-005, ING-ERR-011
-    # @spec ING-ERR-027, ING-ERR-033, ING-ERR-034, ING-ERR-059
+    # @spec ING-ERR-027, ING-ERR-033, ING-ERR-034, ING-ERR-062
     async def _serve(self) -> None:
         try:
             await self._send_bounded({"type": "websocket.accept"})
@@ -770,27 +805,43 @@ class RealtimeAdapter:
                 "engine",
             )
 
+    # @spec ING-EP-110, ING-LIFE-061
     async def _terminate(
         self, error: errors.FrontendError, phase: str = "protocol"
     ) -> None:
-        """Settle the owner's one cause, then project it and close."""
+        """Settle the owner's one cause, then project it and close.
+
+        The terminal event and the close that follows it are sent in
+        sequence as one send under one bound and, once that bound has
+        passed, as one terminal attempt (ING-EP-110), as ``_refuse`` sends
+        its refusal.
+        """
         owner = self._owner
         await surfaces.settle(owner, error, phase)
         error = surfaces.selected_error(owner, error)
         if self._gone or self._closed:
             return
         event, close = _ending(self._plugin.catalog, error, owner)
+        text = json.dumps(project_event(self._error_event(event, error)))
+        messages: tuple[Message, ...] = (
+            {"type": "websocket.send", "text": text},
+            {"type": "websocket.close", "code": close},
+        )
+
+        async def sequence() -> None:
+            for message in messages:
+                await self._send(message)
+
         try:
-            await self._emit_error(event, error, terminal=True)
-            await self._close(close, terminal=True)
+            await self._bounded(sequence(), terminal=True)
         except _Gone:
             return
+        self._closed = True
 
     async def _abandon(self) -> None:
         """The transport is gone: clean up and send nothing more."""
         self._gone = True
         await surfaces.settle_shielded(
-            self._plugin,
             self._record,
             self._owner,
             errors.FrontendError("internal", "the transport is gone"),
@@ -807,7 +858,7 @@ class RealtimeAdapter:
             "service_unavailable", "the server is shutting down"
         )
         await surfaces.settle_shielded(
-            self._plugin, self._record, self._owner, shutdown, "shutdown"
+            self._record, self._owner, shutdown, "shutdown"
         )
         task = asyncio.current_task()
         if task is not None and task.cancelling():
@@ -816,25 +867,23 @@ class RealtimeAdapter:
 
     # ------------------------------------------------------------- sends
 
-    async def _send_bounded(
-        self, message: Message, *, terminal: bool = False
-    ) -> None:
+    async def _send_bounded(self, message: Message) -> None:
         """One send or close under the send bound (``bounded_send``).
 
         A send that exceeds it, or fails, ends the connection by the
-        transport path: nothing further is sent, the close included. Only
-        a terminal error event and its close (``terminal``) are attempted
-        once the bound has passed; any other send then never starts.
+        transport path: nothing further is sent, the close included. Once
+        the bound has passed such a send never starts; only the terminal
+        error event and its close (``_terminate``) are then attempted.
         """
         if self._gone or self._closed:
             raise _Gone
+        await self._bounded(self._send(message), terminal=False)
+
+    async def _bounded(self, send: Awaitable[None], *, terminal: bool) -> None:
+        """``send``, one message or the terminal sequence, under one bound."""
         try:
             await surfaces.bounded_send(
-                self._plugin,
-                self._send(message),
-                owner=self._owner,
-                record=self._record,
-                terminal=terminal,
+                self._plugin, send, record=self._record, terminal=terminal
             )
         except asyncio.CancelledError:
             raise
@@ -845,27 +894,24 @@ class RealtimeAdapter:
     async def _emit(self, kind: str, **fields: Any) -> None:
         await self._send_event({"type": kind, **fields})
 
-    async def _send_event(
-        self, event: dict[str, Any], *, terminal: bool = False
-    ) -> None:
+    async def _send_event(self, event: dict[str, Any]) -> None:
         text = json.dumps(project_event(event))
-        await self._send_bounded(
-            {"type": "websocket.send", "text": text}, terminal=terminal
-        )
+        await self._send_bounded({"type": "websocket.send", "text": text})
 
-    async def _emit_error(
-        self, kind: str, error: errors.FrontendError, *, terminal: bool = False
-    ) -> None:
-        """An error event; ``terminal`` for the one that ends the session."""
+    async def _emit_error(self, kind: str, error: errors.FrontendError) -> None:
+        """A non-terminal error event; the session continues."""
+        await self._send_event(self._error_event(kind, error))
+
+    def _error_event(
+        self, kind: str, error: errors.FrontendError
+    ) -> dict[str, Any]:
         event: dict[str, Any] = {"type": kind, "error": _error_object(error)}
         if kind == _FAILED:
             event.update(item_id=self._item_id, content_index=0)
-        await self._send_event(event, terminal=terminal)
+        return event
 
-    async def _close(self, code: int, *, terminal: bool = False) -> None:
-        await self._send_bounded(
-            {"type": "websocket.close", "code": code}, terminal=terminal
-        )
+    async def _close(self, code: int) -> None:
+        await self._send_bounded({"type": "websocket.close", "code": code})
         self._closed = True
 
     # ------------------------------------------------------------- reads
@@ -969,8 +1015,9 @@ class RealtimeAdapter:
 
     # ------------------------------------------------------ configuration
 
-    # @spec ING-NIMWS-021, ING-NIMWS-022, ING-NIMWS-023, ING-ERR-034
+    # @spec ING-NIMWS-029, ING-NIMWS-022, ING-NIMWS-023, ING-ERR-034
     # @spec ING-CORE-021, ING-LIFE-001, ING-ERR-016, ING-VEH-007
+    # @spec ING-ERR-063
     async def _configure(self) -> None:
         """Read updates until one validates and ``open`` succeeds.
 
@@ -1011,9 +1058,20 @@ class RealtimeAdapter:
                     await self._emit_error(_ERROR, rejection)
                 continue
             audio = self._adopt(session)
-            await self._call(
-                owner.open(cadence=lease.STREAM_CADENCE, locale=self._locale)
-            )
+            try:
+                await self._call(
+                    owner.open(
+                        cadence=lease.STREAM_CADENCE, locale=self._locale
+                    )
+                )
+            except errors.FrontendError as refused:
+                # A locale refusal leaves the owner unconfigured with no
+                # cause (ING-ERR-063): an ``error`` with no close, and a
+                # corrected update within the original bound.
+                if owner.cause is not None:
+                    raise
+                await self._emit_error(_ERROR, refused)
+                continue
             if audio is not None:
                 owner.attach_frontend(audio)
             await self._emit(_UPDATED, session=self._session_object())
@@ -1082,8 +1140,13 @@ class RealtimeAdapter:
                 await self._update(event["session"])
         return False
 
+    # @spec ING-NIMWS-018, ING-LIFE-065
     async def _append(self, payload: str) -> None:
-        """Decode one append in bounded slices and feed each in turn."""
+        """Decode one append in bounded slices and feed each in turn.
+
+        Every slice of an already-read append is fed, also once the
+        shutdown trigger is observed, before shutdown finalization.
+        """
         try:
             data = base64.b64decode(payload, validate=True)
         except (binascii.Error, ValueError):
@@ -1122,8 +1185,6 @@ class RealtimeAdapter:
                         content_index=0,
                         delta=delta,
                     )
-            if owner.shutdown_observed:
-                return
 
     async def _resolve_header(self, data: bytes) -> bytes | None:
         """Buffer deferred-header bytes; return the audio once resolved."""
@@ -1269,14 +1330,11 @@ class RealtimeAdapter:
 
 
 __all__ = [
-    "BOOTSTRAP_PATH",
     "EVENT_TYPES",
-    "REALTIME_PATH",
-    "DispatchDecision",
     "RealtimeAdapter",
-    "RealtimeDispatcher",
+    "RealtimeRoute",
+    "bootstrap_endpoint",
     "bootstrap_session",
-    "dispatch_decision",
     "project_event",
     "suffix",
     "validate_session_update",

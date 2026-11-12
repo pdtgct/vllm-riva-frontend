@@ -267,6 +267,63 @@ async def test_drain_and_stop_end_collector_without_cancel(
     assert plugin.fault is fault, "its faults are recorded"
 
 
+class _CancelCountingTask(asyncio.tasks._PyTask):  # type: ignore[name-defined]
+    """A task that counts the calls to its ``cancel``."""
+
+    def __init__(self, coro, *, loop) -> None:
+        super().__init__(coro, loop=loop)
+        self.cancels = 0
+
+    def cancel(self, msg=None) -> bool:
+        self.cancels += 1
+        return super().cancel(msg)
+
+
+# @spec ING-EP-100, ING-EP-067
+@pytest.mark.parametrize("when", ["between_calls", "during_a_call"])
+async def test_collector_ends_by_its_signal_and_is_never_cancelled(
+    clock, when
+) -> None:
+    """``request_stop`` ends the collector without cancelling its task.
+
+    Between two calls the period's wait ends on the signal; during a call
+    the call completes and its faults are recorded, then the collector ends.
+    """
+    from vllm_riva_frontend.lifecycle import FaultCollector
+
+    fault = RuntimeError("collected while stopping")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[float] = []
+
+    class Factory:
+        async def drain(self, deadline):
+            calls.append(deadline)
+            entered.set()
+            await release.wait()
+            return [fault]
+
+    recorded: list[BaseException] = []
+    collector = FaultCollector(Factory(), 1.0, recorded.append, clock=clock)
+    task = _CancelCountingTask(collector.run(), loop=asyncio.get_running_loop())
+    await clock.settle()
+    if when == "during_a_call":
+        await clock.advance(1.0)
+        await asyncio.wait_for(entered.wait(), 2)
+    collector.request_stop()
+    await clock.settle()
+    if when == "during_a_call":
+        assert not task.done(), "the call in progress was cut short"
+        release.set()
+    await asyncio.wait_for(task, 2)
+    assert task.cancels == 0, "the collector was cancelled"
+    assert not task.cancelled()
+    assert clock.sleepers == 0, "the period's timer outlived the collector"
+    if when == "during_a_call":
+        assert recorded == [fault]
+    else:
+        assert calls == [] and recorded == []
+
+
 # @spec ING-EP-100
 async def test_rolled_back_start_cancels_the_collector(
     initialized, monkeypatch

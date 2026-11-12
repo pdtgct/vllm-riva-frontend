@@ -129,7 +129,11 @@ async def test_bootstrap_at_plugin_path_returns_default_object_in_any_state(
                 await served.clock.advance(49.5)  # past the settle point
         body = await _bootstrap_object(served)
         if reference is not None:
-            assert body == reference
+            # The default object, not a stable id: ``id`` is per session.
+            def without_id(obj: dict) -> dict:
+                return {k: v for k, v in obj.items() if k != "id"}
+
+            assert without_id(body) == without_id(reference)
         assert served.factory.leases == []
         if drain is not None:
             await served.clock.advance(60)

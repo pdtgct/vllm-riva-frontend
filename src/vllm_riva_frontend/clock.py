@@ -34,6 +34,15 @@ class Clock(Protocol):
         """
         ...
 
+    def timer(self, deadline: float) -> asyncio.Future[None]:
+        """Return a future resolved at the absolute ``deadline``.
+
+        No task runs it: a timer of the event loop (or of the clock)
+        resolves it, and cancelling the future cancels that timer. One
+        whose deadline has passed is resolved at once.
+        """
+        ...
+
 
 class RealClock:
     """``time.monotonic`` and asyncio: the clock the plugin uses in service."""
@@ -50,3 +59,20 @@ class RealClock:
         """Await ``awaitable`` until the absolute ``deadline``."""
         remaining = max(0.0, deadline - time.monotonic())
         return await asyncio.wait_for(awaitable, remaining)
+
+    def timer(self, deadline: float) -> asyncio.Future[None]:
+        """A future resolved by an event-loop timer at ``deadline``."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[None] = loop.create_future()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.set_result(None)
+            return future
+
+        def fire() -> None:
+            if not future.done():
+                future.set_result(None)
+
+        handle = loop.call_later(remaining, fire)
+        future.add_done_callback(lambda _: handle.cancel())
+        return future

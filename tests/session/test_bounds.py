@@ -486,3 +486,184 @@ async def test_waits_clip_to_d_only_during_graceful_drain(
     finally:
         if task is not None:
             await _ended(task)
+
+
+# ------------------------------------------------- the shared send bound
+
+
+def _send_plugin(clock, notices):
+    """A plugin stand-in for ``surfaces.bounded_send``: no drain running.
+
+    ``drain_announced`` hands out the futures in ``notices`` in order, then
+    pending ones.
+    """
+    from types import SimpleNamespace
+
+    def drain_announced():
+        if notices:
+            return notices.pop(0)
+        return asyncio.get_running_loop().create_future()
+
+    return SimpleNamespace(
+        clock=clock,
+        config=SimpleNamespace(response_send_timeout=60),
+        drain_announced=drain_announced,
+        drain_deadline=None,
+        send_bounds_passed=False,
+        torn_down=False,
+        registry=None,
+    )
+
+
+# @spec ING-LIFE-061, ING-EP-110
+async def test_a_send_completing_with_the_drain_notice_is_delivered(clock):
+    """A send that completed in time is delivered, whatever woke the caller.
+
+    The drain notice and the send complete in the same loop pass, the
+    notice first, so the caller resumes before the send's done callbacks
+    have run; the send completed within its bound and is delivered.
+    """
+    from vllm_riva_frontend import surfaces
+
+    loop = asyncio.get_running_loop()
+    notice = loop.create_future()
+    plugin = _send_plugin(clock, [notice])
+    written = loop.create_future()
+
+    async def send():
+        await written
+        return "sent"
+
+    sending = asyncio.ensure_future(
+        surfaces.bounded_send(plugin, send(), record=None)
+    )
+    await clock.settle()
+    assert not sending.done()
+    notice.set_result(None)
+    written.set_result(None)
+    assert await asyncio.wait_for(sending, 2) == "sent"
+
+
+# @spec ING-EP-106, ING-EP-095
+async def test_a_refusal_send_starts_no_task_but_the_send(clock):
+    """A refusal that creates no owner starts its send and nothing else.
+
+    The bound is a timer of the clock, not a task: while the send waits,
+    the only new task is the send itself, and it still ends at its bound.
+    """
+    from vllm_riva_frontend import surfaces
+
+    plugin = _send_plugin(clock, [])
+    stalled = asyncio.Event()
+
+    async def send():
+        await stalled.wait()
+
+    before = asyncio.all_tasks()
+    sending = asyncio.ensure_future(
+        surfaces.bounded_send(plugin, send(), record=None, terminal=True)
+    )
+    await clock.settle()
+    new = asyncio.all_tasks() - before - {sending}
+    assert len(new) == 1, f"tasks besides the send: {new}"
+    (send_task,) = new
+    await clock.advance(plugin.config.response_send_timeout + 1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sending, 2)
+    await clock.settle()
+    assert send_task.done()
+    assert clock.sleepers == 0, "the bound's timer outlived the wait"
+
+
+# @spec ING-EP-069, ING-LIFE-061
+def test_shared_helpers_take_no_vestigial_parameters():
+    """The send bound reads the plugin alone; discovery always gets ``discard``.
+
+    ``bounded_send`` takes no ``owner`` and ``settle_shielded`` no
+    ``plugin``; ``discover_session_factory`` has no default ``discard``, so
+    every caller decides how a discarded factory is settled.
+    """
+    import inspect
+
+    from vllm_riva_frontend import lease, surfaces
+
+    assert "owner" not in inspect.signature(surfaces.bounded_send).parameters
+    assert "plugin" not in (
+        inspect.signature(surfaces.settle_shielded).parameters
+    )
+    discard = inspect.signature(lease.discover_session_factory).parameters[
+        "discard"
+    ]
+    assert discard.default is inspect.Parameter.empty
+    assert not hasattr(lease, "_close_factory")
+
+
+# @spec ING-EP-106, ING-EP-100
+async def test_the_real_clock_timer_is_a_loop_timer_not_a_task():
+    """``RealClock.timer`` resolves at its deadline with no task running it.
+
+    A deadline already passed resolves at once; cancelling the future
+    cancels the loop's timer.
+    """
+    from vllm_riva_frontend.clock import RealClock
+
+    clock = RealClock()
+    before = asyncio.all_tasks()
+    passed = clock.timer(clock.monotonic() - 1)
+    assert passed.done()
+    soon = clock.timer(clock.monotonic() + 0.01)
+    later = clock.timer(clock.monotonic() + 3600)
+    assert asyncio.all_tasks() == before, "a timer started a task"
+    await asyncio.wait_for(soon, 2)
+    assert not later.done()
+    later.cancel()
+    await asyncio.sleep(0)
+    assert later.cancelled()
+
+
+# @spec ING-EP-095, ING-EP-110
+async def test_a_cancelled_terminal_refusal_attempt_reraises_after_settling(
+    clock,
+):
+    """A refusal's handler cancelled during its terminal attempt re-raises.
+
+    Every send bound has passed, so the refusal gets its one terminal
+    attempt; the handler is cancelled during that attempt's turn while the
+    send is outstanding, and the registry is closed. The handler cancels
+    the send, awaits it through its stubborn cleanup and, once it has
+    ended, re-raises the cancellation, not ``TimeoutError``.
+    """
+    from types import SimpleNamespace
+
+    from vllm_riva_frontend import surfaces
+
+    plugin = _send_plugin(clock, [])
+    plugin.send_bounds_passed = True
+    plugin.registry = SimpleNamespace(adopt_send=lambda task: False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancellations: list[bool] = []
+
+    async def send():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellations.append(True)
+            await release.wait()
+            raise
+
+    sending = asyncio.ensure_future(
+        surfaces.bounded_send(plugin, send(), record=None, terminal=True)
+    )
+    await asyncio.sleep(0)  # the attempt has started; the handler waits
+    assert not sending.done()
+    sending.cancel()
+    await clock.settle()
+    assert entered.is_set()
+    assert cancellations == [True], "the handler cancelled its send"
+    assert not sending.done(), "the handler awaits the send it cancelled"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(sending, 2)
+    assert sending.cancelled()

@@ -22,7 +22,9 @@ Principles:
   error names the option or check that failed, and a configuration error lists every failing
   option, not only the first.
 - **Every task has an owner until it ends.** The frontend starts no task outside its registry,
-  apart from the fault collector, the listener monitor and refusal sends. A refusal send runs as a
+  apart from the fault collector, the listener monitor, refusal sends and lifecycle helper tasks
+  that the lifecycle invocation starting them (`init_state`, `start`, `drain`, `stop`) retains and
+  awaits through cancellation before it exits. A refusal send runs as a
   task that its own request handler awaits inline under `response_send_timeout`, so the handler
   owns it; it enters the registry only when the handler abandons it (Owner registry, ING-EP-095).
   Engine-facing tasks belong to the model plugin's factory. `drain`, `stop` and a failed startup
@@ -259,7 +261,9 @@ middleware's registration, and the 401 body).
    constructed so far (Factory settlement) before the error propagates, so a failed `init_state`
    leaves no engine-facing task.
 
-`init_state` binds no listener and starts no task, and the factory constructor starts no task or
+`init_state` binds no listener and starts no task that outlives it (a lifecycle helper task it
+starts to settle factories after a failure is awaited, through cancellation, before it raises),
+and the factory constructor starts no task or
 session (the model plugin's constructor only records configuration and creates empty tables). A
 factory that exists when `init_state` returns is therefore inert until the first `open`. Core
 provides no hook between a completed `init_state` and `start` (it calls `stop` only for a plugin
@@ -357,11 +361,17 @@ registered before the close or handled by its own handler after it. A handler aw
 cancelled send after the close keeps awaiting it if the handler is itself cancelled, and re-raises
 that cancellation only once the send has ended, so the send is never abandoned.
 
-The frontend starts no task outside the registry, apart from three exceptions. Two are long-lived
+The frontend starts no task outside the registry, apart from four exceptions. Two are long-lived
 supervision tasks that `start` creates: the fault collector, which settlement ends before the
 factory settlement in `drain` and in `stop`, and the listener monitor, which `drain` leaves running
 and `stop` ends and awaits. The third is a refusal send, which its own request handler awaits
-inline and owns until abandonment moves it into the registry (above). The model plugin's factory
+inline and owns until abandonment moves it into the registry (above). The fourth is a lifecycle
+helper task: work a lifecycle invocation (`init_state`, `start`, `drain`, `stop`) runs as its own
+task so that a cancellation of the invocation cannot interrupt it (the settlement, a factory
+settlement, a rolled-back `start`), and a `factory.drain(D)` call that `drain` stops waiting for at
+`D`. The invocation retains each such task and awaits it through cancellation before it exits, so
+none outlives it; a late `factory.drain(D)` outcome is propagated only after the settlement
+completes (ING-EP-076). The model plugin's factory
 owns every engine-facing task of its sessions.
 
 **Ingress cap.** One finite positive cap (`load_shed_max_sessions`) counts active owners across

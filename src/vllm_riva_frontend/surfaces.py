@@ -7,7 +7,8 @@ input only through ``StreamOwner.receive``, which applies the bound of the
 owner's state (and the RPC deadline set on the owner) and raises
 ``lease.ShutdownObserved`` once the drain's trigger reached the owner; every
 terminal outcome is the owner's one selected cause. Both send through
-``bounded_send`` and wait for cleanup through ``settle_shielded``.
+``bounded_send`` (refusals that create no owner too) and wait for cleanup
+through ``settle_shielded``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import asyncio
 import contextlib
 import inspect
 import math
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Iterable
 from typing import Any, NoReturn, TypeVar
 
 from vllm_riva_frontend import errors, frontend, lease
@@ -84,7 +85,7 @@ async def settle(owner: Any, error: errors.FrontendError, phase: str) -> None:
 
 
 def child(record: Any, awaitable: Awaitable[T]) -> asyncio.Future[T]:
-    """A task owned by the stream's registry record (``stop`` reaps it)."""
+    """A task owned by the stream's record (the settlement awaits it)."""
     task = asyncio.ensure_future(awaitable)
     children = getattr(record, "children", None)
     if isinstance(children, set):
@@ -110,76 +111,78 @@ def hold(record: Any) -> None:
         record.held_by_handler = True
 
 
-def _holding(record: Any) -> asyncio.Future[Any] | None:
-    """A task that still holds ``record``: its continuation or a send."""
-    continuation: asyncio.Future[Any] | None = getattr(
-        record, "continuation", None
-    )
-    if continuation is not None and not continuation.done():
-        return continuation
-    sends: Iterable[asyncio.Future[Any]] = getattr(
-        record, "unsettled_sends", ()
-    )
-    for task in list(sends):
-        if not task.done():
-            return task
-    return None
+def _running(task: asyncio.Future[Any] | None) -> bool:
+    return task is not None and not task.done()
 
 
-# @spec ING-LIFE-058, ING-EP-060
+# @spec ING-LIFE-063, ING-EP-106
 def release_owner(registry: Any, record: Any, admitted: Any) -> None:
-    """Release a handler's record and admission as its handler ends.
+    """Release a handler's admission and record as its handler ends.
 
-    A ``record.continuation`` still running (an owner's cleanup that
-    outlived the answer) or a send cancelled at its bound and not yet
-    settled holds both until it ends: they are released from its done
-    callback instead, once nothing holds the record. ``Admission.release``
-    is idempotent and ``unregister`` tolerates a record already removed.
+    The stream's one ingress-cap count goes once the owner and its cleanup
+    continuation have ended: a ``record.continuation`` still running (an
+    owner's cleanup that outlived the answer) releases it from its done
+    callback. The record goes once, in addition, every send left unsettled
+    under it has ended; a record that persists only for such sends takes no
+    count. ``Admission.release`` is idempotent and ``unregister`` tolerates
+    a record already removed.
     """
 
-    def release(_: Any = None) -> None:
-        holder = _holding(record)
-        if holder is not None:
-            holder.add_done_callback(release)
-            return
+    def release_record(_: Any = None) -> None:
+        for task in list(getattr(record, "unsettled_sends", ())):
+            if _running(task):
+                task.add_done_callback(release_record)
+                return
         unregister(registry, record)
-        admitted.release()
 
-    release()
+    def release_count(_: Any = None) -> None:
+        continuation = getattr(record, "continuation", None)
+        if continuation is not None and not continuation.done():
+            continuation.add_done_callback(release_count)
+            return
+        admitted.release()
+        release_record()
+
+    release_count()
 
 
 def torn_down(plugin: Any) -> bool:
-    """Whether ``stop`` has run: cleanup then yields to its cancellation."""
+    """Whether ``stop`` has run."""
     registry = getattr(plugin, "registry", None)
     return bool(getattr(plugin, "torn_down", False)) or bool(
         getattr(registry, "torn_down", False)
     )
 
 
-async def join(
-    tasks: Iterable[asyncio.Future[Any]], *, stopped: Callable[[], bool]
-) -> None:
+def send_bounds_passed(plugin: Any) -> bool:
+    """Whether every send bound counts as passed (ING-EP-110).
+
+    After the plugin is torn down and, for the rest of a ``drain`` call,
+    once its settlement began or it skipped its graceful steps; ``D``
+    passing is read from ``drain_deadline`` and the clock.
+    """
+    return bool(getattr(plugin, "send_bounds_passed", False)) or torn_down(
+        plugin
+    )
+
+
+async def join(tasks: Iterable[asyncio.Future[Any]]) -> None:
     """Wait until every task is done, whatever cancels the caller meanwhile.
 
-    A cancellation that arrives while they run is absorbed, so the caller's
-    record and admission outlive the cleanup they guard; it propagates at
-    once only when ``stopped()`` holds, since ``stop`` reaps what is left.
+    A cancellation that arrives while they run is absorbed and withdrawn,
+    so the caller's record and admission outlive the cleanup they guard;
+    the vehicle's settlement awaits the caller, it does not reap it.
     """
     pending = {task for task in tasks if not task.done()}
     while pending:
         try:
             await asyncio.wait(pending)
         except asyncio.CancelledError:
-            if stopped():
-                raise
-            current = asyncio.current_task()
-            if current is not None and current.cancelling():
-                current.uncancel()
+            _withdraw_cancellation()
         pending = {task for task in pending if not task.done()}
 
 
 async def settle_shielded(
-    plugin: Any,
     record: Any,
     owner: Any,
     error: errors.FrontendError,
@@ -187,11 +190,10 @@ async def settle_shielded(
 ) -> None:
     """``settle`` as a child of the record, joined through cancellation.
 
-    Returns only once cleanup has run (``join``); a cleanup that ``stop``
-    cancelled ends the caller with ``CancelledError``.
+    Returns only once cleanup has run (``join``).
     """
     cleanup = child(record, settle(owner, error, phase))
-    await join((cleanup,), stopped=lambda: torn_down(plugin))
+    await join((cleanup,))
     if cleanup.cancelled():
         raise asyncio.CancelledError
     cleanup.result()
@@ -200,35 +202,28 @@ async def settle_shielded(
 # ------------------------------------------------------------------- sends
 
 
-def _send_bound(
-    limit: float, plugin: Any, owner: Any, rpc_deadline: float | None
-) -> float:
+def _send_bound(limit: float, plugin: Any, rpc_deadline: float | None) -> float:
     """The send's absolute bound as it stands now.
 
-    ``limit`` clipped to the RPC deadline and, while draining, to ``D``;
-    once the plugin is torn down every bound has passed.
+    ``limit`` clipped to the RPC deadline and, while a ``drain`` call runs
+    its graceful work, to ``D``; once the send bounds pass (ING-EP-110)
+    every bound has passed. Core's ``state.draining`` alone clips nothing.
     """
-    if torn_down(plugin):
+    if send_bounds_passed(plugin):
         return -math.inf
-    candidates = [
-        rpc_deadline,
-        getattr(plugin, "drain_deadline", None),
-        None if owner is None else owner.drain_deadline,
-    ]
+    candidates = [rpc_deadline, getattr(plugin, "drain_deadline", None)]
     return min([limit, *(float(d) for d in candidates if d is not None)])
 
 
-def _start(
-    plugin: Any, record: Any, awaitable: Awaitable[T]
-) -> asyncio.Future[T]:
-    """Start a send's task under ``record`` or, with none, the registry."""
+def _start(record: Any, awaitable: Awaitable[T]) -> asyncio.Future[T]:
+    """Start a send's task: under ``record``, or owned by its handler.
+
+    A refusal that creates no owner (``record`` is ``None``) keeps its send
+    with its own handler, which awaits it inline (ING-EP-095).
+    """
     if record is not None:
         return child(record, awaitable)
-    task = asyncio.ensure_future(awaitable)
-    keep = getattr(getattr(plugin, "registry", None), "keep", None)
-    if callable(keep):
-        keep(task)
-    return task
+    return asyncio.ensure_future(awaitable)
 
 
 def _consume(task: asyncio.Future[Any]) -> None:
@@ -237,30 +232,29 @@ def _consume(task: asyncio.Future[Any]) -> None:
         task.exception()
 
 
+# @spec ING-EP-106
 async def _until(
     plugin: Any,
-    record: Any,
     futures: set[asyncio.Future[Any]],
     deadline: float,
 ) -> None:
     """Wait for one of ``futures`` or ``deadline`` on the plugin's clock.
 
-    The deadline is a ``clock.sleep`` in a task kept like the send's, so
-    the wait starts no task outside the registry, and ``stop``, which
-    cancels that task, wakes the wait.
+    The deadline is a timer of the clock (``clock.timer``), not a task, so
+    a refusal's wait starts nothing outside the registry but its own send
+    (ING-EP-106); the timer is cancelled when the wait ends.
     """
-    remaining = max(0.0, deadline - plugin.clock.monotonic())
-    sleeper = _start(plugin, record, plugin.clock.sleep(remaining))
+    timer = plugin.clock.timer(deadline)
     try:
         await asyncio.wait(
-            {*futures, sleeper}, return_when=asyncio.FIRST_COMPLETED
+            {*futures, timer}, return_when=asyncio.FIRST_COMPLETED
         )
     finally:
-        sleeper.cancel()
+        timer.cancel()
 
 
 def _drain_notice(plugin: Any) -> asyncio.Future[None] | None:
-    """The plugin's drain announcement, while ``D`` is not yet set."""
+    """The plugin's next change of the send bounds, if one is pending."""
     announced = getattr(plugin, "drain_announced", None)
     if not callable(announced):
         return None
@@ -270,36 +264,6 @@ def _drain_notice(plugin: Any) -> asyncio.Future[None] | None:
     return notice
 
 
-def _leave_unsettled(
-    plugin: Any, record: Any, task: asyncio.Future[Any]
-) -> None:
-    """Leave a cancelled send where ``stop`` reaches it until it settles.
-
-    Under ``record.unsettled_sends``, which also holds the record; with no
-    record (a refusal), under ``registry.keep``.
-    """
-    sends = getattr(record, "unsettled_sends", None)
-    if isinstance(sends, set):
-        sends.add(task)
-        task.add_done_callback(sends.discard)
-        return
-    keep = getattr(getattr(plugin, "registry", None), "keep", None)
-    if callable(keep):
-        keep(task)
-
-
-async def _abandon(plugin: Any, record: Any, task: asyncio.Future[Any]) -> None:
-    """Cancel a failed send and give it one loop turn; never wait longer.
-
-    It is left under its owner first, so a cancellation of the caller
-    during that turn cannot orphan it; one that settles in the turn
-    leaves again by its done callback.
-    """
-    task.cancel()
-    _leave_unsettled(plugin, record, task)
-    await asyncio.sleep(0)
-
-
 def _withdraw_cancellation() -> None:
     """Withdraw the cancellation the current task has just absorbed."""
     current = asyncio.current_task()
@@ -307,56 +271,116 @@ def _withdraw_cancellation() -> None:
         current.uncancel()
 
 
+async def _await_to_end(task: asyncio.Future[Any]) -> bool:
+    """Await ``task`` through any number of cancellations of the caller.
+
+    Returns whether the caller was cancelled meanwhile; those
+    cancellations are withdrawn, for the caller to re-raise.
+    """
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            cancelled = True
+            _withdraw_cancellation()
+    return cancelled
+
+
+# @spec ING-LIFE-061, ING-EP-094, ING-EP-095
+async def _abandon(plugin: Any, record: Any, task: asyncio.Future[Any]) -> None:
+    """Cancel a failed or interrupted send without waiting for it.
+
+    An owner's send stays under ``record.unsettled_sends``, which also
+    holds the record, and gets one loop turn. A refusal's send (no record)
+    is registered in the owner registry as a send without an owner while
+    the registry is open (the check and the registration with no
+    suspension between them); once the registry is closed its handler
+    awaits it itself, through any number of cancellations, and re-raises a
+    cancellation only once the send has ended.
+    """
+    task.cancel()
+    if record is not None:
+        sends = getattr(record, "unsettled_sends", None)
+        if isinstance(sends, set) and not task.done():
+            sends.add(task)
+            task.add_done_callback(sends.discard)
+        await asyncio.sleep(0)
+        return
+    adopt = getattr(getattr(plugin, "registry", None), "adopt_send", None)
+    if task.done() or (callable(adopt) and adopt(task)):
+        await asyncio.sleep(0)
+        return
+    if await _await_to_end(task):
+        raise asyncio.CancelledError
+
+
 async def _failed(
     plugin: Any, record: Any, task: asyncio.Future[Any]
 ) -> NoReturn:
     """A send whose failure is established: abandon it, raise ``TimeoutError``.
 
-    The failure is final. A cancellation of the caller during the
-    abandonment's turn is absorbed and withdrawn, so the caller still takes
-    the transport-failure path and sends nothing more; the send stays where
-    ``stop`` reaches it.
+    A send still running is abandoned (``_abandon``); one already ended is
+    left as it is. For an owner's send (``record``) the failure is final: a
+    cancellation of the caller during the abandonment's turn is absorbed
+    and withdrawn, so the caller still takes the transport-failure path and
+    sends nothing more, and the send stays where the settlement reaches it.
+    For a refusal's send (no ``record``), a cancellation of its handler
+    during the abandonment (its turn after registering the send, or its
+    wait for the send once the registry is closed) propagates instead of
+    ``TimeoutError`` (ING-EP-095).
     """
     if not task.done():
         try:
             await _abandon(plugin, record, task)
         except asyncio.CancelledError:
+            if record is None:
+                raise
             _withdraw_cancellation()
     raise TimeoutError
 
 
 async def _last_attempt(plugin: Any, record: Any, send: Awaitable[T]) -> T:
-    """A terminal status past its bound: one attempt that adds no wait.
+    """A terminal send past its bound: one attempt that adds no wait.
 
-    The send starts and runs to its first suspension; it succeeds only if
-    it is complete then, and has otherwise failed. The caller resumes only
-    after that first step, so a cancellation of the caller meanwhile does
-    not change an incomplete attempt's failure; one that finds the attempt
-    complete propagates.
+    The send starts and runs to its first suspension, and the caller
+    resumes after that one loop turn. A send complete then returns its
+    result, or raises its own failure; one still running has failed and is
+    abandoned (``_failed``, ``TimeoutError``). When the attempt is already
+    complete, a cancellation of the caller during that turn propagates.
+    When it is incomplete, the cancellation is withdrawn: for an owner's
+    send (``record``) the failure stands; a refusal's handler (no
+    ``record``) retains the cancellation, abandons the send (``_abandon``)
+    and re-raises the cancellation once the send has been registered or,
+    with the registry closed, has ended (ING-EP-095).
     """
-    task = _start(plugin, record, send)
+    task = _start(record, send)
     task.add_done_callback(_consume)
+    retained = False
     try:
         await asyncio.sleep(0)
     except asyncio.CancelledError:
         if task.done():
             raise
         _withdraw_cancellation()
+        retained = record is None
     except BaseException:
         if not task.done():
             await _abandon(plugin, record, task)
         raise
     if task.done():
         return task.result()
+    if retained:
+        await _abandon(plugin, record, task)
+        raise asyncio.CancelledError
     await _failed(plugin, record, task)
 
 
-# @spec ING-LIFE-051, ING-ADM-016, ING-EP-059, ING-EP-060
+# @spec ING-LIFE-061, ING-ADM-016, ING-EP-095, ING-EP-110, ING-EP-106
 async def bounded_send(
     plugin: Any,
     send: Awaitable[T],
     *,
-    owner: Any = None,
     record: Any = None,
     rpc_deadline: float | None = None,
     terminal: bool = False,
@@ -364,22 +388,27 @@ async def bounded_send(
     """One send or close under ``response_send_timeout``, on either surface.
 
     The bound runs from the send's start and is clipped to ``rpc_deadline``
-    and, while draining, to ``D`` (the plugin's, or the owner's once it
-    observed the trigger); once the plugin is torn down it has passed. A
-    waiting send also waits for the plugin's drain announcement, so one in
-    flight when the drain begins re-clips to ``D`` at once, with or without
-    an owner.
+    and, while a ``drain`` call runs its graceful work, to ``D``; once the
+    send bounds pass (ING-EP-110) it has passed. A waiting send also waits
+    for the plugin's drain announcement, so one in flight when the drain
+    begins re-clips to ``D`` at once, with or without an owner.
 
     A send whose bound has already passed does not start, unless it is
     ``terminal`` (a gRPC status; a Realtime error or ``failed`` event and
-    its close): that one gets one attempt that adds no wait. A send not
-    complete when its bound passes has failed, even if it completes
-    before this coroutine resumes: whenever it resumes, the clock is
-    checked before the send's outcome. A failed send is cancelled and
-    given one loop turn, never a wait for it to settle; one still pending
-    stays under ``record`` (or, with none, the registry) until it settles
-    or ``stop``. Raises ``TimeoutError`` for a send past its bound; the
-    send's own failure propagates.
+    its close; a refusal's whole sequence): that one gets one attempt that
+    adds no wait. A send not complete when its bound passes has failed,
+    even if it completes before this coroutine resumes. The judgement runs
+    in the send's own task, as its last step, when the send completes:
+    whether it completed before its bound, not when this coroutine
+    resumes, decides; the inline judgement here covers only a send
+    cancelled before it ran, which never reached that step. A failed send
+    is cancelled and abandoned (``_abandon``), never waited for to settle.
+    Raises ``TimeoutError`` for a send past its bound; the send's own
+    failure propagates.
+
+    With ``record`` the send is a child of the stream's record. Without
+    one (a refusal that creates no owner) the handler awaits it inline and
+    owns it until it ends or is registered on abandonment (ING-EP-095).
 
     A cancellation of the caller while the send waits, before its bound
     is seen to pass, abandons the send the same way and propagates: the
@@ -390,29 +419,53 @@ async def bounded_send(
     """
     clock = plugin.clock
     limit = clock.monotonic() + float(plugin.config.response_send_timeout)
-    deadline = _send_bound(limit, plugin, owner, rpc_deadline)
+    deadline = _send_bound(limit, plugin, rpc_deadline)
     if clock.monotonic() >= deadline:
         if not terminal:
             if inspect.iscoroutine(send):
                 send.close()
             raise TimeoutError
         return await _last_attempt(plugin, record, send)
-    task = _start(plugin, record, send)
+    # Whether the send completed before its bound passed, judged at the
+    # moment it completes (in the send's own task, as its last step), not
+    # when this coroutine resumes: a send complete in time is delivered
+    # even if the bound passes (the clock, or the send bounds passing at
+    # ``stop``), or another wake-up (the drain notice) resumes this
+    # coroutine, before the send's done callbacks have run.
+    in_time: list[bool] = []
+
+    def judge() -> None:
+        if not in_time:
+            bound = _send_bound(limit, plugin, rpc_deadline)
+            in_time.append(clock.monotonic() < bound)
+
+    async def judged() -> T:
+        try:
+            return await send
+        finally:
+            judge()
+
+    task = _start(record, judged())
     task.add_done_callback(_consume)
     try:
-        while clock.monotonic() < deadline:
+        while True:
             if task.done():
-                return task.result()
+                judge()  # a send cancelled before it ran: judged now
+                if in_time[0]:
+                    return task.result()
+                break
+            if clock.monotonic() >= deadline:
+                break
             waits: set[asyncio.Future[Any]] = {task}
             notice = _drain_notice(plugin)
             if notice is not None:
                 waits.add(notice)
             try:
-                await _until(plugin, record, waits, deadline)
+                await _until(plugin, waits, deadline)
             finally:
                 if notice is not None:
                     notice.cancel()
-            deadline = _send_bound(limit, plugin, owner, rpc_deadline)
+            deadline = _send_bound(limit, plugin, rpc_deadline)
     except BaseException:
         if not task.done():
             await _abandon(plugin, record, task)
