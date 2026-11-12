@@ -1,12 +1,11 @@
-# Gates the declared interpreter range (ING-VEH-019).
+# Gates the declared interpreter range (ING-VEH-027, ING-EP-022).
 #
-# The floor job is the load-bearing one: the plugin is imported into the
-# host's interpreter, so a package that only works on the newest supported
-# Python is undeployable where it is actually meant to run. Static checks
-# cannot stand in for it — the breakages that reached this repository were
-# `asyncio.TimeoutError` not being the builtin `TimeoutError` below 3.11,
-# and `BaseException.add_note` not existing there. Both are import-clean,
-# syntax-clean, and only observable when the suite runs on the floor.
+# The plugin is imported into vLLM's interpreter, so it declares vLLM's
+# range and must work on its lowest version. The floor job (3.11) is the
+# load-bearing one; 3.12 is the current host lane. 3.13 and 3.14 are inside
+# the declared range but not executed here, so the README records them as
+# declared-but-unverified. Keep the README's "Supported Python versions"
+# table in step with this matrix.
 #
 # Dependencies are resolved per interpreter rather than shared, because a
 # floor run against ceiling-resolved dependencies is not floor evidence.
@@ -23,10 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 is the declared floor; 3.12 is the current host lane for the
-        # supported v0.24 line. 3.11 and 3.13 are inside the declared range
-        # but unexecuted here — declared-but-unverified, per ING-VEH-019.
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.11", "3.12"]
     name: python ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
@@ -37,18 +33,35 @@ jobs:
       - name: Resolve dependencies for this interpreter
         run: uv sync --python ${{ matrix.python-version }}
 
-      - name: Lint
-        run: uv run --python ${{ matrix.python-version }} ruff check .
+      # The plugin runs inside vLLM's process and the tests import vLLM's
+      # serving modules, so they need the vLLM core tree it targets (RFC 2's
+      # endpoint-plugin lifecycle, readiness and drain). Its Python sources
+      # are importable from a checkout; the CPU requirements supply what
+      # those imports need.
+      - name: Check out vLLM core
+        uses: actions/checkout@v4
+        with:
+          repository: pdtgct/vllm
+          ref: 22acc7518e3a253473a2a688030d1e0308618e2b
+          path: vllm-core
 
-      # Floor lane only, and not an arbitrary choice: mypy's language level
-      # is pinned to the floor in pyproject, so asking it to judge 3.10
-      # semantics against dependency stubs resolved for a later interpreter
-      # is incoherent — numpy's own stubs use `type` statements that mypy
-      # rejects under `python_version = "3.10"`. The verdict we want is the
-      # floor's, and it needs floor-resolved stubs to be meaningful.
+      - name: Install vLLM core's CPU requirements
+        run: >-
+          uv pip install --python .venv
+          -r vllm-core/requirements/cpu.txt
+          --extra-index-url https://download.pytorch.org/whl/cpu
+          --index-strategy unsafe-best-match
+
+      - name: Lint
+        run: uv run --python ${{ matrix.python-version }} ruff check src tests
+
+      # Floor lane only: mypy's language level is pinned to the floor in
+      # pyproject, and that verdict needs floor-resolved stubs.
       - name: Types
-        if: matrix.python-version == '3.10'
+        if: matrix.python-version == '3.11'
         run: uv run --python ${{ matrix.python-version }} mypy
 
       - name: Tests
+        env:
+          PYTHONPATH: vllm-core
         run: uv run --python ${{ matrix.python-version }} pytest -q

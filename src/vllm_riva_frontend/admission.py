@@ -1,168 +1,156 @@
-"""Atomic compatibility admission, ownership, and load shedding."""
+"""The ingress cap: one bounded count of transport owners, with a file sub-cap.
 
-import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Protocol, TypeAlias
+The cap counts active owners of ``StreamingRecognize``, ``Recognize``, the
+Riva Realtime WebSocket route and the frontend's file route under
+``/plugins/riva/v1/`` together; core's own routes are outside it. A
+handler asks it once,
+before it reads its first message or body, and either gets an ``Admission``
+to hold until its last cleanup step or a refusal it answers at once.
+"""
 
-INFERENCE_OWNER_KINDS = frozenset(
-    {
-        "grpc_streaming_recognize",
-        "grpc_recognize",
-        "nim_realtime_transcription",
-        "nim_http_transcription",
-    }
-)
-EXCLUDED_OWNER_KINDS = frozenset(
-    {
-        "grpc_get_config",
-        "nim_bootstrap",
-        "operational",
-        "host_operational",
-        "native_realtime",
-    }
-)
+from __future__ import annotations
+
+from collections.abc import Callable
+from enum import StrEnum
+
+from vllm_riva_frontend.errors import FrontendError
 
 
-@dataclass(frozen=True)
-class LoadShedRejected:
-    """Retryable rejection before an owner or lease has been created."""
+class OwnerKind(StrEnum):
+    """The four kinds of transport owner the cap counts."""
 
-    code: str = "busy"
-    authority: str = "load_shed"
-
-
-class AdmissionLease(Protocol):
-    """One idempotently releasable host-admission owner."""
-
-    def release(self) -> None:
-        """Synchronously release the host's admitted-work registration."""
+    stream = "stream"
+    realtime = "realtime"
+    recognize = "recognize"
+    file_route = "file_route"
 
 
-class HostAdmission(Protocol):
-    """The host-owned composed-readiness authority."""
-
-    def try_acquire(self) -> AdmissionLease | None:
-        """Atomically register new work or reject after admission closes."""
+#: The owner kinds that also count against the file sub-cap.
+FILE_KINDS = frozenset({OwnerKind.recognize, OwnerKind.file_route})
 
 
-class _UnmanagedAdmissionLease:
-    """No-op lease for direct tests which do not install a host."""
+class Admission:
+    """One admitted owner's place in the cap, released exactly once."""
 
-    def release(self) -> None:
-        """Preserve the same terminal-release shape without host state."""
-
-
-_UNMANAGED_ADMISSION_LEASE = _UnmanagedAdmissionLease()
-
-
-def try_acquire_admission(
-    admission: HostAdmission | None,
-) -> AdmissionLease | None:
-    """Acquire host admission, treating an absent direct-test host as open."""
-    if admission is None:
-        return _UNMANAGED_ADMISSION_LEASE
-    return admission.try_acquire()
-
-
-class OwnerToken(Protocol):
-    """One lifecycle-visible owner-task registration."""
-
-    async def release(self) -> None:
-        """Release the task registration after terminal cleanup."""
-
-
-OwnerRegister: TypeAlias = Callable[[str], Awaitable[OwnerToken]]
-
-
-class LoadShedRegistration:
-    """One atomically admitted and tracked compatibility inference owner."""
-
-    def __init__(
-        self,
-        gate: "LoadShedGate",
-        kind: str,
-        owner_token: OwnerToken | None,
-    ) -> None:
-        """Bind this registration to its gate and counted owner family."""
-        self._gate = gate
+    def __init__(self, cap: IngressCap, kind: OwnerKind) -> None:
+        """Bind the admission to its cap and owner kind."""
+        self._cap = cap
         self.kind = kind
-        self._owner_token = owner_token
         self._released = False
 
-    async def release(self) -> None:
-        """Release this owner exactly once after terminal lease cleanup."""
+    @property
+    def released(self) -> bool:
+        """Whether ``release`` has run."""
+        return self._released
+
+    # @spec ING-ADM-013, ING-ADM-016
+    def release(self) -> None:
+        """Give the place back; later calls do nothing."""
         if self._released:
             return
         self._released = True
-        try:
-            if self._owner_token is not None:
-                await self._owner_token.release()
-        finally:
-            async with self._gate._lock:
-                self._gate._active -= 1
-
-    async def __aenter__(self) -> "LoadShedRegistration":
-        """Enter this admitted owner scope."""
-        return self
-
-    async def __aexit__(
-        self, exc_type: object, exc: object, traceback: object
-    ) -> None:
-        """Release the owner even when its session exits abnormally."""
-        del exc_type, exc, traceback
-        await self.release()
+        self._cap._release(self.kind)
 
 
-class LoadShedGate:
-    """Atomically gate owner tracking and the compatibility-local SLO cap."""
+class IngressCap:
+    """The finite ingress cap and the file-owner sub-cap inside it.
+
+    Constructed closed: ``try_admit`` refuses until ``open`` is called, which
+    the plugin's ``start`` does as its last step; ``drain``, a recorded
+    fault and ``stop`` close it again.
+    """
 
     def __init__(
         self,
-        max_sessions: int,
         *,
-        owner_register: OwnerRegister | None = None,
+        max_sessions: int,
+        max_file_owners: int,
+        serving: Callable[[], bool] | None = None,
     ) -> None:
-        """Create a gate with one finite compatibility-owner limit."""
+        """Size the cap; ``serving`` is an extra predicate the plugin passes.
+
+        ``serving`` reports whether core has not started draining, so an
+        owner arriving between core setting ``state.draining`` and the
+        plugin's ``drain`` closing the cap is refused too.
+        """
         if type(max_sessions) is not int or max_sessions <= 0:
             raise ValueError("max_sessions must be a positive integer")
-        self._max_sessions = max_sessions
-        self._owner_register = owner_register
-        self._active = 0
-        self._closed = False
-        self._lock = asyncio.Lock()
+        if type(max_file_owners) is not int or max_file_owners < 0:
+            raise ValueError("max_file_owners must be a non-negative integer")
+        if max_file_owners >= max_sessions:
+            raise ValueError("max_file_owners must be below max_sessions")
+        self.max_sessions = max_sessions
+        self.max_file_owners = max_file_owners
+        self._serving = serving
+        self._open = False
+        self._count = 0
+        self._file_count = 0
 
     @property
-    def active(self) -> int:
-        """Return the current number of registered compatibility owners."""
-        return self._active
+    def is_open(self) -> bool:
+        """Whether admission is open."""
+        return self._open
 
-    # @spec ING-ADM-006, ING-LIFE-012
-    async def register(
-        self, kind: str
-    ) -> LoadShedRegistration | LoadShedRejected | None:
-        """Atomically admit and track one counted inference candidate."""
-        if kind in EXCLUDED_OWNER_KINDS:
+    @property
+    def count(self) -> int:
+        """Active owners of every kind."""
+        return self._count
+
+    @property
+    def file_count(self) -> int:
+        """Active file owners (``Recognize`` and the file route)."""
+        return self._file_count
+
+    # @spec ING-EP-080
+    def open(self) -> None:
+        """Open admission."""
+        self._open = True
+
+    def close(self) -> None:
+        """Close admission; owners already admitted continue."""
+        self._open = False
+
+    def _serving_now(self) -> bool:
+        return self._open and (self._serving is None or self._serving())
+
+    # @spec ING-ADM-018, ING-ADM-011, ING-ADM-012, ING-ADM-010
+    def try_admit(self, kind: OwnerKind | str) -> Admission | None:
+        """Atomically check serving state and count, and admit one owner.
+
+        Returns ``None`` when admission is closed or the cap (or, for a file
+        owner, the sub-cap) is full; ``refusal(kind)`` names the answer. The
+        check and the increment run without a suspension point, so two
+        handlers never both take the last place. Nothing else is claimed:
+        no residency, engine capacity or queue position.
+        """
+        owner_kind = OwnerKind(kind)
+        if not self._serving_now() or self._count >= self.max_sessions:
             return None
-        if kind not in INFERENCE_OWNER_KINDS:
-            raise ValueError(f"unknown owner kind: {kind}")
-        async with self._lock:
-            if self._closed:
-                return LoadShedRejected(
-                    code="service_unavailable",
-                    authority="load_shed",
-                )
-            if self._active >= self._max_sessions:
-                return LoadShedRejected()
-            owner_token = (
-                await self._owner_register(kind)
-                if self._owner_register is not None
-                else None
-            )
-            self._active += 1
-            return LoadShedRegistration(self, kind, owner_token)
+        is_file = owner_kind in FILE_KINDS
+        if is_file and self._file_count >= self.max_file_owners:
+            return None
+        self._count += 1
+        if is_file:
+            self._file_count += 1
+        return Admission(self, owner_kind)
 
-    async def close(self) -> None:
-        """Linearize shutdown against every candidate registration."""
-        async with self._lock:
-            self._closed = True
+    # @spec ING-ADM-011
+    def refusal(self, kind: OwnerKind | str) -> FrontendError:
+        """Return the error a refused handler answers.
+
+        ``service_unavailable`` while admission is closed or core is
+        draining, otherwise retryable ``busy`` with ``authority: load_shed``.
+        """
+        OwnerKind(kind)
+        if not self._serving_now():
+            return FrontendError(
+                "service_unavailable", "the frontend is not serving"
+            )
+        return FrontendError(
+            "busy", "the ingress cap is full", authority="load_shed"
+        )
+
+    def _release(self, kind: OwnerKind) -> None:
+        self._count -= 1
+        if kind in FILE_KINDS:
+            self._file_count -= 1

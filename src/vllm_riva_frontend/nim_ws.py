@@ -1,307 +1,252 @@
-"""NIM Realtime WebSocket compatibility over the direct RFC-1 lease.
+"""The Riva Realtime WebSocket surface: route, bootstrap and adapter.
 
-This is raw ASGI middleware: it claims only NIM's exact transcription intent
-and passes every other websocket scope to the host's native realtime route.
-It never creates a second HTTP server or a transport-owned inference engine.
+``RealtimeRoute`` is the ASGI app of the WebSocket route
+``/plugins/riva/v1/realtime`` (``routes.REALTIME_PATH``) and
+``bootstrap_endpoint`` the handler of the bootstrap ``POST``; ``attach_router``
+registers both. The route serves only the exact query
+``intent=transcription``, through ``RealtimeAdapter``, which translates the
+dialect's events straight to one ``lease.StreamOwner`` and projects the
+owner's results and its one terminal cause back as events and a close.
+
+Event shapes follow the public client (``riva/client/realtime.py`` of
+``nvidia-riva/python-clients``) and the OpenAI Realtime ``error`` object.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
 import binascii
 import contextlib
 import json
-import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
-from enum import Enum
-from typing import Any, TypeAlias
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from types import MappingProxyType
+from typing import Any, TypeVar
 from urllib.parse import unquote_to_bytes
 
-from vllm_riva_frontend.admission import (
-    AdmissionLease,
-    HostAdmission,
-    LoadShedGate,
-    LoadShedRegistration,
-    LoadShedRejected,
-    try_acquire_admission,
+# Modules, not names: ``lifecycle`` imports this module while it loads.
+from vllm_riva_frontend import admission, errors, frontend, lease, surfaces
+
+T = TypeVar("T")
+Scope = MutableMapping[str, Any]
+Message = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[Message]]
+Send = Callable[[Message], Awaitable[None]]
+
+UPDATE = "transcription_session.update"
+APPEND = "input_audio_buffer.append"
+COMMIT = "input_audio_buffer.commit"
+CLEAR = "input_audio_buffer.clear"
+DONE = "input_audio_buffer.done"
+
+#: The client events of the dialect.
+EVENT_TYPES = frozenset({UPDATE, APPEND, COMMIT, CLEAR, DONE})
+
+_CREATED = "conversation.created"
+_UPDATED = "transcription_session.updated"
+_COMMITTED = "input_audio_buffer.committed"
+_CLEARED = "input_audio_buffer.cleared"
+_DELTA = "conversation.item.input_audio_transcription.delta"
+_COMPLETED = "conversation.item.input_audio_transcription.completed"
+_FAILED = "conversation.item.input_audio_transcription.failed"
+_ERROR = "error"
+
+#: Realtime audio names to the audio frontend's encodings.
+_FORMATS = MappingProxyType(
+    {"pcm16": "LINEAR_PCM", "g711_ulaw": "MULAW", "g711_alaw": "ALAW"}
 )
-from vllm_riva_frontend.errors import catalog
-from vllm_riva_frontend.frontend import (
-    FormatError,
-    RiffFormat,
-    StreamingAudioFrontend,
-    sniff_riff,
-    validate_format,
-)
-from vllm_riva_frontend.lease import DirectLeaseOwner, SessionFactory
-
-AsgiApp: TypeAlias = Callable[[object, object, object], Awaitable[None]]
-AsgiReceive: TypeAlias = Callable[[], Awaitable[dict[str, object]]]
-AsgiSend: TypeAlias = Callable[[dict[str, object]], Awaitable[None]]
-OwnerRegister: TypeAlias = Callable[[], Awaitable[object]]
-LeaseOwnerFactory: TypeAlias = Callable[..., DirectLeaseOwner]
-
-_FORMAT_NAMES = {
-    "pcm16": "LINEAR_PCM",
-    "g711_ulaw": "MULAW",
-    "g711_alaw": "ALAW",
-}
-_DEFERRED_FORMAT = "none"
-_DELTA_EVENT = "conversation.item.input_audio_transcription.delta"
-
-
-class DispatchDecision(Enum):
-    """Exclusive scope outcome before either realtime dialect handles it."""
-
-    CLAIM = "claim"
-    PASS = "pass"
-    DENY = "deny"
-
-
-class _LifecycleTimeout(Exception):
-    """One absolute session timer won while provider work was pending."""
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
-
-
-def _event_id() -> str:
-    """Return an opaque event identifier for one server event."""
-    return f"event_{uuid.uuid4().hex}"
-
-
-def _error(
-    code: str, message: str, fields: list[str] | None = None
-) -> dict[str, Any]:
-    """Build the stable NIM protocol-error event."""
-    projection = catalog().get(code)
-    body: dict[str, Any] = {
-        "type": projection.nim_event if projection is not None else "error",
-        "error": {"code": code, "message": message},
+#: The stock file-mode client's declaration of raw container bytes.
+_DEFERRED = "none"
+#: The audio leaf's neutral format fields by their Realtime names.
+_REALTIME_FORMAT_FIELDS = MappingProxyType(
+    {
+        "encoding": "input_audio_format",
+        "sample_rate_hz": "sample_rate_hz",
+        "channels": "num_channels",
     }
-    if fields:
-        body["error"]["param"] = ",".join(fields)
-    return body
+)
+
+_ECHO_KEYS = frozenset({"id", "object", "client_secret", "provenance"})
+_SECTION_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "input_audio_params": frozenset({"sample_rate_hz", "num_channels"}),
+        "input_audio_transcription": frozenset({"language", "model", "prompt"}),
+        "recognition_config": frozenset(
+            {
+                "max_alternatives",
+                "enable_automatic_punctuation",
+                "enable_verbatim_transcripts",
+                "enable_word_time_offsets",
+                "enable_profanity_filter",
+            }
+        ),
+        "speaker_diarization": frozenset(
+            {"enable_speaker_diarization", "max_speaker_count"}
+        ),
+        "word_boosting": frozenset(
+            {"enable_word_boosting", "word_boosting_list"}
+        ),
+        "endpointing_config": frozenset(
+            {
+                "start_history",
+                "start_threshold",
+                "stop_history",
+                "stop_threshold",
+                "stop_history_eou",
+                "stop_threshold_eou",
+            }
+        ),
+    }
+)
+_CONFIG_KEYS = frozenset(
+    {"modalities", "input_audio_format", "custom_configuration", *_SECTION_KEYS}
+)
+_CAPABILITY_SECTIONS = (
+    "speaker_diarization",
+    "word_boosting",
+    "endpointing_config",
+)
+
+#: Codes a terminal error event closes with when the catalog row has none.
+_CLIENT_CODES = frozenset(
+    {
+        "invalid_config_field",
+        "unsupported_capability",
+        "unknown_locale",
+        "unsupported_format",
+        "malformed_request",
+        "protocol_order",
+        "invalid_event",
+        "session_terminal",
+    }
+)
+_SHUTDOWN_PHASES = frozenset({"shutdown", "drain"})
 
 
-def _suffix(previous: str, current: str) -> str:
-    """Project the true incremental suffix of cumulative hypotheses."""
-    if current.startswith(previous):
-        return current[len(previous) :]
-    return current
+def _hex_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
-def _structural_session_fields(session: Mapping[str, object]) -> list[str]:
-    """Return every field whose JSON type cannot be interpreted safely."""
-    invalid: list[str] = []
-    scalar_strings = ("id", "object")
-    invalid.extend(
-        name
-        for name in scalar_strings
-        if name in session and not isinstance(session[name], str)
-    )
-    if "provenance" in session and not isinstance(session["provenance"], dict):
-        invalid.append("provenance")
-    modalities = session.get("modalities", ["text"])
-    if not isinstance(modalities, list) or not all(
-        isinstance(value, str) for value in modalities
-    ):
-        invalid.append("modalities")
-    if not isinstance(session.get("input_audio_format", "pcm16"), str):
-        invalid.append("input_audio_format")
-    params = session.get("input_audio_params", {})
-    if not isinstance(params, dict):
-        invalid.append("input_audio_params")
-    else:
-        for name in ("sample_rate_hz", "num_channels"):
-            value = params.get(name, 16000 if name == "sample_rate_hz" else 1)
-            if type(value) is not int:
-                invalid.append(f"input_audio_params.{name}")
-    transcription = session.get("input_audio_transcription", {})
-    if not isinstance(transcription, dict):
-        invalid.append("input_audio_transcription")
-    else:
-        for name in ("language", "model", "prompt"):
-            if name in transcription and not isinstance(
-                transcription[name], str
-            ):
-                invalid.append(f"input_audio_transcription.{name}")
-    recognition = session.get("recognition_config", {})
-    if not isinstance(recognition, dict):
-        invalid.append("recognition_config")
-    else:
-        for name, value in recognition.items():
-            if name == "max_alternatives":
-                if type(value) is not int:
-                    invalid.append(f"recognition_config.{name}")
-            elif type(value) is not bool:
-                invalid.append(f"recognition_config.{name}")
-    for name in ("speaker_diarization", "word_boosting", "endpointing_config"):
-        value = session.get(name, {})
-        if not isinstance(value, dict):
-            invalid.append(name)
-    word_boosting = session.get("word_boosting", {})
-    if isinstance(word_boosting, dict):
-        enabled = word_boosting.get("enable_word_boosting", False)
-        words = word_boosting.get("word_boosting_list", [])
-        if type(enabled) is not bool:
-            invalid.append("word_boosting.enable_word_boosting")
-        if not isinstance(words, list) or not all(
-            isinstance(word, str) for word in words
+# ==================================================================== route
+
+
+def _strict_unquote(raw: bytes) -> str | None:
+    """Percent-decode and UTF-8 decode, or ``None`` when either is malformed."""
+    index = raw.find(b"%")
+    while index != -1:
+        escape = raw[index + 1 : index + 3]
+        if len(escape) != 2 or not all(
+            c in b"0123456789abcdefABCDEF" for c in escape
         ):
-            invalid.append("word_boosting.word_boosting_list")
-    diarization = session.get("speaker_diarization", {})
-    if isinstance(diarization, dict):
-        enabled = diarization.get("enable_speaker_diarization", False)
-        if type(enabled) is not bool:
-            invalid.append("speaker_diarization.enable_speaker_diarization")
-    return list(dict.fromkeys(invalid))
+            return None
+        index = raw.find(b"%", index + 3)
+    try:
+        return unquote_to_bytes(raw).decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return None
 
 
-def _session_rejections(
-    session: Mapping[str, object],
-) -> list[tuple[str, str]]:
-    """Return every semantic config rejection in dialect-native spelling."""
-    allowed = {
-        "id",
-        "object",
-        "client_secret",
-        "provenance",
-        "modalities",
-        "input_audio_format",
-        "input_audio_params",
-        "input_audio_transcription",
-        "recognition_config",
-        "speaker_diarization",
-        "word_boosting",
-        "endpointing_config",
-    }
-    rejected: list[tuple[str, str]] = [
-        ("invalid_config_field", key) for key in session if key not in allowed
-    ]
-    if session.get("modalities", ["text"]) != ["text"]:
-        rejected.append(("invalid_config_field", "modalities"))
-    params = session.get("input_audio_params", {})
-    assert isinstance(params, dict)
-    rejected.extend(
-        ("invalid_config_field", f"input_audio_params.{key}")
-        for key in params
-        if key not in {"sample_rate_hz", "num_channels"}
-    )
-    transcription = session.get("input_audio_transcription", {})
-    assert isinstance(transcription, dict)
-    rejected.extend(
-        ("invalid_config_field", f"input_audio_transcription.{key}")
-        for key in transcription
-        if key not in {"language", "model", "prompt"}
-    )
-    if transcription.get("prompt"):
-        rejected.append(
-            ("unsupported_capability", "input_audio_transcription.prompt")
-        )
-    for name in ("speaker_diarization", "word_boosting", "endpointing_config"):
-        value = session.get(name, {})
-        assert isinstance(value, dict)
-        if any(bool(item) for item in value.values()):
-            rejected.append(("unsupported_capability", name))
-    recognition = session.get("recognition_config", {})
-    assert isinstance(recognition, dict)
-    supported = {
-        "max_alternatives",
-        "enable_automatic_punctuation",
-        "enable_verbatim_transcripts",
-        "enable_word_time_offsets",
-        "enable_profanity_filter",
-    }
-    rejected.extend(
-        ("invalid_config_field", f"recognition_config.{key}")
-        for key in recognition
-        if key not in supported
-    )
-    if recognition.get("max_alternatives", 1) > 1:
-        rejected.append(
-            ("invalid_config_field", "recognition_config.max_alternatives")
-        )
-    if recognition.get("enable_word_time_offsets"):
-        rejected.append(
-            (
-                "unsupported_capability",
-                "recognition_config.enable_word_time_offsets",
-            )
-        )
-    if recognition.get("enable_profanity_filter"):
-        rejected.append(
-            (
-                "invalid_config_field",
-                "recognition_config.enable_profanity_filter",
-            )
-        )
-    return list(dict.fromkeys(rejected))
-
-
-def _decode_query(query: bytes) -> list[tuple[str, str]] | None:
-    """Strictly percent/UTF-8 decode a raw ASGI query string."""
-    pairs: list[tuple[str, str]] = []
+def _query_pairs(query: bytes) -> list[tuple[str, str | None]] | None:
+    if not query:
+        return []
+    pairs: list[tuple[str, str | None]] = []
     for part in query.split(b"&"):
         key, separator, value = part.partition(b"=")
-        if not separator:
-            value = b""
-        try:
-            decoded_key = unquote_to_bytes(key).decode("utf-8", "strict")
-            decoded_value = unquote_to_bytes(value).decode("utf-8", "strict")
-        except UnicodeDecodeError:
+        name = _strict_unquote(key)
+        text = _strict_unquote(value) if separator else ""
+        if name is None or text is None:
             return None
-        if b"%" in key or b"%" in value:
-            # urllib leaves malformed percent escapes unchanged; reject rather
-            # than accidentally falling through to the RFC-1 dialect.
-            for raw in (key, value):
-                index = 0
-                while index < len(raw):
-                    if raw[index : index + 1] == b"%":
-                        if index + 2 >= len(raw) or any(
-                            char not in b"0123456789abcdefABCDEF"
-                            for char in raw[index + 1 : index + 3]
-                        ):
-                            return None
-                        index += 3
-                    else:
-                        index += 1
-        pairs.append((decoded_key, decoded_value))
+        pairs.append((name, text if separator else None))
     return pairs
 
 
-# @spec ING-NIMWS-002
-def dispatch_decision(scope: Mapping[str, object]) -> DispatchDecision:
-    """Claim only `/v1/realtime?intent=transcription` exactly once."""
-    if scope.get("type") != "websocket" or scope.get("path") != "/v1/realtime":
-        return DispatchDecision.PASS
+def _serves_query(scope: Mapping[str, Any]) -> bool:
+    """Whether the query decodes strictly to just ``intent=transcription``."""
     query = scope.get("query_string", b"")
-    if not isinstance(query, bytes):
-        return DispatchDecision.DENY
-    decoded = _decode_query(query)
-    if decoded is None:
-        return DispatchDecision.DENY
-    if decoded == [("intent", "transcription")]:
-        return DispatchDecision.CLAIM
-    return DispatchDecision.PASS
+    if not isinstance(query, bytes | bytearray):
+        return False
+    return _query_pairs(bytes(query)) == [("intent", "transcription")]
 
 
-# @spec ING-NIMWS-001
-def bootstrap_session(model_name: str) -> dict[str, object]:
-    """Return a canonical client-echoable NIM transcription-session object."""
-    if not model_name:
-        raise ValueError("model_name must be non-empty")
+class RealtimeRoute:
+    """The ASGI app of the WebSocket route ``/plugins/riva/v1/realtime``.
+
+    ``attach_router`` registers it under the plugin prefix, so it runs
+    inside core's middleware (WebSocket metrics included); core's own
+    ``/v1/realtime`` route is not touched.
+    """
+
+    def __init__(self, plugin: Any) -> None:
+        """Bind the route to ``plugin``."""
+        self.plugin = plugin
+
+    # @spec ING-NIMWS-026, ING-NIMWS-027, ING-SHIM-022, ING-EP-095
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        """Serve a connection with the exact query; refuse any other.
+
+        The query check is the first step, before the ingress cap: any
+        other query is closed with 1008 before accept (the ASGI server's
+        HTTP 403), a refusal send that creates no owner and is one terminal
+        attempt once its bound has passed; nothing is read and no
+        ingress-cap count is taken.
+        """
+        if not _serves_query(scope):
+            close: Message = {"type": "websocket.close", "code": 1008}
+            with contextlib.suppress(Exception):
+                await surfaces.bounded_send(
+                    self.plugin, send(close), terminal=True
+                )
+            return
+        adapter = RealtimeAdapter(
+            plugin=self.plugin, scope=scope, receive=receive, send=send
+        )
+        await adapter.run()
+
+
+def bootstrap_endpoint(plugin: Any) -> Callable[[], Awaitable[Any]]:
+    """The handler of the Realtime bootstrap ``POST`` route."""
+    from fastapi.responses import JSONResponse
+
+    # @spec ING-NIMWS-025, ING-LIFE-045
+    async def realtime_transcription_sessions() -> JSONResponse:
+        """HTTP 200 and the default session object, in any plugin state.
+
+        It creates no owner and starts no timer; a plugin that is not
+        serving refuses on the WebSocket route instead (ING-NIMWS-028).
+        """
+        factory = plugin.factory
+        default_locale = None if factory is None else factory.default_locale
+        return JSONResponse(
+            bootstrap_session(plugin.served_model or "", default_locale)
+        )
+
+    return realtime_transcription_sessions
+
+
+# ================================================================ bootstrap
+
+
+# @spec ING-NIMWS-025, ING-NIMWS-013, ING-NIMWS-020
+def bootstrap_session(
+    model_name: str, default_locale: str | None
+) -> dict[str, Any]:
+    """The default transcription-session object of the public reference.
+
+    The stock client posts ``{}`` and echoes this back as its first update.
+    """
     return {
-        "id": f"sess_{uuid.uuid4().hex}",
+        "id": _hex_id("sess"),
         "object": "realtime.transcription_session",
         "modalities": ["text"],
         "input_audio_format": "pcm16",
+        "input_audio_params": {"sample_rate_hz": 16_000, "num_channels": 1},
         "input_audio_transcription": {
-            "language": "auto",
             "model": model_name,
+            "language": default_locale or "",
         },
-        "input_audio_params": {"sample_rate_hz": 16000, "num_channels": 1},
         "recognition_config": {"max_alternatives": 1},
         "speaker_diarization": {"enable_speaker_diarization": False},
         "word_boosting": {
@@ -313,933 +258,1084 @@ def bootstrap_session(model_name: str) -> dict[str, object]:
     }
 
 
-# @spec ING-CORE-005, ING-NIMWS-004, ING-NIMWS-005, ING-NIMWS-006
-def project_event(event: Mapping[str, object]) -> dict[str, object]:
-    """Project one small sans-I/O event for unit-level wire assertions."""
-    event_type = event.get("type")
-    if event_type == "connect":
-        return {
-            "type": "conversation.created",
-            "conversation": {"object": "realtime.conversation"},
-        }
-    if event_type == "hypothesis":
-        return {
-            "type": "conversation.item.input_audio_transcription.delta",
-            "delta": _suffix(
-                str(event.get("previous", "")), str(event.get("current", ""))
-            ),
-        }
-    if event_type == "input_audio_buffer.done":
-        return {
-            "type": "conversation.item.input_audio_transcription.completed",
-            "is_last_result": True,
-        }
-    if event_type == "input_audio_buffer.clear":
-        return {"type": "input_audio_buffer.cleared", "rewound": False}
-    if event_type == "transcription_session.update":
-        fmt = str(event.get("format", "pcm16"))
-        rate = event.get("rate", 16000)
-        if type(rate) is not int:
-            return _error(
-                "invalid_event",
-                "rate must be an integer",
-                ["rate"],
+# =============================================================== projection
+
+
+# @spec ING-CORE-019
+def suffix(previous: str, current: str) -> str:
+    """The incremental text between two cumulative hypotheses.
+
+    A hypothesis that extends the previous one yields only the new text; a
+    revised one is sent whole, since no suffix of it is true.
+    """
+    if current.startswith(previous):
+        return current[len(previous) :]
+    return current
+
+
+def project_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """One server event on the wire: its ``type``, an ``event_id``, fields."""
+    projected: dict[str, Any] = {
+        "type": event["type"],
+        "event_id": event.get("event_id") or _hex_id("event"),
+    }
+    projected.update(
+        (key, value)
+        for key, value in event.items()
+        if key not in ("type", "event_id")
+    )
+    return projected
+
+
+def _error_object(error: errors.FrontendError) -> dict[str, Any]:
+    """The OpenAI-shaped ``error`` object with the catalog code."""
+    body: dict[str, Any] = {"code": error.code, "message": error.message()}
+    if error.fields:
+        body["param"] = ",".join(error.fields)
+    if error.code == "busy" and error.authority:
+        body["authority"] = error.authority
+    return body
+
+
+# @spec ING-ERR-016, ING-ERR-017, ING-ERR-018, ING-ERR-019, ING-ERR-020
+# @spec ING-ERR-022, ING-ERR-023, ING-ERR-024, ING-ERR-026, ING-ERR-048
+# @spec ING-ERR-062, ING-ERR-063
+def _ending(
+    catalog: Any, error: errors.FrontendError, owner: Any
+) -> tuple[str, int]:
+    """The event and close of a terminal error (errors leaf, phase table).
+
+    ``service_unavailable`` closes 1012 for the shutdown abort row (the
+    owner was in provisional shutdown mode, or the drain deadline came
+    first), 1013 for an engine refusal before configuration, and 1011 after
+    a lease-call timeout or ``engine_dead``. A refusal of ``open`` (the
+    factory phase) is an ``error`` event, never ``failed``: ``cadence`` and
+    ``request_id_in_use`` close 1011 with ``internal``.
+    """
+    code = error.code
+    cause = owner.cause if owner is not None else None
+    phase = None if cause is None else cause.phase
+    shutdown = phase in _SHUTDOWN_PHASES or (
+        owner is not None
+        and owner.shutdown_observed
+        and owner.finalization != "client"
+    )
+    if code == "service_unavailable":
+        if shutdown:
+            return _ERROR, 1012
+        if phase == "factory":
+            return _ERROR, 1013
+        return (_FAILED if phase == "engine" else _ERROR), 1011
+    failing = code in ("internal", "invalid_audio") and phase != "factory"
+    event = _FAILED if failing else _ERROR
+    if code in ("invalid_audio", "unsupported_format"):
+        return event, 1008
+    if code == "internal":
+        return event, 1011
+    close = catalog.realtime_close(code)
+    if close is None:
+        close = 1008 if code in _CLIENT_CODES else 1011
+    return event, int(close)
+
+
+# =============================================================== validation
+
+
+def _rejection(code: str, field: str, detail: str) -> errors.FrontendError:
+    return errors.FrontendError(code, detail, fields=(field,))
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+#: The JSON type of every known field inside a session section.
+_FIELD_TYPES: Mapping[str, Callable[[Any], bool]] = MappingProxyType(
+    {
+        "sample_rate_hz": lambda v: _is_int(v),
+        "num_channels": lambda v: _is_int(v),
+        "language": lambda v: isinstance(v, str),
+        "model": lambda v: isinstance(v, str),
+        "prompt": lambda v: isinstance(v, str),
+        "max_alternatives": lambda v: _is_int(v),
+        "enable_automatic_punctuation": lambda v: isinstance(v, bool),
+        "enable_verbatim_transcripts": lambda v: isinstance(v, bool),
+        "enable_word_time_offsets": lambda v: isinstance(v, bool),
+        "enable_profanity_filter": lambda v: isinstance(v, bool),
+        "enable_speaker_diarization": lambda v: isinstance(v, bool),
+        "max_speaker_count": lambda v: _is_int(v),
+        "enable_word_boosting": lambda v: isinstance(v, bool),
+        "word_boosting_list": lambda v: isinstance(v, list),
+        **{
+            name: _is_number
+            for name in (
+                "start_history",
+                "start_threshold",
+                "stop_history",
+                "stop_threshold",
+                "stop_history_eou",
+                "stop_threshold_eou",
             )
-        mapped = _FORMAT_NAMES.get(fmt, fmt)
-        rejection = validate_format(mapped, rate)
-        if rejection is not None:
-            return {"code": rejection.code, "fields": list(rejection.fields)}
-        return {
-            "type": "transcription_session.updated",
-            "locale": str(event.get("locale", "auto")),
-        }
-    if event_type == "idle_timeout":
-        return {"code": "idle_timeout", "aborted": True}
-    return _error("invalid_event", f"unknown event type {event_type!r}")
+        },
+    }
+)
 
 
-class _Connection:
-    """One raw-ASGI NIM session, serialized through one direct lease owner."""
+def _structure_errors(session: Mapping[str, Any]) -> list[str]:
+    """Known session fields whose JSON type is wrong (``invalid_event``)."""
+    wrong: list[str] = []
+    modalities = session.get("modalities", [])
+    if not (
+        isinstance(modalities, list)
+        and all(isinstance(m, str) for m in modalities)
+    ):
+        wrong.append("modalities")
+    if not isinstance(session.get("input_audio_format", ""), str):
+        wrong.append("input_audio_format")
+    for name in ("custom_configuration", *_SECTION_KEYS):
+        value = session.get(name, {})
+        if not isinstance(value, dict):
+            wrong.append(name)
+            continue
+        if name == "custom_configuration":
+            continue
+        wrong.extend(
+            key
+            for key, item in value.items()
+            if key in _SECTION_KEYS[name] and not _FIELD_TYPES[key](item)
+        )
+    return list(dict.fromkeys(wrong))
+
+
+def _section(session: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = session.get(name)
+    return value if isinstance(value, dict) else {}
+
+
+def _format_rejections(
+    session: Mapping[str, Any],
+) -> list[errors.FrontendError]:
+    """The joint format check of ``input_audio_format`` and its params."""
+    name = session.get("input_audio_format", "pcm16")
+    params = _section(session, "input_audio_params")
+    rate = params.get("sample_rate_hz", 16_000)
+    channels = params.get("num_channels", 1)
+    if not (isinstance(name, str) and _is_int(rate) and _is_int(channels)):
+        return []  # a structural error, reported as invalid_event
+    if name == _DEFERRED:
+        found: list[errors.FrontendError] = []
+        if rate not in (0, 8_000, 16_000):
+            found.append(
+                _rejection(
+                    "unsupported_format",
+                    "sample_rate_hz",
+                    f"no accepted cell has a sample rate of {rate} Hz",
+                )
+            )
+        if channels not in (0, 1):
+            found.append(
+                _rejection(
+                    "unsupported_format",
+                    "num_channels",
+                    "only mono audio is accepted",
+                )
+            )
+        return found
+    problem = frontend.validate_format(
+        _FORMATS.get(name, name), rate, channels or 1
+    )
+    if problem is None:
+        return []
+    return [_format_error(problem)]
+
+
+def _format_error(problem: frontend.FormatError) -> errors.FrontendError:
+    return errors.FrontendError(
+        "unsupported_format",
+        problem.detail,
+        fields=tuple(
+            dict.fromkeys(_REALTIME_FORMAT_FIELDS[f] for f in problem.fields)
+        ),
+    )
+
+
+# @spec ING-NIMWS-007, ING-NIMWS-009, ING-NIMWS-013, ING-NIMWS-014
+# @spec ING-NIMWS-022, ING-EOU-003, ING-EP-026
+def validate_session_update(
+    update: Mapping[str, Any],
+    *,
+    served_model: str,
+    locales: frozenset[str],
+    default_locale: str | None,
+    first: bool,
+) -> list[errors.FrontendError]:
+    """Every rejection of one session object, each naming the dialect field.
+
+    An unknown key is ``invalid_config_field`` on any update, and a named
+    locale is checked on any update. The first update also dispositions the
+    format, ``model``, ``prompt``, ``modalities`` and every section field for
+    field like the gRPC table; later updates leave changed fields to the
+    adapter (``config_change_rejected``). ``id``, ``object``,
+    ``client_secret`` and ``provenance`` are echo keys.
+    """
+    found: list[errors.FrontendError] = []
+    for key in update:
+        if key not in _CONFIG_KEYS and key not in _ECHO_KEYS:
+            found.append(
+                _rejection(
+                    "invalid_config_field", key, f"{key} is not a session field"
+                )
+            )
+    for section, known in _SECTION_KEYS.items():
+        for key in _section(update, section):
+            if key not in known:
+                found.append(
+                    _rejection(
+                        "invalid_config_field",
+                        key,
+                        f"{key} is not a field of {section}",
+                    )
+                )
+    transcription = _section(update, "input_audio_transcription")
+    if first or "language" in transcription:
+        language = transcription.get("language", "")
+        if isinstance(language, str):
+            locale = surfaces.locale_error(
+                language,
+                field="language",
+                locales=locales,
+                default_locale=default_locale,
+            )
+            if locale is not None:
+                found.append(locale)
+    if not first:
+        return found
+    found.extend(_format_rejections(update))
+    modalities = update.get("modalities", ["text"])
+    if modalities != ["text"]:
+        found.append(
+            _rejection(
+                "invalid_config_field", "modalities", 'only ["text"] is served'
+            )
+        )
+    model = transcription.get("model", "")
+    if model and model != served_model:
+        found.append(
+            _rejection(
+                "invalid_config_field",
+                "model",
+                f"this server serves {served_model!r}",
+            )
+        )
+    if transcription.get("prompt", ""):
+        found.append(
+            _rejection(
+                "invalid_config_field", "prompt", "a prompt is not supported"
+            )
+        )
+    recognition = _section(update, "recognition_config")
+    alternatives = recognition.get("max_alternatives", 1)
+    if _is_int(alternatives) and alternatives > 1:
+        found.append(
+            _rejection(
+                "invalid_config_field",
+                "max_alternatives",
+                "greedy decoding has one hypothesis",
+            )
+        )
+    for key in ("enable_profanity_filter", "enable_word_time_offsets"):
+        if recognition.get(key) is True:
+            found.append(
+                _rejection(
+                    "invalid_config_field", key, f"{key} is not supported"
+                )
+            )
+    for section in _CAPABILITY_SECTIONS:
+        if _section_set(section, _section(update, section)):
+            found.append(
+                _rejection(
+                    "unsupported_capability",
+                    section,
+                    f"{section.replace('_', ' ')} is not available",
+                )
+            )
+    custom = update.get("custom_configuration")
+    if custom:
+        found.append(
+            _rejection(
+                "invalid_config_field",
+                "custom_configuration",
+                "no custom configuration key is accepted",
+            )
+        )
+    return found
+
+
+def _section_set(name: str, section: Mapping[str, Any]) -> bool:
+    """Whether a capability section is non-default."""
+    if name == "speaker_diarization":
+        return bool(section.get("enable_speaker_diarization")) or bool(
+            section.get("max_speaker_count")
+        )
+    if name == "word_boosting":
+        return bool(section.get("enable_word_boosting")) or bool(
+            section.get("word_boosting_list")
+        )
+    return any(
+        bool(section.get(key)) for key in _SECTION_KEYS["endpointing_config"]
+    )
+
+
+def _settings(session: Mapping[str, Any], served_model: str) -> dict[str, Any]:
+    """The comparable value of every non-locale field present in ``session``.
+
+    A later update is compared field by field with the configured session;
+    a field absent from the update is unchanged.
+    """
+    values: dict[str, Any] = {}
+    if "modalities" in session:
+        values["modalities"] = tuple(session["modalities"] or ())
+    if "input_audio_format" in session:
+        values["input_audio_format"] = session["input_audio_format"]
+    params = _section(session, "input_audio_params")
+    for key in ("sample_rate_hz", "num_channels"):
+        if key in params:
+            values[key] = params[key]
+    transcription = _section(session, "input_audio_transcription")
+    if "model" in transcription:
+        values["model"] = transcription["model"] or served_model
+    if "prompt" in transcription:
+        values["prompt"] = transcription["prompt"]
+    recognition = _section(session, "recognition_config")
+    for key in _SECTION_KEYS["recognition_config"]:
+        if key in recognition:
+            value = recognition[key]
+            values[key] = (value or 1) if key == "max_alternatives" else value
+    for section in _CAPABILITY_SECTIONS:
+        if section in session:
+            values[section] = _section_set(section, _section(session, section))
+    if "custom_configuration" in session:
+        values["custom_configuration"] = bool(session["custom_configuration"])
+    return values
+
+
+def _default_settings(served_model: str) -> dict[str, Any]:
+    return _settings(
+        {
+            "modalities": ["text"],
+            "input_audio_format": "pcm16",
+            "input_audio_params": {"sample_rate_hz": 16_000, "num_channels": 1},
+            "input_audio_transcription": {"model": "", "prompt": ""},
+            "recognition_config": {
+                "max_alternatives": 1,
+                "enable_automatic_punctuation": False,
+                "enable_verbatim_transcripts": False,
+                "enable_word_time_offsets": False,
+                "enable_profanity_filter": False,
+            },
+            "speaker_diarization": {},
+            "word_boosting": {},
+            "endpointing_config": {},
+            "custom_configuration": {},
+        },
+        served_model,
+    )
+
+
+# ================================================================== adapter
+
+
+class _Gone(Exception):
+    """The transport is gone: a disconnect or a send beyond its bound."""
+
+
+_TRIGGER = object()  # what a read returns once the shutdown trigger is seen
+
+
+class RealtimeAdapter:
+    """One claimed Riva Realtime connection over its ``StreamOwner``.
+
+    Accepted commands are processed through one FIFO: the adapter reads one
+    client event at a time, only between owner operations, so every append
+    ahead of a ``clear`` completes its handoff before the ``clear``, and
+    reads pause while ``feed`` awaits the engine. After ``done`` a receive
+    observer keeps reading until the final's send begins.
+    """
 
     def __init__(
-        self,
-        factory: SessionFactory,
-        config: object,
-        gate: LoadShedGate,
-        owner_register: OwnerRegister | None,
-        owner_factory: LeaseOwnerFactory,
-        admission_lease: AdmissionLease,
+        self, *, plugin: Any, scope: Scope, receive: Receive, send: Send
     ) -> None:
-        """Capture shared factory/config and initialize local buffer state."""
-        self._factory = factory
-        self._config = config
-        self._gate = gate
-        self._owner_register = owner_register
-        self._owner_factory = owner_factory
-        self._admission_lease: AdmissionLease | None = admission_lease
-        self._registration: LoadShedRegistration | None = None
-        self._tracked_owner: object | None = None
-        self._owner: DirectLeaseOwner | None = None
-        self._frontend: StreamingAudioFrontend | None = None
-        self._deferred = False
-        self._riff_bytes = b""
-        self._riff_remaining: int | None = None
-        self._configured = False
-        self._terminal = False
-        self._last_hypothesis = ""
-        self._configured_at: float | None = None
-        self._preconfiguration_deadline = time.monotonic() + float(
-            getattr(config, "preconfiguration_timeout", 30.0)
-        )
-        self._last_accepted_audio_at: float | None = None
-        self._format_spec: tuple[str, int] | None = None
-        self._declared_rate = 16000
-        self._declared_channels = 1
-        self._initial_session: dict[str, object] | None = None
-        self._item_id = f"item_{uuid.uuid4().hex}"
+        """Bind one claimed connection's ASGI channel to the plugin."""
+        self._plugin = plugin
+        self._scope = scope
+        self._receive = receive
+        self._send = send
+        self._owner: Any = None
+        self._record: Any = None
+        self._gone = False
+        self._closed = False
+        self._item_id = _hex_id("item")
+        self._session_id = _hex_id("sess")
+        self._hypothesis = ""
+        self._format = "pcm16"
+        self._rate = 16_000
+        self._channels = 1
+        self._locale = ""
+        self._baseline: dict[str, Any] = {}
+        self._riff: bytearray | None = None
+        self._remaining: int | None = None
+        self._observed: errors.FrontendError | None = None
 
-    def _activity_deadline(self) -> tuple[float, str]:
-        """Return the current accepted-audio idle/max-duration deadline."""
-        assert self._configured_at is not None
-        accepted_at = self._last_accepted_audio_at or self._configured_at
-        idle = accepted_at + float(
-            getattr(self._config, "session_idle_timeout", 30.0)
-        )
-        maximum = getattr(self._config, "max_session_duration", None)
-        if maximum is not None:
-            duration = self._configured_at + float(maximum)
-            if duration <= idle:
-                return duration, "request_timeout"
-        return idle, "idle_timeout"
+    # ------------------------------------------------------------- entry
 
-    async def _await_active(
-        self,
-        operation: Awaitable[Any],
-        *,
-        accepted_event: asyncio.Event | None = None,
-    ) -> Any:
-        """Bound provider work and recompute after exact receipt credit."""
-        task = asyncio.ensure_future(operation)
-        try:
-            while True:
-                deadline, code = self._activity_deadline()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise _LifecycleTimeout(code)
-                if accepted_event is None:
-                    try:
-                        return await asyncio.wait_for(
-                            asyncio.shield(task), remaining
-                        )
-                    except asyncio.TimeoutError as error:
-                        raise _LifecycleTimeout(code) from error
-                accepted_wait = asyncio.create_task(accepted_event.wait())
-                done, _ = await asyncio.wait(
-                    {task, accepted_wait},
-                    timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if task in done:
-                    accepted_wait.cancel()
-                    await asyncio.gather(accepted_wait, return_exceptions=True)
-                    return await task
-                if accepted_wait in done:
-                    accepted_event.clear()
-                    continue
-                accepted_wait.cancel()
-                await asyncio.gather(accepted_wait, return_exceptions=True)
-                raise _LifecycleTimeout(code)
-        finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-
-    async def run(self, receive: AsgiReceive, send: AsgiSend) -> None:
-        """Accept, configure once, process FIFO events, and clean up on drop."""
-        await send({"type": "websocket.accept"})
-        registration = await self._gate.register("nim_realtime_transcription")
-        if isinstance(registration, LoadShedRejected):
-            await self._send_json(
-                send,
-                _error(
-                    registration.code,
-                    f"authority: {registration.authority}",
-                ),
-            )
-            await send({"type": "websocket.close", "code": 1013})
-            await self._release_registration()
+    # @spec ING-NIMWS-028, ING-NIMWS-029, ING-ERR-015, ING-ERR-051
+    async def run(self) -> None:
+        """Admit or refuse the connection, then serve it to its one end."""
+        plugin = self._plugin
+        connect = await self._receive()
+        if connect.get("type") != "websocket.connect":
             return
-        if registration is None:
-            raise RuntimeError("realtime inference must consume one owner slot")
-        assert isinstance(registration, LoadShedRegistration)
-        self._registration = registration
-        if self._owner_register is not None:
-            self._tracked_owner = await self._owner_register()
-        await self._send_json(
-            send,
-            {
-                "type": "conversation.created",
-                "event_id": _event_id(),
-                "conversation": {
-                    "id": f"conv_{uuid.uuid4().hex}",
+        ingress = getattr(plugin, "ingress", None)
+        admitted = (
+            None
+            if ingress is None
+            else ingress.try_admit(admission.OwnerKind.realtime)
+        )
+        if admitted is None:
+            refusal = (
+                errors.FrontendError(
+                    "service_unavailable", "the server is not serving"
+                )
+                if ingress is None
+                else ingress.refusal(admission.OwnerKind.realtime)
+            )
+            await self._refuse(refusal)
+            return
+        registry = plugin.registry
+        record = registry.register(
+            admission.OwnerKind.realtime, asyncio.current_task()
+        )
+        surfaces.hold(record)
+        try:
+            self._record = record
+            self._owner = lease.StreamOwner(
+                lease_opener=plugin.factory.open,
+                surface="realtime",
+                config=plugin.config,
+                clock=plugin.clock,
+                registry=registry,
+                record=record,
+                catalog=plugin.catalog,
+            )
+            await self._serve()
+        finally:
+            surfaces.release_owner(registry, record, admitted)
+
+    # @spec ING-NIMWS-028, ING-EP-095, ING-EP-110, ING-LIFE-061
+    async def _refuse(self, error: errors.FrontendError) -> None:
+        """Accept, send the one ``error``, close 1013: no owner, no read.
+
+        The three messages are one refusal send that creates no owner: one
+        bound (``response_send_timeout``, clipped to ``D``), and once that
+        bound has passed one terminal attempt for the whole sequence. A
+        failed or abandoned refusal starts no further frame.
+        """
+        event = json.dumps(
+            project_event({"type": _ERROR, "error": _error_object(error)})
+        )
+        messages: tuple[Message, ...] = (
+            {"type": "websocket.accept"},
+            {"type": "websocket.send", "text": event},
+            {"type": "websocket.close", "code": 1013},
+        )
+
+        async def sequence() -> None:
+            for message in messages:
+                await self._send(message)
+
+        try:
+            await surfaces.bounded_send(self._plugin, sequence(), terminal=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._gone = True
+            return
+        self._closed = True
+
+    # @spec ING-NIMWS-017, ING-NIMWS-023, ING-ERR-005, ING-ERR-011
+    # @spec ING-ERR-027, ING-ERR-033, ING-ERR-034, ING-ERR-062
+    async def _serve(self) -> None:
+        try:
+            await self._send_bounded({"type": "websocket.accept"})
+            await self._emit(
+                _CREATED,
+                conversation={
+                    "id": _hex_id("conv"),
                     "object": "realtime.conversation",
                 },
-            },
-        )
-        timeout_code = "configuration_timeout"
-        try:
-            while not self._terminal:
-                now = time.monotonic()
-                max_duration = getattr(
-                    self._config, "max_session_duration", None
-                )
-                if (
-                    self._configured_at is not None
-                    and max_duration is not None
-                    and now - self._configured_at >= float(max_duration)
-                ):
-                    await self._fail(
-                        send,
-                        "request_timeout",
-                        "session duration exceeded",
-                        close=1008,
-                    )
-                    return
-                if self._configured:
-                    accepted_at = self._last_accepted_audio_at
-                    if accepted_at is None:
-                        accepted_at = self._configured_at
-                    assert accepted_at is not None
-                    deadline = accepted_at + float(
-                        getattr(self._config, "session_idle_timeout", 30.0)
-                    )
-                    timeout_code = "idle_timeout"
-                    max_duration = getattr(
-                        self._config, "max_session_duration", None
-                    )
-                    if max_duration is not None:
-                        assert self._configured_at is not None
-                        duration_deadline = self._configured_at + float(
-                            max_duration
-                        )
-                        if duration_deadline < deadline:
-                            deadline = duration_deadline
-                            timeout_code = "request_timeout"
-                else:
-                    deadline = self._preconfiguration_deadline
-                    timeout_code = "configuration_timeout"
-                timeout = deadline - now
-                if timeout <= 0:
-                    await self._fail(
-                        send,
-                        timeout_code,
-                        "session receive timeout",
-                        close=1008,
-                    )
-                    return
-                message = await asyncio.wait_for(receive(), timeout)
-                message_type = message.get("type")
-                if message_type == "websocket.disconnect":
-                    await self._abort()
-                    return
-                if message_type != "websocket.receive":
-                    continue
-                text = message.get("text")
-                if not isinstance(text, str):
-                    await self._fail(
-                        send,
-                        "invalid_event",
-                        "text JSON event required",
-                        close=1008,
-                    )
-                    return
-                if len(text.encode()) > int(
-                    getattr(
-                        self._config, "ws_event_envelope_max_bytes", 1 << 20
-                    )
-                ):
-                    await self._fail(
-                        send,
-                        "request_too_large",
-                        "event envelope exceeds limit",
-                        close=1009,
-                    )
-                    return
-                try:
-                    event = json.loads(text)
-                except json.JSONDecodeError:
-                    await self._fail(
-                        send,
-                        "invalid_event",
-                        "event is not valid JSON",
-                        close=1008,
-                    )
-                    return
-                if not isinstance(event, dict):
-                    await self._fail(
-                        send,
-                        "invalid_event",
-                        "event must be an object",
-                        close=1008,
-                    )
-                    return
-                await self._handle(event, send)
+            )
+            await self._configure()
+            client = await self._stream()
+            text = await self._finalize(client=client)
+            shutdown = self._owner.finalization == "shutdown"
+            # The final's send begins here: it is irrevocable from now on.
+            await self._emit(
+                _COMPLETED,
+                item_id=self._item_id,
+                content_index=0,
+                transcript=text,
+                is_last_result=True,
+            )
+            await self._close(1001 if shutdown else 1000)
+        except errors.FrontendError as error:
+            await self._terminate(error)
+        except _Gone:
+            await self._abandon()
         except asyncio.CancelledError:
-            # Plugin shutdown cancels the ASGI owner task. Preserve that
-            # cancellation as the primary cause, but do not release owner
-            # tracking until the lease has attempted abort → release.
-            with contextlib.suppress(BaseException):
-                await self._abort()
-            raise
-        except asyncio.TimeoutError:
-            await self._fail(
-                send,
-                timeout_code,
-                "session receive timeout",
-                close=1008,
-            )
-        except Exception:
-            await self._abort()
-            await self._fail(send, "internal", "adapter failure", close=1011)
-        finally:
-            await self._release_registration()
-
-    async def _handle(self, event: dict[str, object], send: AsgiSend) -> None:
-        """Project one client event without reading ahead of lease work."""
-        event_type = event.get("type")
-        if (
-            not self._configured
-            and event_type != "transcription_session.update"
-        ):
-            await self._fail(
-                send,
-                "protocol_order",
-                "first event must configure the transcription session",
-                close=1008,
-            )
-            return
-        if event_type == "transcription_session.update":
-            await self._update(event, send)
-        elif event_type == "input_audio_buffer.append":
-            await self._append(event, send)
-        elif event_type == "input_audio_buffer.commit":
-            await self._send_json(
-                send,
-                {
-                    "type": "input_audio_buffer.committed",
-                    "event_id": _event_id(),
-                    "item_id": self._item_id,
-                    "content_index": 0,
-                },
-            )
-        elif event_type == "input_audio_buffer.clear":
-            self._riff_bytes = b""
-            self._riff_remaining = None
-            if self._deferred:
-                self._frontend = None
-            elif self._format_spec is not None:
-                encoding, rate = self._format_spec
-                self._frontend = StreamingAudioFrontend(
-                    encoding=encoding, sample_rate_hz=rate
-                )
-            await self._send_json(
-                send,
-                {"type": "input_audio_buffer.cleared", "event_id": _event_id()},
-            )
-        elif event_type == "input_audio_buffer.done":
-            await self._done(send)
-        else:
-            await self._fail(
-                send,
-                "invalid_event",
-                f"unknown event type {event_type!r}",
-                close=1008,
-            )
-
-    async def _update(self, event: dict[str, object], send: AsgiSend) -> None:
-        """Open on first update; later updates can change locale."""
-        session = event.get("session")
-        if not isinstance(session, dict):
-            await self._fail(
-                send, "invalid_event", "session object required", close=1008
-            )
-            return
-        structural_fields = _structural_session_fields(session)
-        if structural_fields:
-            await self._fail(
-                send,
-                "invalid_event",
-                "invalid session field types",
-                structural_fields,
-                close=1008,
-            )
-            return
-        transcription = session.get("input_audio_transcription", {})
-        params = session.get("input_audio_params", {})
-        assert isinstance(transcription, dict)
-        assert isinstance(params, dict)
-        semantic_rejections = _session_rejections(session)
-        initial_transcription = (
-            (self._initial_session or {}).get("input_audio_transcription", {})
-            if self._configured
-            else {}
-        )
-        assert isinstance(initial_transcription, dict)
-        old_locale = str(initial_transcription.get("language", "auto"))
-        locale = str(
-            transcription.get(
-                "language", old_locale if self._configured else "auto"
-            )
-        )
-        served_model = getattr(self._config, "model_name", None)
-        requested_model = transcription.get("model")
-        locales = getattr(self._config, "locales", None)
-        selector_rejections: list[tuple[str, str]] = []
-        if served_model is not None and requested_model not in (
-            None,
-            served_model,
-        ):
-            selector_rejections.append(
-                ("invalid_config_field", "input_audio_transcription.model")
-            )
-        if locales is not None and locale not in set(locales) | {"auto"}:
-            selector_rejections.append(
-                ("unknown_locale", "input_audio_transcription.language")
-            )
-        if not self._configured and (
-            semantic_rejections or selector_rejections
-        ):
-            for code, field in semantic_rejections + selector_rejections:
-                await self._fail(
-                    send,
-                    code,
-                    "unsupported model or locale selector",
-                    [field],
-                )
-            return
-        if self._configured:
-            if self._owner is None:
-                await self._fail(
-                    send, "internal", "missing lease owner", close=1011
-                )
-                return
-            initial = self._initial_session or {}
-            immutable = (
-                "input_audio_format",
-                "input_audio_params",
-                "recognition_config",
-                "speaker_diarization",
-                "word_boosting",
-                "endpointing_config",
-            )
-            changed = [
-                name
-                for name in immutable
-                if name in session and session.get(name) != initial.get(name)
-            ]
-            for name in ("model", "prompt"):
-                if name in transcription and transcription.get(
-                    name
-                ) != initial_transcription.get(name):
-                    changed.append(f"input_audio_transcription.{name}")
-            for code, field in semantic_rejections + selector_rejections:
-                await self._fail(
-                    send,
-                    code,
-                    "unsupported session field",
-                    [field],
-                )
-            if changed:
-                await self._fail(
-                    send,
-                    "config_change_rejected",
-                    "field is immutable after session open",
-                    changed,
-                )
-            if any(code == "unknown_locale" for code, _ in selector_rejections):
-                return
-            if locale == old_locale:
-                await self._updated(send, old_locale)
-                return
-            try:
-                await self._await_active(self._owner.update_locale(locale))
-            except _LifecycleTimeout as error:
-                await self._fail(
-                    send,
-                    error.code,
-                    "session lifetime expired during locale update",
-                    close=1008,
-                )
-                return
-            except RuntimeError:
-                await self._fail(
-                    send, "session_terminal", "session is terminal", close=1008
-                )
-                return
-            initial_transcription["language"] = locale
-            initial["input_audio_transcription"] = initial_transcription
-            await self._updated(send, locale)
-            return
-
-        fmt = str(session.get("input_audio_format", "pcm16"))
-        rate = int(params.get("sample_rate_hz", 16000))
-        channels = int(params.get("num_channels", 1))
-        self._declared_rate = rate
-        self._declared_channels = channels
-        if fmt == _DEFERRED_FORMAT:
-            self._deferred = True
-        else:
-            mapped = _FORMAT_NAMES.get(fmt, fmt)
-            rejection = validate_format(mapped, rate, channels)
-            if rejection is not None:
-                await self._format_failure(send, rejection)
-                return
-            self._frontend = StreamingAudioFrontend(
-                encoding=mapped, sample_rate_hz=rate
-            )
-            self._format_spec = (mapped, rate)
-        self._owner = self._owner_factory(
-            self._factory,
-            cleanup_timeout=float(
-                getattr(self._config, "session_cleanup_timeout", 5.0)
-            ),
-        )
-        try:
-            remaining = self._preconfiguration_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            await asyncio.wait_for(
-                self._owner.open(cadence="560ms", locale=locale),
-                remaining,
-            )
-        except asyncio.TimeoutError:
-            await self._fail(
-                send,
-                "configuration_timeout",
-                "session configuration and open timed out",
-                close=1011,
-            )
-            return
-        except Exception:
-            await self._fail(send, "internal", "lease open failed", close=1011)
-            return
-        self._configured = True
-        effective_model = (
-            served_model
-            if isinstance(served_model, str) and served_model
-            else (
-                requested_model
-                if isinstance(requested_model, str) and requested_model
-                else "served"
-            )
-        )
-        effective = bootstrap_session(effective_model)
-        for name, value in session.items():
-            effective[name] = json.loads(json.dumps(value))
-        effective_transcription = effective["input_audio_transcription"]
-        assert isinstance(effective_transcription, dict)
-        effective_transcription["language"] = locale
-        effective_transcription["model"] = effective_model
-        provenance = getattr(self._config, "provenance", None)
-        if "provenance" not in session and isinstance(provenance, dict):
-            # Deployment-owned path only: `provenance` here is always the
-            # output of build_deployment_provenance (allowlist-built from
-            # DeploymentMetadata), never an arbitrary copied mapping, so
-            # embedding it verbatim is safe.  A client-supplied
-            # `session["provenance"]` was already copied into `effective`
-            # above and is intentionally left untouched -- the ING-NIMWS-008
-            # echo-key contract requires echoing client session fields, not
-            # rewriting them.
-            effective["provenance"] = dict(provenance)
-        self._initial_session = effective
-        self._configured_at = time.monotonic()
-        self._last_accepted_audio_at = self._configured_at
-        await self._updated(send, locale)
-
-    async def _append(self, event: dict[str, object], send: AsgiSend) -> None:
-        """Base64-decode one FIFO append and await its lease feed."""
-        if not self._configured:
-            await self._fail(
-                send, "protocol_order", "audio before session update"
-            )
-            return
-        payload = event.get("audio")
-        if not isinstance(payload, str):
-            await self._fail(send, "invalid_audio", "audio must be base64")
-            return
-        try:
-            raw = base64.b64decode(payload, validate=True)
-        except (binascii.Error, ValueError):
-            await self._fail(send, "invalid_audio", "audio must be base64")
-            return
-        if self._deferred and self._frontend is None:
-            riff_candidate = self._riff_bytes + raw
-            result = sniff_riff(
-                riff_candidate,
-                max_header_bytes=int(
-                    getattr(self._config, "max_riff_header_bytes", 65536)
+            await self._cancelled()
+        except Exception as unexpected:  # a bug here, not the client's
+            await self._terminate(
+                errors.FrontendError(
+                    "internal", f"unexpected failure: {unexpected!r}"
                 ),
+                "engine",
             )
-            if result is None:
-                self._riff_bytes = riff_candidate
-                return
-            if isinstance(result, FormatError):
-                await self._format_failure(send, result)
-                return
-            await self._resolve_riff(result, send)
-            if self._terminal:
-                return
-            raw = riff_candidate[result.data_offset :]
-            self._riff_bytes = b""
-        if self._riff_remaining is not None:
-            raw = raw[: self._riff_remaining]
-            self._riff_remaining -= len(raw)
-        if self._frontend is None or self._owner is None:
-            await self._fail(
-                send, "internal", "missing configured audio state", close=1011
-            )
-            return
-        samples = self._frontend.push(raw)
-        cap = int(getattr(self._config, "pre_submit_max_samples", 1 << 30))
-        for start in range(0, len(samples), cap):
-            await self._feed(samples[start : start + cap], send)
-            if self._terminal:
-                return
 
-    async def _resolve_riff(self, result: RiffFormat, send: AsgiSend) -> None:
-        """Bind deferred file mode once its header proves a valid cell."""
-        fields: list[str] = []
-        if result.sample_rate_hz != self._declared_rate:
-            fields.append("input_audio_params.sample_rate_hz")
-        if result.channels != self._declared_channels:
-            fields.append("input_audio_params.num_channels")
-        if fields:
-            await self._fail(
-                send,
-                "unsupported_format",
-                "RIFF format contradicts declared input_audio_params",
-                fields,
-                close=1008,
-            )
-            return
-        rejection = validate_format(
-            result.encoding, result.sample_rate_hz, result.channels
-        )
-        if rejection is not None:
-            await self._format_failure(send, rejection)
-            return
-        self._frontend = StreamingAudioFrontend(
-            encoding=result.encoding, sample_rate_hz=result.sample_rate_hz
-        )
-        self._format_spec = (result.encoding, result.sample_rate_hz)
-        self._riff_remaining = result.data_bytes
-
-    async def _feed(
-        self,
-        samples: object,
-        send: AsgiSend,
-        *,
-        finalization_deadline: float | None = None,
+    # @spec ING-EP-110, ING-LIFE-061
+    async def _terminate(
+        self, error: errors.FrontendError, phase: str = "protocol"
     ) -> None:
-        """Submit one normalized FIFO piece and emit only changed suffixes."""
-        if self._owner is None:
-            return
-        accepted: int | None = None
-        accepted_event = asyncio.Event()
+        """Settle the owner's one cause, then project it and close.
 
-        def accepted_callback(credit: int) -> None:
-            nonlocal accepted
-            if type(credit) is not int or credit != len(samples):  # type: ignore[arg-type]
-                raise RuntimeError("invalid provider acceptance credit")
-            if accepted is not None:
-                raise RuntimeError("duplicate provider acceptance credit")
-            accepted = credit
-            self._last_accepted_audio_at = time.monotonic()
-            accepted_event.set()
+        The terminal event and the close that follows it are sent in
+        sequence as one send under one bound and, once that bound has
+        passed, as one terminal attempt (ING-EP-110), as ``_refuse`` sends
+        its refusal.
+        """
+        owner = self._owner
+        await surfaces.settle(owner, error, phase)
+        error = surfaces.selected_error(owner, error)
+        if self._gone or self._closed:
+            return
+        event, close = _ending(self._plugin.catalog, error, owner)
+        text = json.dumps(project_event(self._error_event(event, error)))
+        messages: tuple[Message, ...] = (
+            {"type": "websocket.send", "text": text},
+            {"type": "websocket.close", "code": close},
+        )
+
+        async def sequence() -> None:
+            for message in messages:
+                await self._send(message)
 
         try:
-            operation = self._owner.feed(samples, on_accepted=accepted_callback)
-            if finalization_deadline is None:
-                hypotheses = await self._await_active(
-                    operation,
-                    accepted_event=accepted_event,
+            await self._bounded(sequence(), terminal=True)
+        except _Gone:
+            return
+        self._closed = True
+
+    async def _abandon(self) -> None:
+        """The transport is gone: clean up and send nothing more."""
+        self._gone = True
+        await surfaces.settle_shielded(
+            self._record,
+            self._owner,
+            errors.FrontendError("internal", "the transport is gone"),
+            "transport",
+        )
+
+    async def _cancelled(self) -> None:
+        """The plugin cancelled this owner: the shutdown abort row.
+
+        Cleanup is joined through any further cancellation, so the record
+        and admission outlive it (unless ``stop`` tore the plugin down).
+        """
+        shutdown = errors.FrontendError(
+            "service_unavailable", "the server is shutting down"
+        )
+        await surfaces.settle_shielded(
+            self._record, self._owner, shutdown, "shutdown"
+        )
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            task.uncancel()
+        await self._terminate(shutdown, "shutdown")
+
+    # ------------------------------------------------------------- sends
+
+    async def _send_bounded(self, message: Message) -> None:
+        """One send or close under the send bound (``bounded_send``).
+
+        A send that exceeds it, or fails, ends the connection by the
+        transport path: nothing further is sent, the close included. Once
+        the bound has passed such a send never starts; only the terminal
+        error event and its close (``_terminate``) are then attempted.
+        """
+        if self._gone or self._closed:
+            raise _Gone
+        await self._bounded(self._send(message), terminal=False)
+
+    async def _bounded(self, send: Awaitable[None], *, terminal: bool) -> None:
+        """``send``, one message or the terminal sequence, under one bound."""
+        try:
+            await surfaces.bounded_send(
+                self._plugin, send, record=self._record, terminal=terminal
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as failure:
+            self._gone = True
+            raise _Gone from failure
+
+    async def _emit(self, kind: str, **fields: Any) -> None:
+        await self._send_event({"type": kind, **fields})
+
+    async def _send_event(self, event: dict[str, Any]) -> None:
+        text = json.dumps(project_event(event))
+        await self._send_bounded({"type": "websocket.send", "text": text})
+
+    async def _emit_error(self, kind: str, error: errors.FrontendError) -> None:
+        """A non-terminal error event; the session continues."""
+        await self._send_event(self._error_event(kind, error))
+
+    def _error_event(
+        self, kind: str, error: errors.FrontendError
+    ) -> dict[str, Any]:
+        event: dict[str, Any] = {"type": kind, "error": _error_object(error)}
+        if kind == _FAILED:
+            event.update(item_id=self._item_id, content_index=0)
+        return event
+
+    async def _close(self, code: int) -> None:
+        await self._send_bounded({"type": "websocket.close", "code": code})
+        self._closed = True
+
+    # ------------------------------------------------------------- reads
+
+    # @spec ING-NIMWS-012, ING-NIMWS-015, ING-ERR-026
+    def _classify(
+        self, message: Message
+    ) -> dict[str, Any] | errors.FrontendError:
+        """One received message as an event, or the error it is.
+
+        Sizes are checked before any JSON or base64 decode: above
+        ``ws_receive_max_bytes`` or ``ws_event_envelope_max_bytes`` it is
+        ``request_too_large``. Malformed JSON, a non-object, a missing or
+        unknown type and wrong field types are ``invalid_event``.
+        """
+        kind = message.get("type")
+        if kind != "websocket.receive":
+            raise _Gone
+        config = self._plugin.config
+        text = message.get("text")
+        raw = message.get("bytes")
+        size = len(raw) if raw is not None else len((text or "").encode())
+        for limit_name in (
+            "ws_receive_max_bytes",
+            "ws_event_envelope_max_bytes",
+        ):
+            limit = int(getattr(config, limit_name))
+            if size > limit:
+                return errors.FrontendError(
+                    "request_too_large",
+                    f"a {size}-byte message exceeds {limit_name} ({limit})",
+                )
+        try:
+            body = raw.decode("utf-8") if raw is not None else (text or "")
+            event = json.loads(body)
+        except (UnicodeDecodeError, ValueError):
+            return errors.FrontendError(
+                "invalid_event", "the message is not a JSON object"
+            )
+        if not isinstance(event, dict):
+            return errors.FrontendError(
+                "invalid_event", "the message is not a JSON object"
+            )
+        event_type = event.get("type")
+        if not isinstance(event_type, str) or event_type not in EVENT_TYPES:
+            return _rejection(
+                "invalid_event", "type", f"unknown event type {event_type!r}"
+            )
+        if event_type == APPEND and not isinstance(event.get("audio"), str):
+            return _rejection(
+                "invalid_event", "audio", "audio must be a base64 string"
+            )
+        if event_type == UPDATE:
+            session = event.get("session")
+            if not isinstance(session, dict):
+                return _rejection(
+                    "invalid_event", "session", "session must be an object"
+                )
+            wrong = _structure_errors(session)
+            if wrong:
+                return errors.FrontendError(
+                    "invalid_event",
+                    "session fields have the wrong JSON type",
+                    fields=tuple(wrong),
+                )
+        return event
+
+    # @spec ING-LIFE-039
+    async def _next_event(self) -> Any:
+        """The next client event under the owner's client-wait bound.
+
+        Returns ``_TRIGGER`` once the shutdown trigger reached the owner;
+        raises the terminal error of an expired bound or invalid message.
+        """
+        try:
+            message = await self._call(self._owner.receive(self._receive()))
+        except lease.ShutdownObserved:
+            return _TRIGGER
+        if message.get("type") != "websocket.receive":
+            raise _Gone
+        event = self._classify(message)
+        if isinstance(event, errors.FrontendError):
+            phase = "input" if event.code == "request_too_large" else "protocol"
+            raise await self._terminal(event, phase)
+        return event
+
+    async def _terminal(
+        self, error: errors.FrontendError, phase: str
+    ) -> errors.FrontendError:
+        await surfaces.settle(self._owner, error, phase)
+        return surfaces.selected_error(self._owner, error)
+
+    async def _call(self, operation: Awaitable[T]) -> T:
+        """One owner operation; a failure has already been cleaned up."""
+        try:
+            return await operation
+        except errors.FrontendError:
+            if self._gone:
+                raise _Gone from None
+            raise
+
+    # ------------------------------------------------------ configuration
+
+    # @spec ING-NIMWS-029, ING-NIMWS-022, ING-NIMWS-023, ING-ERR-034
+    # @spec ING-CORE-021, ING-LIFE-001, ING-ERR-016, ING-VEH-007
+    # @spec ING-ERR-063
+    async def _configure(self) -> None:
+        """Read updates until one validates and ``open`` succeeds.
+
+        A rejected first update emits every field error and leaves the
+        session unconfigured for a corrected one, all within the original
+        preconfiguration bound; any other event first is ``protocol_order``.
+        """
+        plugin = self._plugin
+        factory = plugin.factory
+        owner = self._owner
+        while True:
+            event = await self._next_event()
+            if event is _TRIGGER:
+                raise await self._terminal(
+                    errors.FrontendError(
+                        "service_unavailable", "the server is shutting down"
+                    ),
+                    "shutdown",
+                )
+            if event["type"] != UPDATE:
+                raise await self._terminal(
+                    errors.FrontendError(
+                        "protocol_order",
+                        "the first event must be transcription_session.update",
+                    ),
+                    "protocol",
+                )
+            session = event["session"]
+            rejections = validate_session_update(
+                session,
+                served_model=plugin.served_model,
+                locales=frozenset(factory.locales),
+                default_locale=factory.default_locale,
+                first=True,
+            )
+            if rejections:
+                for rejection in rejections:
+                    await self._emit_error(_ERROR, rejection)
+                continue
+            audio = self._adopt(session)
+            try:
+                await self._call(
+                    owner.open(
+                        cadence=lease.STREAM_CADENCE, locale=self._locale
+                    )
+                )
+            except errors.FrontendError as refused:
+                # A locale refusal leaves the owner unconfigured with no
+                # cause (ING-ERR-063): an ``error`` with no close, and a
+                # corrected update within the original bound.
+                if owner.cause is not None:
+                    raise
+                await self._emit_error(_ERROR, refused)
+                continue
+            if audio is not None:
+                owner.attach_frontend(audio)
+            await self._emit(_UPDATED, session=self._session_object())
+            return
+
+    def _adopt(
+        self, session: Mapping[str, Any]
+    ) -> frontend.StreamingAudioFrontend | None:
+        """Record a valid first update; the audio frontend of a known cell."""
+        factory = self._plugin.factory
+        params = _section(session, "input_audio_params")
+        transcription = _section(session, "input_audio_transcription")
+        self._format = str(session.get("input_audio_format", "pcm16"))
+        self._rate = int(params.get("sample_rate_hz", 16_000))
+        self._channels = int(params.get("num_channels", 1))
+        self._locale = str(
+            transcription.get("language") or factory.default_locale
+        )
+        served = self._plugin.served_model
+        self._baseline = {
+            **_default_settings(served),
+            **_settings(session, served),
+        }
+        if self._format == _DEFERRED:
+            self._riff = bytearray()
+            return None
+        return frontend.StreamingAudioFrontend(
+            encoding=_FORMATS[self._format], sample_rate_hz=self._rate
+        )
+
+    def _session_object(self) -> dict[str, Any]:
+        """The honoured session ``transcription_session.updated`` carries."""
+        session = bootstrap_session(self._plugin.served_model, self._locale)
+        session["id"] = self._session_id
+        session["input_audio_format"] = self._format
+        session["input_audio_params"] = {
+            "sample_rate_hz": self._rate,
+            "num_channels": self._channels,
+        }
+        return session
+
+    # ----------------------------------------------------------- stream
+
+    # @spec ING-NIMWS-005, ING-NIMWS-018, ING-NIMWS-024, ING-LIFE-009
+    async def _stream(self) -> bool:
+        """Serve client events until ``done`` (``True``) or the trigger."""
+        owner = self._owner
+        while True:
+            event = await self._next_event()
+            if event is _TRIGGER:
+                break
+            kind = event["type"]
+            if kind == DONE:
+                return True
+            if kind == APPEND:
+                await self._append(event["audio"])
+            elif kind == COMMIT:
+                await self._emit(_COMMITTED, item_id=self._item_id)
+            elif kind == CLEAR:
+                if owner.frontend is not None:
+                    owner.frontend.reset()
+                if self._riff is not None:
+                    self._riff = bytearray()
+                await self._emit(_CLEARED, item_id=self._item_id)
+            else:
+                await self._update(event["session"])
+        return False
+
+    # @spec ING-NIMWS-018, ING-LIFE-065
+    async def _append(self, payload: str) -> None:
+        """Decode one append in bounded slices and feed each in turn.
+
+        Every slice of an already-read append is fed, also once the
+        shutdown trigger is observed, before shutdown finalization.
+        """
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError):
+            raise await self._terminal(
+                _rejection(
+                    "invalid_audio", "audio", "the audio is not valid base64"
+                ),
+                "input",
+            ) from None
+        if self._riff is not None:
+            resolved = await self._resolve_header(data)
+            if resolved is None:
+                return
+            data = resolved
+        if self._remaining is not None:
+            data = data[: self._remaining]
+            self._remaining -= len(data)
+        owner = self._owner
+        audio = owner.frontend
+        if audio is None or not data:
+            return
+        bound = int(self._plugin.config.pre_submit_max_samples)
+        for piece in audio.decode(data, max_samples=bound):
+            if not len(piece):
+                continue
+            hypotheses = await self._call(owner.feed(piece))
+            for text in hypotheses:
+                if text == self._hypothesis:
+                    continue
+                delta = suffix(self._hypothesis, text)
+                self._hypothesis = text
+                if delta:
+                    await self._emit(
+                        _DELTA,
+                        item_id=self._item_id,
+                        content_index=0,
+                        delta=delta,
+                    )
+
+    async def _resolve_header(self, data: bytes) -> bytes | None:
+        """Buffer deferred-header bytes; return the audio once resolved."""
+        assert self._riff is not None
+        bound = int(self._plugin.config.max_riff_header_bytes)
+        buffered = bytes(self._riff) + data
+        header = frontend.sniff_riff(buffered, max_header_bytes=bound)
+        if header is None:
+            self._riff = bytearray(buffered)
+            return None
+        problem = surfaces.header_problem(header, self._rate, self._channels)
+        if problem is not None:
+            raise await self._terminal(_format_error(problem), "protocol")
+        assert isinstance(header, frontend.RiffFormat)
+        self._riff = None
+        self._remaining = header.data_length
+        self._owner.attach_frontend(
+            frontend.StreamingAudioFrontend(
+                encoding=header.encoding, sample_rate_hz=header.sample_rate_hz
+            )
+        )
+        return buffered[header.data_offset :]
+
+    # @spec ING-LIFE-008, ING-VEH-007
+    async def _update(self, session: Mapping[str, Any]) -> None:
+        """A later update: rejections first, then one truthful ack.
+
+        Only the locale is mutable, through the serialized ``update_locale``;
+        every other changed field is ``config_change_rejected``.
+        """
+        plugin = self._plugin
+        factory = plugin.factory
+        rejections = validate_session_update(
+            session,
+            served_model=plugin.served_model,
+            locales=frozenset(factory.locales),
+            default_locale=factory.default_locale,
+            first=False,
+        )
+        changed = [
+            name
+            for name, value in _settings(session, plugin.served_model).items()
+            if self._baseline.get(name) != value
+        ]
+        rejections.extend(
+            _rejection(
+                "config_change_rejected",
+                name,
+                f"{name} cannot change after configuration",
+            )
+            for name in changed
+        )
+        for rejection in rejections:
+            await self._emit_error(_ERROR, rejection)
+        transcription = _section(session, "input_audio_transcription")
+        locale_rejected = any("language" in r.fields for r in rejections)
+        if "language" in transcription and not locale_rejected:
+            locale = str(transcription["language"] or factory.default_locale)
+            if locale != self._locale:
+                await self._change_locale(locale)
+        await self._emit(_UPDATED, session=self._session_object())
+
+    async def _change_locale(self, locale: str) -> None:
+        """Run ``update_locale``; a refusal keeps the prior locale."""
+        owner = self._owner
+        try:
+            await self._call(owner.update_locale(locale))
+        except errors.FrontendError as refused:
+            if owner.cause is not None or owner.state == "terminal":
+                raise
+            await self._emit_error(_ERROR, refused)
+            return
+        self._locale = locale
+
+    # ------------------------------------------------------- finalization
+
+    # @spec ING-ERR-057, ING-ERR-058, ING-NIMWS-023, ING-LIFE-024
+    async def _finalize(self, *, client: bool) -> str:
+        """The one finalization; after ``done`` an observer keeps reading.
+
+        The observer holds at most one message, under the finalization
+        bound, until the final's send begins: the owner stops its read when
+        the stream ends, and the shutdown trigger stops it earlier.
+        """
+        owner = self._owner
+        if self._riff:
+            raise await self._terminal(
+                errors.FrontendError(
+                    "unsupported_format",
+                    "the stream ended inside its RIFF/WAVE header",
+                    fields=("input_audio_format",),
+                ),
+                "protocol",
+            )
+        observer = (
+            surfaces.child(self._record, self._observe()) if client else None
+        )
+        failure: errors.FrontendError | None = None
+        text = ""
+        try:
+            text = await owner.finalize()
+        except errors.FrontendError as raised:
+            failure = raised
+        if observer is not None:
+            await asyncio.wait({observer})
+        observed = self._observed
+        if observed is not None:
+            if self._gone:
+                raise _Gone
+            raise surfaces.selected_error(owner, observed)
+        if failure is not None:
+            if self._gone:
+                raise _Gone
+            raise failure
+        return text
+
+    async def _observe(self) -> None:
+        """Read one message after ``done`` and classify it."""
+        owner = self._owner
+        try:
+            message = await owner.receive(self._receive())
+        except (lease.ShutdownObserved, errors.FrontendError, RuntimeError):
+            return  # the trigger, an expiry or the stream's end stops it
+        if message.get("type") != "websocket.receive":
+            self._gone = True
+            observed = errors.FrontendError("internal", "the client is gone")
+            phase = "transport"
+        else:
+            event = self._classify(message)
+            if isinstance(event, errors.FrontendError):
+                observed = event
+                phase = (
+                    "input" if event.code == "request_too_large" else "protocol"
                 )
             else:
-                hypotheses = await asyncio.wait_for(
-                    operation,
-                    finalization_deadline - time.monotonic(),
+                observed = errors.FrontendError(
+                    "session_terminal",
+                    f"{event['type']} arrived after input_audio_buffer.done",
                 )
-        except _LifecycleTimeout as error:
-            await self._fail(
-                send,
-                error.code,
-                "session lifetime expired during audio handoff",
-                close=1008,
-            )
-            return
-        except asyncio.TimeoutError:
-            await self._fail(
-                send,
-                "finalization_timeout",
-                "terminal audio handoff timed out",
-                close=1011,
-            )
-            return
-        except Exception:
-            await self._fail(send, "internal", "lease feed failed", close=1011)
-            return
-        if type(accepted) is not int or accepted != len(samples):  # type: ignore[arg-type]
-            await self._fail(
-                send,
-                "internal",
-                "lease returned invalid acceptance credit",
-                close=1011,
-            )
-            return
-        for hypothesis in hypotheses:
-            suffix = _suffix(self._last_hypothesis, hypothesis)
-            self._last_hypothesis = hypothesis
-            if suffix:
-                await self._send_json(
-                    send,
-                    {
-                        "type": _DELTA_EVENT,
-                        "event_id": _event_id(),
-                        "item_id": self._item_id,
-                        "content_index": 0,
-                        "delta": suffix,
-                    },
-                )
-
-    async def _done(self, send: AsgiSend) -> None:
-        """Flush frontend/lease once, then emit one completion and close."""
-        if not self._configured or self._owner is None:
-            await self._fail(
-                send, "protocol_order", "done before session update"
-            )
-            return
-        if self._riff_remaining not in {None, 0}:
-            await self._fail(
-                send,
-                "invalid_audio",
-                "truncated RIFF data",
-                close=1008,
-            )
-            return
-        finalization_deadline = time.monotonic() + float(
-            getattr(self._config, "session_finalization_timeout", 30.0)
-        )
-        if self._configured_at is not None:
-            limit = getattr(self._config, "max_session_duration", None)
-            if (
-                limit is not None
-                and time.monotonic() - self._configured_at > limit
-            ):
-                await self._fail(
-                    send,
-                    "request_timeout",
-                    "session duration exceeded",
-                    close=1008,
-                )
-                return
-        if self._frontend is not None:
-            tail = self._frontend.flush()
-            if len(tail):
-                await self._feed(
-                    tail,
-                    send,
-                    finalization_deadline=finalization_deadline,
-                )
-                if self._terminal:
-                    return
-        try:
-            transcript = await asyncio.wait_for(
-                self._owner.complete(),
-                finalization_deadline - time.monotonic(),
-            )
-        except asyncio.TimeoutError:
-            await self._fail(
-                send,
-                "finalization_timeout",
-                "terminal drain timed out",
-                close=1011,
-            )
-            return
-        except Exception:
-            await self._fail(
-                send, "internal", "normal completion failed", close=1011
-            )
-            return
-        if transcript is None:
-            await self._fail(
-                send, "internal", "normal completion failed", close=1011
-            )
-            return
-        suffix = _suffix(self._last_hypothesis, transcript)
-        if suffix:
-            await self._send_json(
-                send,
-                {
-                    "type": _DELTA_EVENT,
-                    "event_id": _event_id(),
-                    "item_id": self._item_id,
-                    "content_index": 0,
-                    "delta": suffix,
-                },
-            )
-        await self._send_json(
-            send,
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "event_id": _event_id(),
-                "item_id": self._item_id,
-                "content_index": 0,
-                "transcript": transcript,
-                "is_last_result": True,
-            },
-        )
-        self._terminal = True
-        await send({"type": "websocket.close", "code": 1000})
-        await self._release_registration()
-
-    async def _format_failure(self, send: AsgiSend, error: FormatError) -> None:
-        """Project frontend rejection without retaining an open owner."""
-        await self._fail(
-            send,
-            error.code,
-            error.detail or "unsupported audio",
-            list(error.fields),
-            close=1008 if self._configured else None,
-        )
-
-    async def _updated(self, send: AsgiSend, locale: str) -> None:
-        """Acknowledge the effective echoable session without admission."""
-        session = json.loads(json.dumps(self._initial_session or {}))
-        transcription = session.get("input_audio_transcription", {})
-        if isinstance(transcription, dict):
-            transcription["language"] = locale
-            session["input_audio_transcription"] = transcription
-        await self._send_json(
-            send,
-            {
-                "type": "transcription_session.updated",
-                "event_id": _event_id(),
-                "session": session,
-            },
-        )
-
-    async def _fail(
-        self,
-        send: AsgiSend,
-        code: str,
-        message: str,
-        fields: list[str] | None = None,
-        *,
-        close: int | None = None,
-    ) -> None:
-        """Settle a terminal lease, then send its stable error and close."""
-        event = _error(code, message, fields)
-        if event["type"] != "error":
-            event["event_id"] = _event_id()
-            event["item_id"] = self._item_id
-            event["content_index"] = 0
-        if close is not None:
-            self._terminal = True
-            await self._abort()
-        await self._send_json(send, event)
-        if close is not None:
-            await send({"type": "websocket.close", "code": close})
-
-    async def _abort(self) -> None:
-        """Select abnormal cleanup for an owned lease exactly once."""
-        if self._owner is not None:
-            # DirectLeaseOwner reports terminal cleanup faults to the plugin
-            # lifetime. They remain secondary to the transport/protocol cause
-            # already selected by this adapter.
-            with contextlib.suppress(BaseException):
-                await self._owner.cancel()
-        await self._release_registration()
-
-    async def _release_registration(self) -> None:
-        """Release local owners before the host admission lease."""
-        try:
-            if self._tracked_owner is not None:
-                release = getattr(self._tracked_owner, "release", None)
-                if callable(release):
-                    await release()
-                self._tracked_owner = None
-        finally:
-            try:
-                if self._registration is not None:
-                    await self._registration.release()
-                    self._registration = None
-            finally:
-                if self._admission_lease is not None:
-                    self._admission_lease.release()
-                    self._admission_lease = None
-
-    async def _send_json(self, send: AsgiSend, event: dict[str, Any]) -> None:
-        """Serialize one server event through the existing ASGI socket only."""
-        await send({"type": "websocket.send", "text": json.dumps(event)})
+                phase = "protocol"
+        self._observed = observed
+        await owner.fail(lease.Cause(observed.code, phase, None))
 
 
-# @spec ING-NIMWS-002, ING-VEH-014
-def dispatch_nim_realtime(
-    *,
-    app: AsgiApp,
-    factory: object,
-    config: object,
-    admission: HostAdmission | None = None,
-    gate: LoadShedGate | None = None,
-    owner_register: OwnerRegister | None = None,
-    owner_factory: LeaseOwnerFactory | None = None,
-) -> AsgiApp:
-    """Wrap the host ASGI app with the exact-query NIM realtime dispatcher."""
-    # Protocol runtime checks are not available; retain a narrow failure
-    # message for a miswired plugin context without imposing a concrete type.
-    if not hasattr(factory, "open"):
-        raise TypeError("factory must expose async open")
-    # Lifecycle supplies the process-wide gate. The fallback is only for
-    # direct unit construction before the plugin lifetime is installed.
-    shared_gate = gate or LoadShedGate(
-        int(getattr(config, "load_shed_max_sessions", 1))
-    )
-    shared_owner_factory = owner_factory or (
-        lambda factory, *, cleanup_timeout: DirectLeaseOwner(
-            factory, cleanup_timeout=cleanup_timeout
-        )
-    )
-
-    async def middleware(scope: object, receive: object, send: object) -> None:
-        """Claim NIM, deny bad query bytes, otherwise preserve host scope."""
-        if (
-            not isinstance(scope, dict)
-            or not callable(receive)
-            or not callable(send)
-        ):
-            raise TypeError("raw ASGI scope, receive, and send are required")
-        decision = dispatch_decision(scope)
-        if decision is DispatchDecision.PASS:
-            await app(scope, receive, send)
-            return
-        if decision is DispatchDecision.DENY:
-            await send({"type": "websocket.close", "code": 1008})
-            return
-        admission_lease = try_acquire_admission(admission)
-        if admission_lease is None:
-            await send({"type": "websocket.close"})
-            return
-        connection = _Connection(
-            factory,
-            config,
-            shared_gate,
-            owner_register,
-            shared_owner_factory,
-            admission_lease,
-        )
-        try:
-            await connection.run(receive, send)
-        finally:
-            await connection._release_registration()
-
-    return middleware
+__all__ = [
+    "EVENT_TYPES",
+    "RealtimeAdapter",
+    "RealtimeRoute",
+    "bootstrap_endpoint",
+    "bootstrap_session",
+    "project_event",
+    "suffix",
+    "validate_session_update",
+]

@@ -7,3 +7,6 @@ build/
 dist/
 *.egg-info/
 *.py[cod]
+
+# coverage data
+.coverage
