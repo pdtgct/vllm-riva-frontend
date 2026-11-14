@@ -7,9 +7,10 @@ paths are in the RFC 1 + RFC 2 tree):
   (``vllm/engine/protocol.py:46-47``); ``errored``, ``dead_error``
   (``:61``, ``:69``); ``abort(request_id)`` (``:133``); ``check_health()``
   (``:164``);
-* ``vllm_config.additional_config`` (the ``riva_frontend`` and
-  ``stream_admission`` mappings; ``vllm/v1/core/sched/state_scheduler.py:85-91``
-  reads the latter);
+* ``vllm_config.additional_config`` (the ``riva_frontend`` mapping);
+* ``vllm_config.scheduler_config.stream_admission_timeouts``
+  (``vllm/config/scheduler.py:283``, set by ``--stream-admission-timeouts``;
+  core's default is an empty mapping);
 * ``vllm_config.cache_config.num_gpu_blocks`` (``vllm/config/cache.py:338``;
   the state-slot count is this minus one);
 * ``vllm_config.scheduler_config.max_num_seqs`` and ``max_num_active_seqs``
@@ -21,8 +22,9 @@ paths are in the RFC 1 + RFC 2 tree):
 * ``model_config.served_model_name`` and ``model_config.max_model_len``
   (``vllm/config/model.py:336``, ``:256``).
 
-The engine's stream deadlines default to ``StreamAdmissionConfig``'s
-(``vllm/v1/core/stream_admission.py:38-40``): 15, 60 and 40 seconds.
+The engine's stream deadlines default to
+``SchedulerConfig.DEFAULT_STREAM_ADMISSION_TIMEOUTS``
+(``vllm/config/scheduler.py:44-48``): 15, 60 and 40 seconds.
 """
 
 from __future__ import annotations
@@ -53,15 +55,13 @@ class FakeEngineClient:
         shutdown_timeout: float = 60.0,
         max_model_len: int = 76_800,
         riva_frontend: dict[str, Any] | None = None,
-        stream_admission: dict[str, Any] | None = None,
+        stream_admission_timeouts: dict[str, Any] | None = None,
         additional_config: dict[str, Any] | None = None,
     ) -> None:
         self.tasks = tuple(tasks)
         config: dict[str, Any] = dict(additional_config or {})
         if riva_frontend is not None:
             config["riva_frontend"] = riva_frontend
-        if stream_admission is not None:
-            config["stream_admission"] = stream_admission
         self.model_config = SimpleNamespace(
             model=model,
             served_model_name=served_model_name or model,
@@ -75,6 +75,7 @@ class FakeEngineClient:
             scheduler_config=SimpleNamespace(
                 max_num_seqs=max_num_seqs,
                 max_num_active_seqs=max_num_active_seqs,
+                stream_admission_timeouts=dict(stream_admission_timeouts or {}),
             ),
             parallel_config=SimpleNamespace(
                 data_parallel_size=data_parallel_size

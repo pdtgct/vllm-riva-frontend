@@ -9,7 +9,7 @@ plugin's own requirements of vLLM are in its documentation.
 
 ## Serve
 
-<!-- @spec ING-EP-019 -->
+<!-- @spec ING-EP-113 -->
 
 ```bash
 export VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming
@@ -23,7 +23,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --tokenizer-mode nemotron_asr_streaming \
     --max-model-len 76800 \
     --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.3.0b1", "pin": "unspecified"}}' \
+    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b1", "pin": "unspecified"}}' \
     --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
 ```
 
@@ -51,11 +51,13 @@ error naming every failing option. `deployment_image` and `pin` identify this de
 `GET /plugins/riva/v1/metadata`; they default to `unspecified`. `pin` may be a commit SHA.
 
 **Engine stream deadlines.** The engine ends an admitted stream that is never fed, parked idle or
-draining past its deadlines, set by the `stream_admission` object of the same additional
-configuration (defaults: `never_fed_timeout` 15 s, `parked_idle_timeout` 60 s,
-`draining_timeout` 40 s). The frontend's own bounds must stay below them, and startup fails
-otherwise; when these defaults change, pass `stream_admission` beside `riva_frontend` in the same
-JSON object.
+draining past its deadlines, which core's `--stream-admission-timeouts` flag sets (defaults:
+`never_fed_timeout` 15 s, `parked_idle_timeout` 60 s, `draining_timeout` 40 s). The frontend reads
+the same setting at startup; its own bounds must stay below these deadlines, and startup fails
+otherwise. When these defaults change, add the flag to the command above with only the keys that
+change, for example `--stream-admission-timeouts '{"never_fed_timeout": 30}'`, and keep
+`--shutdown-timeout` above `draining_timeout`. The deadlines are not part of the additional
+configuration: a `stream_admission` object there stops startup with an error naming the flag.
 
 **Shutdown.** The shutdown timeout is the frontend's whole drain budget: open streams are
 finalized, files settle and the gRPC listener stops before the engine shuts down, with time kept

@@ -209,8 +209,8 @@ middleware's registration, and the 401 body).
    identity: the canonical checkpoint identifier (when different) and every secondary alias are not
    additional selectors there. The file route's `model` field is validated by core against every
    served name, as core's own route does.
-3. **Engine stream deadlines**: the three `stream_admission` deadlines (below) are read, and each
-   frontend bound is checked against its engine deadline.
+3. **Engine stream deadlines**: the three deadlines of core's `--stream-admission-timeouts` (below)
+   are read, and each frontend bound is checked against its engine deadline.
 4. **Capacity**: data parallel size must be 1 (the model requires parallel sizes of 1, and slot
    count and active limit are read per engine), otherwise startup fails. The state-slot count and
    the active-request limit are then read (below).
@@ -286,14 +286,27 @@ that its bound fires first: sub-unit traffic (including accepted audio shorter t
 the engine's never-fed deadline) and client clocks suspended during lease calls can let the engine
 end a stream first, and the engine's `expired` then projects as an idle timeout.
 
-`init_state` reads the deadlines from `vllm_config.additional_config["stream_admission"]`, the
-mapping core's state scheduler reads. A missing section or key means the documented defaults
-(`never_fed_timeout` 15 s, `parked_idle_timeout` 60 s, `draining_timeout` 40 s); a present value
-that is not a finite positive number fails startup, because it means the frontend cannot know the
-deadline the engine enforces. The engine-client protocol does not declare these settings, so this
-mapping is the contract; the frontend's copy of the defaults is pinned by a test against the core
-build. That test needs RFC 1's stream-admission settings and runs only in the RFC 1 + RFC 2 build;
-the frontend's other CPU tests need nothing from RFC 1 and run against an RFC 2 build without it.
+`init_state` reads the deadlines from `vllm_config.scheduler_config.stream_admission_timeouts`, the
+mapping core's `--stream-admission-timeouts` sets and core's stream admission reads. An absent key
+means the documented default (`never_fed_timeout` 15 s, `parked_idle_timeout` 60 s,
+`draining_timeout` 40 s); a present value that is not a finite positive number, or a setting that
+is not a mapping, fails startup, because it means the frontend cannot know the deadline the engine
+enforces. Core validates the same values when it builds its configuration, so this check is
+defence in depth. On a core without the attribute (an RFC 2 build without RFC 1's stream
+admission) all three defaults apply. Such a build cannot serve streams, and startup fails
+elsewhere: the model plugin refuses to load on a build without RFC 1's stream-admission engine
+calls, and the frontend's session-factory discovery fails when no constructor accepts or one
+raises on a missing engine call (step 9, ING-EP-021).
+The engine-client protocol does not declare these settings, so this public configuration field is
+the contract, read by attribute access without importing a core class; the frontend's copy of the
+defaults is pinned by a test against the core build. That test needs RFC 1's stream-admission
+settings and runs only in the RFC 1 + RFC 2 build; the frontend's other CPU tests need nothing from
+RFC 1 and run against an RFC 2 build without it.
+
+A `stream_admission` key in `--additional-config` fails startup with an error naming
+`--stream-admission-timeouts`. Core never read that key, so a deadline set there would change
+nothing in the engine; refusing it turns a silently ignored setting into a startup error that
+names the flag that works.
 
 Each frontend bound is checked against the matching engine deadline and must be strictly below it:
 
@@ -799,8 +812,8 @@ The repository's deployment guide, `docs/deployment.md`, sets:
 - `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming`: core loads no endpoint plugin when the
   variable is unset, and allowlists by entry-point name in every plugin group, so the model plugin
   must be named too;
-- `--additional-config` carrying `riva_frontend` options and, when the defaults are changed,
-  `stream_admission`;
+- `--additional-config` carrying `riva_frontend` options, and, when the engine's stream deadlines
+  change, `--stream-admission-timeouts` with the changed keys;
 - `--shutdown-timeout` above the engine's drain time (the engine's `draining_timeout` default is
   40 s; 60 s is the documented value);
 - the model plugin's own serve flags (HLD Constraints). The reference deployment serves
@@ -858,7 +871,8 @@ The guide also sets:
 | --- | --- | --- | --- |
 | Vehicle | RFC 2 endpoint plugin, one class | A fork-only application plugin; patches to core | The lifecycle (`start`, `drain`, `stop`, `request_shutdown`) is what a long-lived listener needs and has an upstream path; patching core would merge Riva-shaped code into vLLM |
 | vLLM version gate in packaging | None; `init_state` checks capabilities (session factory constructor raising on a missing engine call, the `realtime` task) | A lower bound on `vllm`; a version check at startup | No release carries RFC 1 and RFC 2 yet, so a bound would name a version that does not exist; a capability failure names the missing call, which is what the operator needs. A version gate is deferred until releases carry both |
-| Engine deadlines | Read the `stream_admission` mapping from `additional_config` and apply the documented defaults when absent; fail on an unreadable value | Import core's `StreamAdmissionConfig`; read nothing and use fixed bounds | The mapping is the documented public setting; importing a scheduler-internal class couples the package to core internals; fixed bounds cannot be checked against what the engine enforces. A test pins the copied defaults against core in the RFC 1 + RFC 2 build |
+| Engine deadlines | Read `scheduler_config.stream_admission_timeouts` (core's `--stream-admission-timeouts`) by attribute access and apply the documented defaults for absent keys, or for all three when core has no such attribute; fail on an unreadable value | Read the `stream_admission` mapping from `additional_config`; import core's `SchedulerConfig` defaults; read nothing and use fixed bounds | The scheduler field is the public setting core's stream admission reads; `additional_config["stream_admission"]` is read by nothing in core, so the frontend's check would not see the deadlines the engine enforces. Importing a core class couples the package to core internals; a public configuration field read by attribute access does not. Fixed bounds cannot be checked against what the engine enforces. A test pins the copied defaults against core in the RFC 1 + RFC 2 build |
+| `stream_admission` in `--additional-config` | Fail startup, naming `--stream-admission-timeouts` | Ignore it; warn and continue; read it as a fallback | Core does not read it, so a deadline set there is silently ignored by the engine, which is the defect this decision removes; a warning still starts a server whose deadlines differ from what the operator wrote; a fallback would make the frontend's bound check disagree with the engine |
 | CPU test build | RFC 2 without RFC 1, except the deadline-default pin, which runs in the RFC 1 + RFC 2 build | Every CPU test on the RFC 1 + RFC 2 build | The frontend needs nothing from RFC 1 beyond what the factory provides, so an RFC 2-only build tests the plugin against the lifecycle it targets; only the pin reads RFC 1's settings |
 | Frontend bounds below engine deadlines | Strictly below each, checked at startup, with defaults that pass | Equal bounds; engine deadlines as the only idle mechanism | A frontend timeout can name its cause and release its own resources first; the engine abort is then a backstop whose lease failure `expired` is projected as an idle timeout |
 | Slot count and active limit | `num_gpu_blocks - 1` and `max_num_active_seqs or max_num_seqs`, read from `vllm_config` in `init_state` | A new `EngineClient` method; probing the scheduler | These values are already in the configuration the plugin is handed after the engine reports its cache; a new protocol method would be a core change outside RFC 1 and RFC 2 |
@@ -951,8 +965,10 @@ while it awaits the engine abort) may go unreported.
 - vLLM's endpoint-plugin security guidance: `docs/usage/security.md` (namespaced plugin routes; the
   prefixes `--api-key` covers).
 - RFC 1 persistent state and stream admission: `docs/design/persistent_state.md`,
-  `vllm/v1/core/stream_admission.py`, `vllm/v1/core/state_slot_manager.py` on `pdtgct/vllm` branch
-  `persistent-state-primitive-v2`.
+  `vllm/v1/core/stream_admission.py` and `vllm/v1/core/state_slot_manager.py` on `pdtgct/vllm`
+  branch `persistent-state-primitive-v2`; the `stream_admission_timeouts` field
+  (`--stream-admission-timeouts`) with its defaults in `vllm/config/scheduler.py`, which arrives
+  with vllm-project/vllm#67375 (verified on a stage 2 tree at `83efb4586c`).
 - Core middleware order and authentication: `vllm/entrypoints/launchers/app.py`,
   `vllm/entrypoints/serve/middleware/register.py`, `.../authenticate.py` (`AuthenticationMiddleware`,
   `verify_token`).

@@ -680,7 +680,7 @@ def test_fake_entry_points_mimic_importlib_metadata():
 async def test_fake_engine_uses_core_attribute_names():
     engine = FakeEngineClient(
         riva_frontend={"grpc_bind": "127.0.0.1:50051"},
-        stream_admission={"never_fed_timeout": 15},
+        stream_admission_timeouts={"never_fed_timeout": 15},
         max_num_active_seqs=8,
     )
     config = engine.vllm_config
@@ -692,9 +692,12 @@ async def test_fake_engine_uses_core_attribute_names():
     assert config.additional_config["riva_frontend"]["grpc_bind"].endswith(
         "50051"
     )
-    assert config.additional_config["stream_admission"] == {
+    assert config.scheduler_config.stream_admission_timeouts == {
         "never_fed_timeout": 15
     }
+    assert "stream_admission" not in config.additional_config
+    default = FakeEngineClient().vllm_config.scheduler_config
+    assert default.stream_admission_timeouts == {}
     assert engine.model_config is config.model_config
     assert engine.model_config.served_model_name == engine.model_config.model
     assert not engine.errored

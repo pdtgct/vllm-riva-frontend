@@ -3,8 +3,10 @@
 Options come from ``--additional-config`` under the key ``riva_frontend``.
 Validation is strict and reports every failure together, each naming the
 plugin key and the option. The engine's stream deadlines are read from the
-``stream_admission`` mapping core's state scheduler reads, and the engine's
-capacity from the ``vllm_config`` core hands the plugin.
+scheduler setting core's stream admission reads
+(``scheduler_config.stream_admission_timeouts``, set by
+``--stream-admission-timeouts``), and the engine's capacity from the
+``vllm_config`` core hands the plugin.
 """
 
 from __future__ import annotations
@@ -20,8 +22,13 @@ from vllm_riva_frontend.frontend import RESAMPLER_ID
 
 #: The ``--additional-config`` key of the frontend's options.
 PLUGIN_KEY = "riva_frontend"
-#: The ``--additional-config`` key of the engine's stream deadlines.
-STREAM_ADMISSION_KEY = "stream_admission"
+#: The scheduler setting that holds the engine's stream deadlines.
+STREAM_ADMISSION_TIMEOUTS = "stream_admission_timeouts"
+#: The ``vllm serve`` flag that sets it.
+STREAM_ADMISSION_TIMEOUTS_FLAG = "--stream-admission-timeouts"
+#: An ``--additional-config`` key that core does not read; startup refuses
+#: it so that a deadline set there is not silently ignored.
+REFUSED_STREAM_ADMISSION_KEY = "stream_admission"
 
 
 class StartupError(Exception):
@@ -306,36 +313,62 @@ class StreamDeadlines:
     draining_timeout: float
 
 
-#: The engine's defaults when ``stream_admission`` leaves a key out.
+#: The engine's defaults when ``--stream-admission-timeouts`` leaves a key
+#: out; a copy of core's, pinned against core by a test (ING-EP-071).
 DEFAULT_STREAM_DEADLINES = StreamDeadlines(15.0, 60.0, 40.0)
 
 
-# @spec ING-EP-013
-def read_stream_deadlines(
-    additional_config: Mapping[str, Any] | None,
-) -> StreamDeadlines:
-    """Read the engine's stream deadlines from ``stream_admission``.
+# @spec ING-EP-114
+def refused_deadline_settings(vllm_config: Any) -> list[str]:
+    """A failure for a ``stream_admission`` key in ``--additional-config``.
 
-    A missing section or key takes the engine's default; a present value
-    that is not a finite positive number fails, because the frontend would
-    not know the deadline the engine enforces.
+    Core does not read that key, so a deadline set there would be ignored.
+    ``init_state`` reports it together with the deadline step's other
+    failures: unreadable deadlines, or the bound failures of
+    ``check_bounds``.
     """
-    section: object = {}
-    if additional_config is not None and STREAM_ADMISSION_KEY in (
-        additional_config
+    additional = getattr(vllm_config, "additional_config", None)
+    if (
+        isinstance(additional, Mapping)
+        and REFUSED_STREAM_ADMISSION_KEY in additional
     ):
-        section = additional_config[STREAM_ADMISSION_KEY]
-    if not isinstance(section, Mapping):
-        raise ConfigError([f"{STREAM_ADMISSION_KEY} must be a JSON object"])
-    values: dict[str, float] = {}
+        return [
+            f"additional_config key {REFUSED_STREAM_ADMISSION_KEY!r} is not "
+            "read by the engine; set the stream deadlines with "
+            f"{STREAM_ADMISSION_TIMEOUTS_FLAG} instead"
+        ]
+    return []
+
+
+# @spec ING-EP-112
+def read_stream_deadlines(vllm_config: Any) -> StreamDeadlines:
+    """Read the engine's stream deadlines from core's scheduler setting.
+
+    The setting is ``vllm_config.scheduler_config.stream_admission_timeouts``
+    (``--stream-admission-timeouts``). An absent key takes the engine's
+    default, and so does every key on a core without the setting. A present
+    value that is not a finite positive number fails, because the frontend
+    would not know the deadline the engine enforces. Every failure is
+    reported together.
+    """
     failures: list[str] = []
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    section: object = getattr(scheduler, STREAM_ADMISSION_TIMEOUTS, {})
+    if not isinstance(section, Mapping):
+        failures.append(
+            f"scheduler_config.{STREAM_ADMISSION_TIMEOUTS} "
+            f"({STREAM_ADMISSION_TIMEOUTS_FLAG}) must be a mapping, not "
+            f"{section!r}"
+        )
+        raise ConfigError(failures)
+    values: dict[str, float] = {}
     for field in fields(StreamDeadlines):
         default = getattr(DEFAULT_STREAM_DEADLINES, field.name)
         value = section.get(field.name, default)
         if not _is_number(value) or not math.isfinite(value) or value <= 0:
             failures.append(
-                f"{STREAM_ADMISSION_KEY}.{field.name} must be a finite "
-                f"positive number, not {value!r}"
+                f"{STREAM_ADMISSION_TIMEOUTS_FLAG} {field.name} must be a "
+                f"finite positive number, not {value!r}"
             )
         else:
             values[field.name] = float(value)
@@ -364,8 +397,8 @@ def check_bounds(
         engine = getattr(deadlines, deadline)
         if not bound < engine:
             failures.append(
-                f"{_named(option)} ({bound} s) must be below "
-                f"{STREAM_ADMISSION_KEY}.{deadline} ({engine} s)"
+                f"{_named(option)} ({bound} s) must be below the engine's "
+                f"{deadline} ({engine} s, {STREAM_ADMISSION_TIMEOUTS_FLAG})"
             )
     return failures
 

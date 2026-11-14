@@ -28,17 +28,23 @@ network layer.
 
 ## Requirements
 
-- A vLLM build carrying RFC 2 (endpoint plugins). The package declares no dependency on vLLM: the
-  host environment supplies it, and startup checks the capabilities it needs.
+- A vLLM build carrying RFC 2 (endpoint plugins, `vllm-project/vllm#65546`; readiness and drain,
+  `#67294`, when present) and RFC 1's stream admission (`#67375`, on `#67374`), which the model
+  plugin needs. The package declares no dependency on vLLM: the host environment supplies it, and
+  startup checks the capabilities it needs.
 - A model plugin that publishes a session factory in the `vllm_riva_frontend.session_factories`
   entry-point group, such as `pdtgct/vllm-nemotron-asr-streaming-plugin`.
 - A Python version vLLM supports (below).
 
-This repository is a development preview and is not published to PyPI. Install it from git:
+This repository is a development preview and is not published to PyPI. Install a tagged release
+from git:
 
 ```bash
-pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git"
+pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b1"
 ```
+
+The GitHub release notes for the tag give the full pinned recipe: the vLLM build and the model
+plugin version it was tested with.
 
 ## Supported Python versions
 
