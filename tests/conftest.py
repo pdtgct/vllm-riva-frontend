@@ -4,8 +4,8 @@
   core tree on ``PYTHONPATH``. They need RFC 2 only (ING-EP-072) and fail,
   not skip, when it is missing.
 * ``engine``: CPU tests that need RFC 1 as well (the RFC 1 + RFC 2 build);
-  only the stream-deadline pin (ING-EP-071) belongs here. Skipped when RFC
-  1's stream-admission settings do not import.
+  only the stream-deadline pin (ING-EP-071) belongs here. Skipped when core's
+  scheduler configuration lacks RFC 1's stream admission timeouts.
 * ``real_factory``: the seam conformance suite against the model plugin's
   real factory. Skipped when the model plugin is not installed.
 * ``gpu``: an installed engine on a CUDA device. Skipped without one.
@@ -35,6 +35,15 @@ def _importable(name: str) -> bool:
     return True
 
 
+def _has_stream_admission_timeouts() -> bool:
+    """Whether core's scheduler configuration has RFC 1's stream timeouts."""
+    try:
+        from vllm.config import SchedulerConfig
+    except Exception:
+        return False
+    return hasattr(SchedulerConfig, "DEFAULT_STREAM_ADMISSION_TIMEOUTS")
+
+
 def _cuda_available() -> bool:
     try:
         import torch
@@ -45,7 +54,7 @@ def _cuda_available() -> bool:
 
 #: RFC 2 is required by every tier; ``engine`` additionally needs RFC 1.
 RFC2 = _importable("vllm.plugins.endpoint_plugins.interface")
-ENGINE = RFC2 and _importable("vllm.v1.core.stream_admission")
+ENGINE = RFC2 and _has_stream_admission_timeouts()
 REAL_FACTORY = _importable("vllm_nemotron_asr_streaming.session")
 
 #: Real seconds the ``started`` fixture's teardown gives the plugin's stop

@@ -170,8 +170,8 @@ owners from the moment core sets it, before or without a `drain` call.
   This cap bounds frontend memory and work; the file gate (below) separately bounds files in
   inference.
 - **Bounds.** Every lease call runs under a finite frontend bound (configuration, first audio, idle,
-  finalization, cleanup). `init_state` reads the engine's stream deadlines (the `stream_admission`
-  settings: never-fed, parked-idle and draining) and fails startup unless each frontend bound is
+  finalization, cleanup). `init_state` reads the engine's stream deadlines (core's
+  `--stream-admission-timeouts` setting: never-fed, parked-idle and draining) and fails startup unless each frontend bound is
   below the matching engine deadline, so the frontend's bounds are below the engine's and the
   engine's idle abort (`expired`, reported as an idle timeout) is a backstop. The engine is the
   authority for sub-unit traffic and the frontend suspends client-idle timing while a lease call is

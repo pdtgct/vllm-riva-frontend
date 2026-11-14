@@ -53,6 +53,7 @@ from vllm_riva_frontend.config import (
     parse_config,
     read_capacity,
     read_stream_deadlines,
+    refused_deadline_settings,
 )
 from vllm_riva_frontend.errors import ErrorCatalog, catalog
 from vllm_riva_frontend.operational import operational_endpoints
@@ -852,10 +853,15 @@ class RivaFrontendPlugin:
         config = parse_config(additional)
         self.served_model = _served_identity(state)
 
-        deadlines = read_stream_deadlines(additional)
+        # One step: the refused key is reported with whatever else fails.
+        refused = refused_deadline_settings(vllm_config)
+        try:
+            deadlines = read_stream_deadlines(vllm_config)
+        except ConfigError as error:
+            raise ConfigError([*refused, *error.failures]) from error
         bounds = check_bounds(config, deadlines)
-        if bounds:
-            raise StartupError(bounds)
+        if refused or bounds:
+            raise StartupError([*refused, *bounds])
         self.deadlines = deadlines
 
         self.capacity = _engine_capacity(vllm_config)

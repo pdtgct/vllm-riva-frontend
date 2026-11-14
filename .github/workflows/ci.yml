@@ -37,12 +37,13 @@ jobs:
       # serving modules, so they need the vLLM core tree it targets (RFC 2's
       # endpoint-plugin lifecycle, readiness and drain). Its Python sources
       # are importable from a checkout; the CPU requirements supply what
-      # those imports need.
+      # those imports need. The pin is the head of vllm-project/vllm#67294
+      # (pdtgct/vllm branch endpoint-plugin-readiness-drain-review-20261111).
       - name: Check out vLLM core
         uses: actions/checkout@v4
         with:
           repository: pdtgct/vllm
-          ref: 22acc7518e3a253473a2a688030d1e0308618e2b
+          ref: 7589a900be9f426000477f4c4e69c462988285d8
           path: vllm-core
 
       - name: Install vLLM core's CPU requirements

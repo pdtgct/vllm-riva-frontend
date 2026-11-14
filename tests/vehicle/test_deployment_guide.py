@@ -1,11 +1,12 @@
 """Checks of the repository's deployment guide, ``docs/deployment.md``.
 
 The guide is parsed as text: the ``VLLM_PLUGINS`` assignment, the JSON
-object passed to ``--additional-config``, ``--shutdown-timeout``,
-``--max-model-len``, core's decode-duration limit and the model plugin's
-lookahead settings. A required statement is checked as a paragraph or list
-item of the guide that carries every term the statement needs, so a term
-scattered over unrelated paragraphs does not count.
+objects passed to ``--additional-config`` and ``--stream-admission-timeouts``,
+``--shutdown-timeout``, ``--max-model-len``, core's decode-duration limit
+and the model plugin's lookahead settings. A required statement is checked
+as a paragraph or list item of the guide that carries every term the
+statement needs, so a term scattered over unrelated paragraphs does not
+count.
 """
 
 from __future__ import annotations
@@ -55,6 +56,21 @@ def additional_config(text: str) -> dict[str, Any]:
     merged: dict[str, Any] = {}
     for item in objects:
         merged.update(item)
+    return merged
+
+
+def stream_admission_timeouts(text: str) -> dict[str, Any]:
+    """The ``--stream-admission-timeouts`` object the guide's commands pass.
+
+    Only fenced code is read, and only an object that directly follows the
+    flag, so prose that names the flag or shows an example sets nothing.
+    """
+    code = "\n".join(re.findall(r"```.*?```", text, flags=re.S))
+    merged: dict[str, Any] = {}
+    for match in re.finditer(
+        r"--stream-admission-timeouts[\s=]+['\"]?(?=\{)", code
+    ):
+        merged.update(json_objects_after(code[match.start() :], match[0])[0])
     return merged
 
 
@@ -166,7 +182,7 @@ def test_budget_formula_matches_the_documented_values(
     assert model_budget(DEFAULT_DECODE_LIMIT, lookahead) == budget
 
 
-# @spec ING-EP-019
+# @spec ING-EP-113
 def test_guide_allowlists_both_plugins() -> None:
     text = guide_text()
     assert re.search(
@@ -174,27 +190,67 @@ def test_guide_allowlists_both_plugins() -> None:
     ), "VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming"
 
 
-# @spec ING-EP-019
+# @spec ING-EP-113
 def test_guide_passes_frontend_options_through_additional_config() -> None:
     config = additional_config(guide_text())
     assert isinstance(config.get("riva_frontend"), dict)
 
 
-# @spec ING-EP-019
+# @spec ING-EP-113
 def test_guide_passes_frontend_options_that_validate() -> None:
     from vllm_riva_frontend.config import parse_config
 
     parse_config(additional_config(guide_text()))
 
 
-# @spec ING-EP-019
+# @spec ING-EP-113
 def test_guide_shutdown_timeout_exceeds_the_engine_draining_timeout() -> None:
     text = guide_text()
-    config = additional_config(text)
-    draining = config.get("stream_admission", {}).get(
+    draining = stream_admission_timeouts(text).get(
         "draining_timeout", DEFAULT_DRAINING_TIMEOUT
     )
     assert flag_number(text, "--shutdown-timeout") > draining
+
+
+# @spec ING-EP-113
+def test_guide_passes_no_stream_admission_key_in_additional_config() -> None:
+    assert "stream_admission" not in additional_config(guide_text()), (
+        "core does not read additional_config['stream_admission']"
+    )
+
+
+# @spec ING-EP-113
+def test_guide_sets_changed_deadlines_with_the_scheduler_flag() -> None:
+    assert states(
+        guide_text(),
+        r"--stream-admission-timeouts",
+        r"never_fed_timeout",
+        r"parked_idle_timeout",
+        r"draining_timeout",
+    ), "the guide says changed deadlines go to --stream-admission-timeouts"
+
+
+# @spec ING-EP-113
+def test_guide_stream_admission_timeouts_are_readable() -> None:
+    """Whatever the guide passes, the frontend reads as core would."""
+    from types import SimpleNamespace
+
+    from vllm_riva_frontend.config import (
+        DEFAULT_STREAM_DEADLINES,
+        read_stream_deadlines,
+    )
+
+    timeouts = stream_admission_timeouts(guide_text())
+    assert set(timeouts) <= {
+        "never_fed_timeout",
+        "parked_idle_timeout",
+        "draining_timeout",
+    }
+    scheduler = SimpleNamespace(stream_admission_timeouts=timeouts)
+    read = read_stream_deadlines(SimpleNamespace(scheduler_config=scheduler))
+    assert read.draining_timeout == timeouts.get(
+        "draining_timeout", DEFAULT_STREAM_DEADLINES.draining_timeout
+    )
 
 
 # @spec ING-EP-078

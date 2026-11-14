@@ -110,14 +110,15 @@ ORDER_CASES = {
     "identity-before-deadlines": dict(
         inputs=dict(
             models=SimpleNamespace(model_name=lambda: ""),
-            stream_admission={"never_fed_timeout": -1},
+            stream_admission_timeouts={"never_fed_timeout": -1},
         ),
         first=(),
         later=("never_fed_timeout",),
     ),
     "deadlines-before-capacity": dict(
         inputs=dict(
-            stream_admission={"draining_timeout": 0}, num_gpu_blocks=None
+            stream_admission_timeouts={"draining_timeout": 0},
+            num_gpu_blocks=None,
         ),
         first=("draining_timeout",),
         later=("num_gpu_blocks",),
@@ -344,7 +345,9 @@ async def test_identity_is_checked_before_engine_deadlines(
     plugin = helpers.make_frontend(
         clock, factories={"nemotron": fake_factory.constructor}
     )
-    engine = helpers.engine_with(stream_admission={"never_fed_timeout": -1})
+    engine = helpers.engine_with(
+        stream_admission_timeouts={"never_fed_timeout": -1}
+    )
     models = SimpleNamespace(model_name=lambda: "")
     failures = await _expect_failure(helpers, plugin, engine, models=models)
     assert not helpers.mentions(failures, "never_fed_timeout")
@@ -357,7 +360,7 @@ async def test_deadlines_are_checked_before_capacity(
     failures = await helpers.startup_failures(
         clock,
         fake_factory,
-        stream_admission={"draining_timeout": 0},
+        stream_admission_timeouts={"draining_timeout": 0},
         data_parallel_size=2,
     )
     assert helpers.mentions(failures, "draining_timeout")
@@ -399,7 +402,8 @@ async def test_route_table_is_checked_before_the_factory(
     "engine_kw",
     [
         {"options": {"surprise": 1}},
-        {"stream_admission": {"never_fed_timeout": 0}},
+        {"stream_admission_timeouts": {"never_fed_timeout": 0}},
+        {"additional_config": {"stream_admission": {}}},
         {"num_gpu_blocks": 0},
         {"data_parallel_size": 4},
         {"options": {"max_concurrent_files": 99}},
