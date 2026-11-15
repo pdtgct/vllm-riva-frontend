@@ -21,10 +21,9 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --no-enable-prefix-caching \
     --config-format nemotron_asr_streaming \
     --tokenizer-mode nemotron_asr_streaming \
-    --max-model-len 76800 \
+    --max-model-len 77000 \
     --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b2", "pin": "unspecified"}}' \
-    --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
+    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b2", "pin": "unspecified"}}'
 ```
 
 One process serves:
@@ -108,18 +107,25 @@ parallel sizes of 1, and slot count and active limit are read per engine.
 ## Model plugin settings
 
 The model plugin's own serve flags are the ones above (float32, eager, synchronous scheduling, no
-prefix caching, its config format and tokenizer mode, and the lookahead overrides).
+prefix caching, its config format and tokenizer mode).
 
-- `supported_num_lookahead_tokens` is `[6, 13]`: 6 is the 560 ms arm the Riva streaming surfaces
-  open at, and 13 fixes the 1120 ms cadence at which complete files and core's own `/v1/realtime`
-  run.
-- `num_lookahead_tokens` is 13 and must be in the served set.
-- `--max-model-len` must cover the longest file `unary_max_decoded_duration_seconds` admits at the
-  cadence `num_lookahead_tokens` fixes. With lookahead `r`, `Q = (r + 1) * 10 + 1` tokens per
+- The command sets no lookahead, so the model plugin serves the checkpoint's default lookahead, 3
+  (320 ms). Riva streams, complete files and core's own `/v1/realtime` all run at that cadence.
+  To serve another cadence, set `num_lookahead_tokens` in `--hf-overrides` to one of the model
+  plugin's implemented lookaheads (0, 1, 3, 6 or 13: 80, 160, 320, 560 or 1120 ms); clients cannot
+  choose a cadence per request.
+- This needs a model plugin release that defaults to the checkpoint's lookahead, serves that one
+  cadence and publishes `default_cadence` (HLD, Constraints). With an earlier release the plugin
+  requires `num_lookahead_tokens`, and the frontend refuses to start because the factory publishes
+  no `default_cadence`.
+- Size `--max-model-len` for core's decode-duration limit (`VLLM_MAX_AUDIO_DECODE_DURATION_S`,
+  600 s by default), which bounds both frontend file surfaces, at the served cadence. With lookahead `r`, `Q = (r + 1) * 10 + 1` tokens per
   chunk and `C` whole chunks of `(r + 1) * 1280` samples at 16 kHz, a file needs
-  `1 + (C + 1) * Q + 1` tokens. At `r = 13` a 600 s file needs 75,578, and the model plugin serves
-  76,800. Running files at 560 ms (`r = 6`) needs 76,114 for the same file. The frontend does not
-  compute this budget; the model refuses a file that exceeds it.
+  `1 + (C + 1) * Q + 1` tokens. At `r = 3` a 600 s file needs 76,918, covered by 77,000; at
+  `r = 6` it needs 76,114 and at `r = 13` 75,578. The frontend does not
+  compute this budget. The model applies no input-length limit of its own: core ends a request
+  that reaches `--max-model-len` with a `length` finish, and whether that is reported as a failure
+  depends on the core build.
 
 ## Complete files
 

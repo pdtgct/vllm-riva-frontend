@@ -65,7 +65,8 @@ The frontend uses the following surface and nothing else.
 
 | Object | Member | Use |
 | --- | --- | --- |
-| factory | `served_cadences: frozenset[str]` | startup check; cadence selection |
+| factory | `served_cadences: frozenset[str]` | startup check; holds the one cadence the server serves |
+| factory | `default_cadence: str` | the cadence every stream opens at; must be in `served_cadences` |
 | factory | `locales: frozenset[str]` | locale validation on every surface |
 | factory | `default_locale: str \| None` | default when the client names none |
 | factory | `open(*, cadence, locale)` | opens a lease; may raise a refusal or failure |
@@ -84,9 +85,13 @@ name.
 
 ## Cadence and locale
 
-Streaming surfaces open at `560ms`. `init_state` fails startup if `served_cadences` does not
-contain it; the factory and the model separately refuse an unserved cadence, so a stream never
-opens at one.
+Every stream opens at the factory's `default_cadence`, a cadence label such as `320ms` that the
+model plugin derives from its configured lookahead (HLD, Cadence). The frontend holds no cadence of
+its own and selects none per request. `init_state` fails startup if the factory has no
+`default_cadence` or `served_cadences` does not contain it; the factory and the model separately
+refuse an unserved cadence, so a stream never opens at one. The server serves one geometry,
+chosen at startup, so the model plugin publishes `served_cadences` as
+`frozenset({default_cadence})`; that is the model plugin's obligation.
 
 A stream's locale is the client's, validated against `locales`. When the client names none, the
 locale is `default_locale`. When that is `None`, the client must name one, and a client that names
@@ -373,7 +378,7 @@ locale is acknowledged only after the call succeeds and applies to every unit pa
 call (`SESS-LOC-001`, `SESS-LOC-002`). Accepted finalization freezes the current locale and
 rejects every later update.
 
-After the first successful update and open, every changed cadence, audio-format, sample-rate,
+After the first successful update and open, every changed audio-format, sample-rate,
 channel or recognition-option field answers `config_change_rejected` and leaves the active lease
 and front end unchanged, even when no audio has arrived. Every later update before accepted
 finalization ends with exactly one `transcription_session.updated`: the adapter emits the field
@@ -586,7 +591,7 @@ every engine-facing task of its sessions, including the cleanup of a session who
 | Coupling to the model plugin | Entry-point discovery, structural protocol, `getattr` on two attributes | Import the model plugin's classes; a base class in the frontend | The two packages release separately, and neither can import the other without a cycle or a lock-step version |
 | Engine capability check | The factory constructor raises | A frontend check on the engine client | The engine-client protocol does not declare the stream-admission calls; only the party using them can test for them |
 | Factory selection | Exactly one accepts, unless a name is configured | First accepting; priority order | Two factories for one model is a deployment error; ordering would hide it |
-| Cadence | `560ms` for every stream; startup fails if not served | Client-chosen cadence; model default | Riva has no cadence field; one cadence for both streaming surfaces means one clip decodes on the same lookahead over either |
+| Cadence | The factory's `default_cadence` for every stream; startup fails if it is absent or not served | A frontend constant; a cadence chosen per request | The lookahead is the model's setting; a constant fails on a deployment that serves another; Riva documents no request field for it; one cadence for both streaming surfaces means one clip decodes on the same lookahead over either |
 | Default locale | The factory's `default_locale`; client must name one when `None` | A frontend-chosen default; always `auto` | The locale table is the model's; a guessed default changes transcripts silently |
 | Final transcript | Taken from `flush`'s string at one shared point | Per-surface accumulation of `feed` results | A transcript is final only after a normal close; one derivation point cannot diverge between surfaces |
 | Final delivery | Only after `finish` and `release` succeed | After `flush` | A wire terminal that precedes resource cleanup lets a client reconnect into a slot that is still held |

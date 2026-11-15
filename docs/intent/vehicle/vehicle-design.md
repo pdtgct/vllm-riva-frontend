@@ -100,8 +100,8 @@ entirely the engine scheduler's.
 
 The gRPC server is `grpc.aio.server()` with the servicer registered through the generated
 `add_RivaSpeechRecognitionServicer_to_server`; no OS thread is committed per concurrent streaming
-session for that session's duration. Every streaming adapter passes its validated cadence and
-locale only to `SessionFactory.open` and carries no per-session override through a process-shared
+session for that session's duration. Every streaming adapter passes the factory's `default_cadence`
+and its validated locale only to `SessionFactory.open` and carries no per-session override through a process-shared
 object. Engine rendering and the streaming integration stay inside the model plugin's session; the
 frontend renders no prompt and passes no transport-owned configuration to the engine. (The exact
 locale the file path sends in `vllm_xargs` is request data the model defines, not transport-owned
@@ -258,7 +258,7 @@ middleware's registration, and the 401 body).
    checks): the `app` kept from `attach_router` is searched, and `init_state` fails startup unless,
    in core's final table (after every plugin attached), the first route that matches each path the
    frontend added (and its method, for an HTTP route) is the frontend's own.
-9. **Session factory, last**: discovery, the single-accept rule and the `560ms` cadence check
+9. **Session factory, last**: discovery, the single-accept rule and the `default_cadence` check
    (session leaf), then the servicer, which needs the factory. The vehicle owns every factory a
    constructor returned: a factory that discovery discards (not the named one, or one of several
    accepting) is settled when it is discarded, the selected one in `drain`, `stop` or a
@@ -327,7 +327,7 @@ so that the default deployment passes these checks.
 
 The engine is the authority for sub-unit traffic. The frontend's idle bound resets on any accepted
 audio, but the engine's parked-idle clock resets only when a complete unit is sent. A client that
-delivers less than one unit of audio (560 ms at the streaming cadence) per engine idle window can
+delivers less than one unit of audio (one cadence chunk, 320 ms in the reference deployment) per engine idle window can
 therefore be ended by the engine (`expired`, projected as an idle timeout) even though the
 frontend's bound would not have fired. The startup check compares the bounds as above and does not
 close this gap; the seam is unchanged.
@@ -844,23 +844,26 @@ The repository's deployment guide, `docs/deployment.md`, sets:
   change, `--stream-admission-timeouts` with the changed keys;
 - `--shutdown-timeout` above the engine's drain time (the engine's `draining_timeout` default is
   40 s; 60 s is the documented value);
-- the model plugin's own serve flags (HLD Constraints). The reference deployment serves
-  `supported_num_lookahead_tokens` `[6, 13]` with `num_lookahead_tokens` 13: 6 is the 560 ms arm
-  that the Riva streaming surfaces open at, and 13 fixes the 1120 ms cadence at which complete
-  files and core's own `/v1/realtime` run;
+- the model plugin's own serve flags (HLD Constraints). The reference deployment sets no
+  lookahead, so the model plugin serves the checkpoint's default lookahead, 3 (320 ms), and the
+  Riva streaming surfaces, complete files and core's own `/v1/realtime` all run at that cadence;
+  an operator who sets `num_lookahead_tokens` in `--hf-overrides` moves all three together. This
+  needs the model-plugin change the HLD records (Constraints): until it lands, the plugin requires
+  `num_lookahead_tokens` and publishes no `default_cadence`, so this deployment cannot start;
 - `--max-model-len` large enough for the longest file either frontend file surface admits, at the
-  cadence `num_lookahead_tokens` fixes. The frontend's file route admits a file up to core's
+  served cadence (lookahead `r`). The frontend's file route admits a file up to core's
   decode-duration limit (`VLLM_MAX_AUDIO_DECODE_DURATION_S`, 600 s by default), and `Recognize` up
   to `unary_max_decoded_duration_seconds`, which `init_state` keeps at or below that limit; so
   core's limit is the governing duration, and the guide states it whenever it changes it. The
   model applies no input-length limit of its own: a file that reaches `--max-model-len` ends with
   a `length` finish, and on a core without the pending change that turns such an ending into a
   failure, core returns the partial transcript as success (HTTP 200 on the route, a normal
-  `Recognize` result). The worst-case token count of a file is `1 + (C + 1) * Q + 1` with `r` that
-  lookahead, `Q = (r + 1) * 10 + 1` and `C` the number of whole cadence chunks of `(r + 1) * 1280`
-  samples. At the reference `r = 13` (`Q = 141`, 17,920 samples per chunk) a 600 s file needs at
-  least 75,578; the model plugin's README serves 76,800. A deployment that runs files at 560 ms
-  (`r = 6`, `Q = 71`, 8,960 samples per chunk) needs 76,114. The frontend does not compute this
+  `Recognize` result). The worst-case token count of a file is `1 + (C + 1) * Q + 1` with `r` the
+  served lookahead, `Q = (r + 1) * 10 + 1` and `C` the number of whole cadence chunks of `(r + 1) * 1280`
+  samples. At the reference `r = 3` (`Q = 41`, 5,120 samples per chunk) a 600 s file needs at
+  least 76,918, and the deployment guide serves 77,000. A deployment at 1120 ms (`r = 13`,
+  `Q = 141`, 17,920 samples per chunk) needs 75,578, and one at 560 ms (`r = 6`, `Q = 71`, 8,960
+  samples per chunk) needs 76,114. The frontend does not compute this
   count (it needs model-specific knowledge outside the structural seam); the formula and values
   here are for operators. Core's own `POST /v1/audio/transcriptions` admits files up to the same
   decode-duration limit, so the same value covers it.

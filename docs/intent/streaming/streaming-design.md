@@ -44,10 +44,10 @@ code. It is registered on the plugin's `grpc.aio.server()` (vehicle leaf).
 The first request message is `streaming_config`; any other message first is `protocol_order`
 (`FAILED_PRECONDITION`). The handler validates it completely and calls
 `open` before advancing the request iterator; every later message carries `audio_content`; a later
-`streaming_config` is terminal `protocol_order` with abnormal lease cleanup. The session opens with
-`cadence="560ms"`, the convention shared with the Realtime WebSocket, so a clip transcribed over
-either decodes on the same lookahead, and with the validated locale; cadence is server policy
-because the Riva protocol has no cadence field.
+`streaming_config` is terminal `protocol_order` with abnormal lease cleanup. The session opens at the
+factory's `default_cadence`, as the Realtime WebSocket does, so a clip transcribed over either
+decodes on the same lookahead, and with the validated locale. Cadence is a server setting: the
+Riva protocol has no cadence field, and the frontend reads no `custom_configuration` key for one.
 
 Validation of the first message covers:
 
@@ -358,7 +358,7 @@ never by golden parity, since the NeMo reference model has no endpointing.
 | --- | --- | --- | --- |
 | One leaf for the gRPC facet | `Recognize`'s wire handling here, its execution path in the files leaf | Split the facet between streaming and files | A facet belongs to exactly one leaf, and the servicer, field table, limits and header inference are shared by both RPCs; the files leaf owns what is specific to complete files |
 | Stubs | `nvidia-riva-client` generated stubs, pinned | Vendored codegen | The canonical client and the servicer then share one proto artifact; one fewer build step |
-| Streaming cadence | `560ms` fixed | Client field (none exists); model default | Server policy; one cadence for both streaming surfaces |
+| Streaming cadence | The factory's `default_cadence` | A frontend constant; a `custom_configuration` key | The lookahead is the model's setting; Riva documents no key for it; one cadence for both streaming surfaces |
 | Configuration listing shape | One entry per type and locale, types `online` and `offline`, singular `language_code` | One entry per type listing every locale in `language_codes`; type `streaming` | The stock scripts select `online` or `offline` entries and group them by the singular `language_code`; the online filter excludes `streaming`, and a plural `language_codes` leaves the grouping key empty |
 | `verbatim_transcripts`, punctuation | Accepted under either value, documented | Reject the non-default | The canonical tools send a value by default; rejecting a default breaks the stock client |
 | `Recognize` request-level rider | `runtime_config` rejected on streaming requests | Ignore | Riders are request-level options; the honest subset covers them |
