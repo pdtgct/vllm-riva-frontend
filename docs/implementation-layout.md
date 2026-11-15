@@ -9,6 +9,28 @@ Core is vLLM with RFC 2 (endpoint plugins) merged (`pdtgct/vllm`). The frontend 
 of core; the session seam belongs to the model plugin. Core
 paths below are relative to that tree.
 
+## Distribution `vllm-riva-frontend-dev`
+
+Built from `dev/` (its own `pyproject.toml`, sources under `dev/src/`), released
+with the frontend at the same version, and a member of the repository's uv workspace. The root
+project's `dev` dependency group lists `vllm-riva-frontend-dev`, and `tool.uv.sources` maps both
+`vllm-riva-frontend` and `vllm-riva-frontend-dev` to the workspace, so `uv sync` installs both
+from the working tree. The root's development dependency and the development distribution's
+runtime dependency on the root form no runtime cycle: the frontend never depends on it. An
+isolated build of `dev/` cannot read the frontend's source, so `dev/` carries its own literal
+`__version__`, its own exact `vllm-riva-frontend==<version>` pin and its own copy of `LICENSE`; a
+test fails when that version or pin differs from the frontend's `__version__`. The suite imports
+no frontend module at module level, so collecting it needs no vLLM tree.
+
+| Module | Public names |
+| --- | --- |
+| `vllm_riva_frontend_dev` | `Return(value=<default>)` (one default sentinel, compared by identity), `Raise(exc, skip_accept=False)`, `Block(then=Return(), delay_cancel=False, on_enter=None)` with `entered`, `released`, `cancellations`, `async park()` and `release(then=None)`; `SeamError(session_error, reason, message="")`, `refused(reason, message="")`, `failed(reason, message="")`; `async settle(rounds=50)`; `__version__`; the adapter hooks a `seam` fixture's object provides, in the package docstring. Imports neither `pytest` nor `seam_conformance` |
+| `vllm_riva_frontend_dev.seam_conformance` | the seam conformance tests (ING-CORE-022, ING-CORE-030), each marked `asyncio`; no `seam` fixture. A consumer registers it for assertion rewriting in its `conftest.py`, star-imports it in a test module and defines `seam` there |
+
+`tests/support/fake_session.py` and `tests/support/clock.py` import these names from the
+development package rather than defining them, so the fake and a real adapter share one set of
+types.
+
 ## Package `vllm_riva_frontend`
 
 | Module | Public names |
@@ -531,7 +553,7 @@ wiring with a real clock use `support.app.drain_plugins`.
 | Leaf | Directory | Covers |
 | --- | --- | --- |
 | vehicle | `tests/vehicle/` | declaration, `init_state` order and checks, listener, `ready`, `drain`, `stop`, faults, configuration |
-| session | `tests/session/` | discovery, seam conformance (against `FakeSessionFactory`), the stream owner, bounds, cleanup |
+| session | `tests/session/` | discovery, seam conformance (`test_seam_conformance.py` star-imports `vllm_riva_frontend_dev.seam_conformance` and defines `seam` as `FakeSeam` over `FakeSessionFactory`), the stream owner, bounds, cleanup |
 | streaming | `tests/streaming/` | the Riva servicer's wire contract, the Realtime route and adapter |
 | files | `tests/files/` | gate, guard, multipart, the HTTP route, `Recognize`, core pins |
 | audio | `tests/audio/` | accept-matrix, decoders, carry, resampler, WAV |
@@ -557,7 +579,8 @@ python -m pytest -q tests
 ```
 
 Markers: `gpu` (an installed engine on a CUDA device; skipped without one), `engine` (imports the
-core tree; skipped when it does not import), `real_factory` (the seam conformance suite against the
-model plugin's factory; skipped when it is not installed). Unmarked tests are CPU tests over the
+core tree; skipped when it does not import), `real_factory` (a test against the model plugin's
+factory; skipped when it is not installed; the model plugin's repository runs the conformance
+suite against its real factory). Unmarked tests are CPU tests over the
 fakes. Asyncio mode is `auto` (`pytest-asyncio`): `async def` tests need no marker, and each test
 gets its own event loop.

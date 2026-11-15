@@ -110,6 +110,31 @@ a `release` after a cancelled `abort` keeps a tracked task until the generation 
 (`SESS-REL-003`, `SESS-OWN-003`); the call order the owner relies on; and the error attributes,
 including a reason the frontend does not know.
 
+The suite ships as a second distribution, `vllm-riva-frontend-dev` (import package
+`vllm_riva_frontend_dev`), built from the `dev/` directory of this repository and
+released at the frontend's own version: both wheels are built from one revision, and the
+development distribution declares its version in its own source rather than importing the
+frontend to read it. Its runtime dependencies are `vllm-riva-frontend` at
+exactly that version, `pytest`, `pytest-asyncio` and `numpy`. The frontend's wheel contains no
+test code and declares no test dependency, so a deployment installs no test code. The model plugin
+repository adds the development distribution, at the version of the frontend it pairs with, to
+its test dependencies only.
+
+The development package exports the values an adapter needs to arrange each case: `Return`,
+`Raise` and `Block` (what a hook's suspended call does: `Block.park()` waits for `release(then)`,
+then performs `then`), `SeamError` with its constructors `refused` and `failed` (an exception
+carrying `session_error` and `reason`), and `settle` (yield to the event loop for a number of
+turns and then while callbacks are ready, within a bound; it reads the loop's ready queue where
+the loop exposes it). Importing the package imports neither `pytest` nor the suite. Its module
+`seam_conformance` holds the tests, each marked `asyncio`, and defines no `seam` fixture. A consumer runs it
+from one of its own test modules: its `conftest.py` calls
+`pytest.register_assert_rewrite("vllm_riva_frontend_dev.seam_conformance")` before that module is
+imported, the module star-imports the suite, and it defines `seam`, returning its adapter. The
+frontend's CPU lane returns the adapter over its fake factory; the model plugin's run returns one
+over its real factory. The hooks an adapter provides are documented in the package. The suite
+imports frontend modules (`lease`, `errors`, `lifecycle`) when its tests run, so a consumer's
+environment also needs what the frontend package imports, a vLLM tree included.
+
 ### Factory obligations
 
 The frontend imposes the following obligations on every factory. This list is the canonical one;
@@ -581,10 +606,11 @@ every engine-facing task of its sessions, including the cleanup of a session who
 
 | Decision | Chosen | Alternatives Considered | Rationale |
 | --- | --- | --- | --- |
-| Coupling to the model plugin | Entry-point discovery, structural protocol, `getattr` on two attributes | Import the model plugin's classes; a base class in the frontend | The two packages release separately, and neither can import the other without a cycle or a lock-step version |
+| Coupling to the model plugin | Entry-point discovery, structural protocol, `getattr` on two attributes | Import the model plugin's classes; a base class in the frontend | The two packages release separately, and neither can import the other without a cycle or a lock-step version; the model plugin's test environment depends on the development distribution, which its runtime never imports |
 | Engine capability check | The factory constructor raises | A frontend check on the engine client | The engine-client protocol does not declare the stream-admission calls; only the party using them can test for them |
 | Factory selection | Exactly one accepts, unless a name is configured | First accepting; priority order | Two factories for one model is a deployment error; ordering would hide it |
 | Cadence | Owned by the model plugin; `open` takes only the locale | A frontend constant; the factory's default read and passed back | The lookahead is the model's setting and no Riva request field selects it; a constant fails on a deployment that serves another, and a value passed back is one the frontend never uses |
+| Conformance suite delivery | A second distribution, `vllm-riva-frontend-dev`, released at the frontend's version and pinning it exactly | The suite under `tests/`, run by the model plugin from a checkout of the frontend at a tag; the suite inside the frontend's wheel, with its test dependencies in an extra | A checkout needs the frontend's test tree and its `pythonpath`, which no installed distribution carries; inside the frontend's wheel, test code would reach every deployment, and test code is not held to the frontend's runtime review |
 | Default locale | The factory's `default_locale`; client must name one when `None` | A frontend-chosen default; always `auto` | The locale table is the model's; a guessed default changes transcripts silently |
 | Final transcript | Taken from `flush`'s string at one shared point | Per-surface accumulation of `feed` results | A transcript is final only after a normal close; one derivation point cannot diverge between surfaces |
 | Final delivery | Only after `finish` and `release` succeed | After `flush` | A wire terminal that precedes resource cleanup lets a client reconnect into a slot that is still held |

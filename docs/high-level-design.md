@@ -372,8 +372,10 @@ module. Every spec ID cited in this repository resolves here or in the model plu
 
 ## Success metrics
 
-1. CPU: lifecycle, seam conformance (against a fake factory, and against the model plugin's real
-   factory), error mapping, `--api-key` coverage of the namespace and the authentication startup
+1. CPU: lifecycle, seam conformance (the suite of the `vllm-riva-frontend-dev` distribution,
+   run against the frontend's fake factory in the frontend's CPU lane, and against the model
+   plugin's real factory in the model plugin repository's run, which is the seam's acceptance
+   gate), error mapping, `--api-key` coverage of the namespace and the authentication startup
    check, core's routes left unchanged, refusal of a non-transcription WebSocket query, refusal of
    more than one API server process, readiness on core's `/ready` and admission refused while
    `state.draining`, file gate and guard, startup rollback, and settlement of owned work on every
