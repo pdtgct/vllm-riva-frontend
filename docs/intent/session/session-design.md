@@ -172,6 +172,10 @@ specification.
    faults not yet returned, and every later `teardown_all` returns no task still running and
    raises nothing, so a `stop` after a completed `drain` settlement ends its factory settlement
    at once.
+9. **One startup cadence.** `default_cadence` is the cadence of the lookahead configured at
+   startup (`num_lookahead_tokens` from `--hf-overrides` when given, otherwise the checkpoint's
+   default lookahead), `served_cadences` is `frozenset({default_cadence})` for the server's
+   lifetime, and core's file path runs at that cadence.
 
 The suite checks each obligation, and includes these tests:
 

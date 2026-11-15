@@ -462,7 +462,7 @@ of this budget.
 ## Equivalence
 
 A complete file's transcript equals the transcript of a factory session fed the same audio at the
-factory's `default_cadence`. Core's file path runs at the same configured lookahead (ING-EP-078), so
+factory's `default_cadence`. Core's file path runs at the same configured lookahead (session design, Factory obligation 9), so
 this is also the cadence of the frontend's streaming surfaces. Under matched
 conditions: the same decoded samples, with the `Recognize` conversion's 16-bit requantization
 applied to the stream side too (audio leaf); the same cadence, locale, precision and endpointing
@@ -499,7 +499,7 @@ failure.
 | Ignored fields | Explicit non-default `n`, `length_penalty`, `include_stop_str_in_output` refused | Accept silently | Unsupported features are refused, never ignored |
 | Request fields | Explicit allowlist; explicit non-default sampling refused; inherited values not inspected | Pass unknown fields to core; refuse inherited values | Extra fields would reach the model unvalidated; inherited values are operator configuration |
 | File owners | Counted in `max_file_owners` inside the ingress cap | A shared cap | A backlog of waiting files must not refuse streams |
-| Equivalence reference | A factory session at `default_cadence`, the cadence core's file path also uses (ING-EP-078) | A session on a server configured for another lookahead | The file runs at the configured lookahead, so only a session at that cadence compares exactly |
+| Equivalence reference | A factory session at `default_cadence`, the cadence core's file path also uses (Factory obligation 9) | A session on a server configured for another lookahead | The file runs at the configured lookahead, so only a session at that cadence compares exactly |
 | Model length | No startup relation between the frontend's duration caps and `max_model_len`; the deployment guide sizes `--max-model-len` for the longest file either surface admits | A startup check; projecting a model refusal of an over-length file | The frontend cannot compute a file's token count, which needs the model's emission bound; the model refuses no file for its length, so there is no refusal to project |
 | `Recognize` accounting | Outside the server-load counter | Count it too | The counter reports HTTP load; the synthetic request exists only to fix the engine request ID |
 | Gate placement | In the frontend, before `generate` | Core's queue | A queued file counts against the active-request limit and refuses streams |
