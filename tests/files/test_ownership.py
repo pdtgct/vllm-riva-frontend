@@ -916,6 +916,10 @@ async def test_owner_cleanup_deadline_is_clipped_to_d_at_selection_only(
     * ``drain-after``: core's ``state.draining`` with no ``drain`` call at
       the selection (unclipped, ``t0 + 34``); a ``drain(20)`` begun at
       ``t0 + 5`` with ``D = t0 + 20`` neither clips nor restarts it.
+
+    A held stream owner on the plugin's own registry keeps each ``drain``
+    call in its graceful work, since a drain with no owner left would end
+    at once (ING-EP-109).
     """
     from support.app import drain_plugin
     from support.audio import pcm16_sine, wav_pcm16
@@ -955,6 +959,8 @@ async def test_owner_cleanup_deadline_is_clipped_to_d_at_selection_only(
         return await owner.run(wav, request, files.build_raw_request())
 
     owners: list[object] = []
+    held = asyncio.ensure_future(asyncio.Event().wait())
+    plugin.registry.register(OwnerKind.stream, held)
     t0 = clock.monotonic()
     task = asyncio.ensure_future(run())
     drain: asyncio.Future | None = None

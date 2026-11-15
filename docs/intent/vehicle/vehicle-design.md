@@ -156,6 +156,11 @@ the operations leaf owns the route set they apply to.
   endpoint and relative order, and every added route is under `/plugins/riva/v1/`. The same tests
   verify that the frontend's route set collides with no route of core's table.
 
+**Core's startup listing.** Before it serves, core's launcher logs every route: an HTTP route by
+path and methods, any other route by path and its endpoint's `__name__`. The Realtime WebSocket
+route's endpoint is an ASGI app object rather than a function, so it carries a `__name__` of its
+own, and a CPU test runs core's listing over the app with the plugin attached.
+
 **Path-scoped authentication.** Core's authentication middleware checks `--api-key` only on its own
 prefixes (`/v1`, `/v2`, `/inference`, `/cohere`), so it does not cover the namespace. `attach_router`
 therefore adds one pure-ASGI middleware with `app.add_middleware`. `build_app` runs plugin hooks
@@ -494,27 +499,50 @@ running keeps the value it had when its cleanup began.
 1. Set health to `NOT_SERVING` and close admission: new owners are refused (`state.draining` is
    already set by core).
 2. Let owners finish normally until the settle point, `S = D - min(5 s, (D - t0) / 4)`, computed
-   once from the instant `t0` at which `drain` computed `D`. Clients that
-   finish their audio get their finals. This step lasts until the settle point even when no owner
-   remains, so health checkers and load balancers observe `NOT_SERVING` and stop routing to the
-   server before its listener closes.
-3. At the settle point, raise the shutdown trigger with `D` for every remaining stream owner. An
-   owner whose lease is open and that has selected neither a client finalization nor an abnormal
-   cause selects provisional shutdown mode when it observes the trigger; an owner already finalizing
-   for its client or already cleaning up keeps that path, as the session leaf's shutdown
-   finalization states. An owner in shutdown mode wakes if it is blocked in a transport receive by
-   cancelling that receive (never a lease call), settles any outstanding call under that call's own
-   deadline with the wait clipped to `D`, feeds the audio frontend's drained tail, calls `flush`,
-   `finish` and `release`, delivers the final only after `release`, and ends the stream: gRPC `OK`
-   after the final, WebSocket close 1001. An owner whose sequence fails or does not finish by `D`
-   aborts as the session leaf states (an open or broken lease takes `abort` then `release`; a lease
-   already flushed takes `release` only) and ends the stream with gRPC `UNAVAILABLE`
-   (`service_unavailable`) or WebSocket close 1012. File requests still running at the settle point
-   are cancelled (errors leaf: `service_unavailable`, 503 before headers, stream termination after)
-   and take their cancellation path; the wait for their settlement is bounded by
-   `min(session_cleanup_timeout, time to D)`, and children still unsettled stay under their cleanup
-   continuation, with its permit and accounting, which the settlement awaits.
-4. Stop the gRPC server with the time remaining to `D` as the grace period.
+   once from the instant `t0` at which `drain` computed `D`, or until no owner remains, whichever
+   comes first. Clients that finish their audio get their finals. While an owner remains, health
+   checkers and load balancers observe `NOT_SERVING` on a listener that still serves. Once the last
+   owner (stream or file, with its cleanup continuation) has ended, or when none is open as `drain`
+   begins, nothing is left to finish, so `drain` goes on to step 3 at once and ends without waiting
+   for the settle point; the graceful work then takes as long as the open work needs, never more
+   than `D`. The settlement that follows it (below) has no time limit.
+3. At the settle point, or as soon as no owner remains, raise the shutdown trigger with `D` for
+   every remaining stream owner. An owner whose lease is open and that has selected neither a
+   client finalization nor an abnormal cause selects provisional shutdown mode when it observes the
+   trigger; an owner already finalizing for its client or already cleaning up keeps that path, as
+   the session leaf's shutdown finalization states. An owner in shutdown mode wakes if it is
+   blocked in a transport receive by cancelling that receive (never a lease call), settles any
+   outstanding call under that call's own deadline with the wait clipped to `D`, feeds the audio
+   frontend's drained tail, calls `flush`, `finish` and `release`, delivers the final only after
+   `release`, and ends the stream: gRPC `OK` after the final, WebSocket close 1001. An owner whose
+   sequence fails or does not finish by `D` aborts as the session leaf states (an open or broken
+   lease takes `abort` then `release`; a lease already flushed takes `release` only) and ends the
+   stream with gRPC `UNAVAILABLE` (`service_unavailable`) or WebSocket close 1012. File requests
+   still running at the settle point are cancelled (errors leaf: `service_unavailable`, 503 before
+   headers, stream termination after) and take their cancellation path; the wait for their
+   settlement is bounded by `min(session_cleanup_timeout, time to D)`, and children still unsettled
+   stay under their cleanup continuation, with its permit and accounting, which the settlement
+   awaits.
+4. Stop the gRPC server once, gracefully, with the time remaining to `D` as the grace period.
+   gRPC's graceful stop returns as soon as every RPC still open has ended and sent its response and
+   status. An owner that ends within the grace has until `D` for its response and status to reach
+   its client; the grace's expiry at `D` can still end an RPC whose answer is unfinished. The grace
+   serves owners only. A health `Watch` and a server reflection stream own nothing but stay open
+   for as long as their client keeps them, and would hold the stop to `D`; so once no owner
+   remains, at the stop or later during its grace, the plugin ends each of them with `UNAVAILABLE`
+   from the server side, and ends one that arrives afterwards at once. The stop then returns as
+   soon as the owners' RPCs have flushed their answers; gRPC refuses every RPC that arrives once the
+   stop has begun. The plugin never ends an owner's RPC before `D`: an owner's record leaves the
+   registry when its handler ends, before gRPC has sent the handler's response, so the registry
+   alone cannot tell when an answer is on the wire. One kind of RPC escapes both rules. gRPC reads
+   the request message of an RPC whose request is one message (`Recognize`,
+   `GetRivaSpeechRecognitionConfig`, health `Check` and `Watch`) before it invokes the plugin's
+   handler, so a client that has opened such an RPC but not yet sent its request holds a call the
+   plugin cannot see: it is no owner, and the plugin cannot end it. Such a call may hold the stop to
+   the end of its grace, never past `D`. The plugin does not intercept request reception to close
+   this gap; the grace bounds it. An admitted `StreamingRecognize` call is not affected: gRPC
+   invokes its handler before the first request message, and the handler registers its owner before
+   its first read.
 5. End the fault collector: signal it to stop and await its end (a collection call in progress
    finishes, and its faults are recorded). Then call `factory.drain(D)`, wait on its cleanup tasks
    until `D`, and log the faults it returns.
@@ -895,6 +923,8 @@ The guide also sets:
 | Sub-unit traffic | The engine is the authority; document the limit | A frontend check on units delivered; a seam change | The engine's clock resets on units sent, which the frontend cannot observe without a seam change; the engine's expiry is already a safe backstop |
 | Startup order | Factory built last; any later failure runs the factory settlement; admission opens last in `start`; a failed or cancelled `start` tears the factory down and awaits what it cancels before re-raising | Build it first; re-raise without awaiting | A factory owns engine-facing tasks, so a failed startup must not leave any, and core calls `stop` only for a plugin whose `start` completed; admitting before `start` completes would admit owners into a failing plugin |
 | Live streams at drain | The frontend finalizes them at the settle point (tail, `flush`, final, then gRPC `OK` or WebSocket 1001); failures abort with `UNAVAILABLE` or 1012 | Cancel everything at the settle point; wait for clients | Clients that sent audio get a complete transcript; an aborted stream is told to retry elsewhere |
+| Drain with no owner left | Step 2 ends when the last owner ends, and at once when none is open | Hold `NOT_SERVING` on a serving listener until the settle point, owners or not | Holding keeps an idle server in its drain for most of its budget (49 s of the documented 60 s) and delays engine shutdown and exit by as much; health and core's `/ready` already report `NOT_SERVING` and 503 from the start of the drain, and a client that reaches a closed listener retries elsewhere just as it does on `NOT_SERVING` |
+| Non-owner RPCs at the listener stop | One graceful stop; once no owner remains, the plugin ends each health `Watch` and reflection stream with `UNAVAILABLE` and refuses new ones the same way | A second stop without grace once the registry holds no owner | An owner's record leaves the registry before gRPC has sent its handler's response, so a stop without grace at that moment cuts a reply already being sent (a large `Recognize` response most of all); gRPC's graceful stop already waits for exactly the RPCs still sending, and only the RPCs that own nothing need ending |
 | Drain deadline | A graceful-work target `D = deadline - max(5 s, 10% of timeout)`; settlement may run past it | The full core deadline | The target aims to leave core time to shut the engine down after plugins drain; core reserves no engine allowance, so the target is not a guarantee, and settlement takes precedence |
 | Shutdown settlement | Graceful work within `D`, then abort and await every owner, continuation, unsettled send and the fault collector, then the factory settlement, before `drain` returns, raises or re-raises a cancellation | Return at the deadline with work still cancelling; leave the remainder to `stop` | RFC 2 requires owned work to be settled so that it cannot submit engine requests after the hook returns; core shuts the engine down once `drain` returns |
 | Factory settlement | Owners, continuations and unsettled sends settle and the fault collector ends; then `factory.drain(math.inf)`, then `teardown_all()`, await every task it returns, then `factory.drain(now)` once more, and report the faults both `drain` calls return plus last-resort cancellations | `teardown_all()` first and await what it returns; `factory.drain` with a large finite deadline, then `teardown_all()`; the lease's `teardown()` on bound expiry | `teardown_all` cancels unconditionally, so calling it while a generation task is still completing the engine client's abort (after `abort` or a cancelled `open`) interrupts that abort. `factory.drain(math.inf)` lets every handed-over generation task finish its cancellation, so the later `teardown_all` cancels only ended tasks. A finite bound reintroduces a deadline after which `teardown_all` would cancel a task still awaiting the abort. `teardown()` also cancels again and starts no factory task that the settlement could await |

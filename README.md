@@ -40,7 +40,7 @@ This repository is a development preview and is not published to PyPI. Install a
 from git:
 
 ```bash
-pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b1"
+pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b2"
 ```
 
 The GitHub release notes for the tag give the full pinned recipe: the vLLM build and the model

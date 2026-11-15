@@ -129,6 +129,7 @@ async def test_drain_computes_core_deadline_and_d_and_clips_graceful_waits(
     started, fake_factory, clock, helpers, monkeypatch
 ) -> None:
     plugin, state = started
+    helpers.register_dummy(plugin)  # keeps drain in its graceful work
     events: list[Any] = []
     spy_listener_stop(plugin, monkeypatch, events, clock)
     spy_factory(fake_factory, monkeypatch, events, clock)
@@ -157,6 +158,7 @@ async def test_drain_sets_not_serving_and_closes_admission(
     from vllm_riva_frontend.grpc import RIVA_SERVICE_NAME
 
     plugin, state = started
+    helpers.register_dummy(plugin)  # keeps the listener serving
     task = helpers.begin_drain(plugin, state, 60)
     await clock.settle()
     async with aio_channel(plugin.config.grpc_bind) as channel:
@@ -174,30 +176,720 @@ async def test_drain_sets_not_serving_and_closes_admission(
     await helpers.drive(clock, task)
 
 
-# @spec ING-EP-109
-async def test_listener_serves_not_serving_until_settle_point_without_owners(
-    started, clock, helpers, monkeypatch
-) -> None:
+async def _health(plugin: Any) -> Any:
     from grpc_health.v1 import health_pb2, health_pb2_grpc
     from support.grpc_harness import aio_channel
 
+    async with aio_channel(plugin.config.grpc_bind) as channel:
+        reply = await health_pb2_grpc.HealthStub(channel).Check(
+            health_pb2.HealthCheckRequest(service=""), timeout=2.0
+        )
+    return reply.status
+
+
+# @spec ING-EP-109
+@OUTLASTS_DRAIN
+async def test_listener_serves_not_serving_until_settle_point_with_an_owner(
+    started, fake_factory, clock, helpers, monkeypatch
+) -> None:
+    from grpc_health.v1 import health_pb2
+
     plugin, state = started
+    run, lease = await helpers.stream_with_lease(plugin, fake_factory, clock)
     events: list[Any] = []
     spy_listener_stop(plugin, monkeypatch, events, clock)
     t0 = clock.monotonic()
     task = helpers.begin_drain(plugin, state, 60)  # settle point t0 + 49
     await clock.advance(48.5)
-    assert not task.done(), "drain waits for its settle point, owners or not"
+    assert not task.done(), "an open stream holds drain to its settle point"
     assert events == [], "the listener is not stopped before the settle point"
     assert state.request_shutdown.calls == 0
     assert plugin.registry.shutdown_trigger is None
-    async with aio_channel(plugin.config.grpc_bind) as channel:
-        reply = await health_pb2_grpc.HealthStub(channel).Check(
-            health_pb2.HealthCheckRequest(service=""), timeout=2.0
-        )
-        assert reply.status == health_pb2.HealthCheckResponse.NOT_SERVING
+    assert "flush" not in lease.names()
+    assert await _health(plugin) == health_pb2.HealthCheckResponse.NOT_SERVING
+    await clock.advance(1.0)  # past the settle point
+    await helpers.settle_until(clock, lambda: run.done)
     await helpers.drive(clock, task)
     assert events and events[0][2] >= t0 + 49
+
+
+# @spec ING-EP-109
+async def test_drain_without_owners_stops_the_listener_at_once(
+    started, clock, helpers, monkeypatch
+) -> None:
+    plugin, state = started
+    events: list[Any] = []
+    spy_listener_stop(plugin, monkeypatch, events, clock)
+    t0 = clock.monotonic()
+    task = helpers.begin_drain(plugin, state, 60)  # settle point t0 + 49
+    await helpers.drive(clock, task)
+    assert events, "the listener is stopped"
+    assert events[0][2] < t0 + 1, "no wait for the settle point"
+    assert clock.monotonic() < t0 + 1, "drain ends without its settle point"
+
+
+@contextlib.asynccontextmanager
+async def _health_watch(plugin: Any) -> Any:
+    """An open health ``Watch`` on the real listener, past its first reply.
+
+    Yields the call; a ``Watch`` owns nothing, so it is no owner of the
+    plugin's registry.
+    """
+    from grpc_health.v1 import health_pb2, health_pb2_grpc
+    from support.grpc_harness import aio_channel
+
+    async with aio_channel(plugin.config.grpc_bind) as channel:
+        call = health_pb2_grpc.HealthStub(channel).Watch(
+            health_pb2.HealthCheckRequest(service="")
+        )
+        first_reply = await asyncio.wait_for(call.read(), 2.0)
+        assert first_reply.status == health_pb2.HealthCheckResponse.SERVING
+        try:
+            yield call
+        finally:
+            call.cancel()
+
+
+async def _watch_end(call: Any) -> Any:
+    """Read a streaming call's remaining replies; return its status code."""
+
+    async def to_end() -> Any:
+        with contextlib.suppress(grpc.aio.AioRpcError):
+            while await call.read() is not grpc.aio.EOF:
+                pass
+        return await call.code()
+
+    return await asyncio.wait_for(to_end(), 2.0)
+
+
+@contextlib.asynccontextmanager
+async def _reflection_stream(plugin: Any) -> Any:
+    """An open server reflection stream, past its first reply.
+
+    Yields the call and its request iterator's ``asyncio.Queue``; the
+    client keeps the stream open, and it owns nothing.
+    """
+    from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
+    from support.grpc_harness import aio_channel
+
+    requests: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def client_requests() -> Any:
+        while True:
+            yield await requests.get()
+
+    async with aio_channel(plugin.config.grpc_bind) as channel:
+        stub = reflection_pb2_grpc.ServerReflectionStub(channel)
+        call = stub.ServerReflectionInfo(client_requests())
+        await requests.put(
+            reflection_pb2.ServerReflectionRequest(list_services="")
+        )
+        first_reply = await asyncio.wait_for(call.read(), 2.0)
+        assert first_reply.list_services_response.service
+        try:
+            yield call
+        finally:
+            call.cancel()
+
+
+# @spec ING-EP-074, ING-EP-109
+async def test_an_open_health_watch_does_not_hold_an_idle_drain(
+    started, clock, helpers
+) -> None:
+    import time
+
+    plugin, state = started
+    async with (
+        _health_watch(plugin) as watch,
+        _reflection_stream(plugin) as reflection,
+    ):
+        assert plugin.registry.settled(), "neither call is an owner"
+        t0, real0 = clock.monotonic(), time.monotonic()
+        task = helpers.begin_drain(plugin, state, 60)  # D t0 + 54
+        await helpers.drive(clock, task)
+        assert time.monotonic() - real0 < 3, "no listener grace without owners"
+        assert clock.monotonic() < t0 + 1
+        assert await _watch_end(watch) is grpc.StatusCode.UNAVAILABLE
+        assert await _watch_end(reflection) is grpc.StatusCode.UNAVAILABLE
+
+
+# @spec ING-EP-074
+async def test_listener_grace_ends_when_the_last_owner_ends_during_it(
+    started, clock, helpers, monkeypatch
+) -> None:
+    import time
+
+    plugin, state = started
+    release_owner = asyncio.Event()
+    dummy, _ = helpers.register_dummy(plugin, stubborn=release_owner)
+    events: list[Any] = []
+    spy_listener_stop(plugin, monkeypatch, events, clock)
+    async with _health_watch(plugin) as watch:
+        task = helpers.begin_drain(plugin, state, 60)  # S t0 + 49, D t0 + 54
+        await advance_until(clock, lambda: bool(events))
+        grace = events[0][1]
+        assert grace > 1, "an owner remains: the stop keeps its grace"
+        await asyncio.sleep(0.2)
+        assert not task.done() and not watch.done(), "grace while it remains"
+        real0 = time.monotonic()
+        release_owner.set()
+        await helpers.drive(clock, task)
+        assert dummy.done()
+        assert time.monotonic() - real0 < 3, "the grace ends with the owner"
+        assert await _watch_end(watch) is grpc.StatusCode.UNAVAILABLE
+    assert [grace for _, grace, _ in events] == [grace], "one stop only"
+
+
+#: A reply of several MiB, large enough to take many transport writes.
+_LARGE_REPLY_BYTES = 6 * 1024 * 1024
+#: Owner RPCs per drain in the large-reply test.
+_LARGE_REPLY_CALLS = 8
+
+
+# @spec ING-EP-074
+@pytest.mark.parametrize("repeat", range(4))
+@pytest.mark.parametrize("released", ["before_the_stop", "during_its_grace"])
+async def test_owner_replies_flush_whole_while_the_listener_stops(
+    initialized, clock, helpers, monkeypatch, released, repeat
+) -> None:
+    """Large unary replies from owners ending around the stop all arrive.
+
+    Each RPC registers as an owner and leaves the registry as its handler
+    returns, before gRPC has sent its reply, as every owner of the
+    frontend does; it is registered as a stream owner so that it lasts past
+    the settle point to the stop. A health ``Watch`` stays open throughout
+    and ends with ``UNAVAILABLE`` once no owner remains.
+    """
+    import time
+
+    from riva.client.proto import riva_asr_pb2 as rasr
+    from riva.client.proto import riva_asr_pb2_grpc
+    from support.riva import recognize_request
+
+    from vllm_riva_frontend import surfaces
+    from vllm_riva_frontend.admission import OwnerKind
+    from vllm_riva_frontend.grpc import RivaServicer
+
+    del repeat
+    plugin, state = initialized
+    release = asyncio.Event()
+    transcript = "x" * _LARGE_REPLY_BYTES
+
+    async def large_recognize(self, request, context):
+        registry = plugin.registry
+        record = registry.register(OwnerKind.stream, asyncio.current_task())
+        try:
+            # The shutdown trigger cancels an owner with no observer; this
+            # one finishes its answer all the same, as a finalizing owner.
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            asyncio.current_task().uncancel()
+        finally:
+            surfaces.unregister(registry, record)
+        alternative = rasr.SpeechRecognitionAlternative(transcript=transcript)
+        return rasr.RecognizeResponse(
+            results=[rasr.SpeechRecognitionResult(alternatives=[alternative])]
+        )
+
+    monkeypatch.setattr(RivaServicer, "Recognize", large_recognize)
+    await plugin.start(state)
+    events: list[Any] = []
+    spy_listener_stop(plugin, monkeypatch, events, clock)
+    options = [("grpc.max_receive_message_length", 2 * _LARGE_REPLY_BYTES)]
+    channel = grpc.aio.insecure_channel(plugin.config.grpc_bind, options)
+    try:
+        async with _health_watch(plugin) as watch:
+            stub = riva_asr_pb2_grpc.RivaSpeechRecognitionStub(channel)
+            calls = [
+                stub.Recognize(recognize_request(b"\0\0" * 160))
+                for _ in range(_LARGE_REPLY_CALLS)
+            ]
+            await helpers.until(
+                lambda: len(plugin.registry.records) == _LARGE_REPLY_CALLS
+            )
+            task = helpers.begin_drain(plugin, state, 60)  # S 49, D 54
+            if released == "during_its_grace":
+                await advance_until(clock, lambda: bool(events))
+                await asyncio.sleep(0.05)
+                assert not watch.done(), "owners remain: the Watch stays"
+            else:
+                await clock.settle()
+                assert not events, "owners remain: no stop yet"
+            real0 = time.monotonic()
+            release.set()
+            outcomes = await asyncio.wait_for(
+                asyncio.gather(*calls, return_exceptions=True), 5.0
+            )
+            await helpers.drive(clock, task)
+            assert time.monotonic() - real0 < 3, "the grace ends with them"
+            assert await _watch_end(watch) is grpc.StatusCode.UNAVAILABLE
+    finally:
+        await channel.close()
+    for outcome in outcomes:
+        assert isinstance(outcome, rasr.RecognizeResponse), outcome
+        assert len(outcome.results[0].alternatives[0].transcript) == len(
+            transcript
+        )
+    assert len(events) == 1, "one graceful stop, no stop without grace"
+
+
+# @spec ING-EP-074, ING-EP-076, ING-EP-093
+async def test_drain_cancelled_during_the_listener_stop_still_settles(
+    started, fake_factory, clock, helpers, monkeypatch
+) -> None:
+    """A cancellation during the graceful stop still reaches the settlement.
+
+    gRPC shares one shutdown future among concurrent stops; the cancelled
+    graceful stop must not cancel the settlement's stop without grace.
+    """
+    plugin, state = started
+    release_owner = asyncio.Event()
+    dummy, _ = helpers.register_dummy(plugin, stubborn=release_owner)
+    events: list[Any] = []
+    spy_listener_stop(plugin, monkeypatch, events, clock)
+    watch_collector(plugin, events, clock)
+    async with _health_watch(plugin) as watch:
+        task = helpers.begin_drain(plugin, state, 60)  # S t0 + 49, D t0 + 54
+        await advance_until(clock, lambda: bool(events))
+        await asyncio.sleep(0.05)
+        assert not task.done(), "the owner holds the graceful stop"
+        task.cancel()
+        await clock.settle()
+        assert not task.done(), "the settlement awaits the owner"
+        release_owner.set()
+        with pytest.raises(asyncio.CancelledError):
+            await helpers.drive(clock, task)
+        assert await _watch_end(watch) is not grpc.StatusCode.OK
+    assert dummy.cancelled(), "the settlement aborted the owner"
+    assert labels(events)[:2] == ["listener.stop", "listener.stop"]
+    assert events[1][1] is None, "the settlement stops without grace"
+    assert "collector.end" in labels(events)
+    helpers.factory_settlement(fake_factory)
+    left = [
+        running
+        for running in asyncio.all_tasks()
+        if "non_owner" in getattr(running.get_coro(), "__qualname__", "")
+    ]
+    assert left == [], "no task of the listener stop outlives the drain"
+    assert not plugin.registry.records
+
+
+# @spec ING-EP-074, ING-EP-106
+@pytest.mark.parametrize("companion", ["cancelled", "raises"])
+async def test_listener_stop_joins_its_companion_through_cancellations(
+    started, monkeypatch, caplog, companion
+) -> None:
+    """The task ending the non-owner calls is awaited before the stop exits.
+
+    The caller is cancelled repeatedly while the companion is still ending;
+    the stop exits only after it, re-raising the cancellation, and a
+    companion's own failure is logged.
+    """
+    plugin, _ = started
+    stop_entered = asyncio.Event()
+    companion_entered = asyncio.Event()
+    release = asyncio.Event()
+    ended: list[str] = []
+
+    async def blocked_stop(grace: float | None) -> None:
+        stop_entered.set()
+        await asyncio.Event().wait()
+
+    async def stubborn_companion() -> None:
+        companion_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            if companion == "raises":
+                raise RuntimeError("companion failed") from None
+            raise
+        finally:
+            ended.append("companion")
+
+    monkeypatch.setattr(plugin, "_stop_listener", blocked_stop)
+    monkeypatch.setattr(
+        plugin, "_end_non_owner_calls_when_idle", stubborn_companion
+    )
+    stop = asyncio.ensure_future(
+        plugin._stop_listener_for_owners(plugin.clock.monotonic() + 1)
+    )
+    await asyncio.wait_for(stop_entered.wait(), 1.0)
+    await asyncio.wait_for(companion_entered.wait(), 1.0)
+    for _ in range(3):
+        stop.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    assert not stop.done(), "the companion is still ending"
+    with caplog.at_level(logging.ERROR):
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await stop
+    assert ended == ["companion"], "joined before the stop exits"
+    logged = "a lifecycle helper task failed" in caplog.text
+    assert logged is (companion == "raises")
+
+
+# @spec ING-EP-074, ING-EP-106
+@pytest.mark.parametrize("cancelled_during_join", [False, True])
+async def test_a_failing_listener_stop_joins_its_companion_first(
+    started, monkeypatch, cancelled_during_join
+) -> None:
+    """A stop that raises still joins the companion before it exits.
+
+    Its failure propagates; a cancellation of the caller while the
+    companion is ending is re-raised instead, chained to the failure.
+    """
+    plugin, _ = started
+    companion_entered = asyncio.Event()
+    companion_cleaning = asyncio.Event()
+    release = asyncio.Event()
+    ended: list[str] = []
+    failure = RuntimeError("listener stop failed")
+
+    async def failing_stop(grace: float | None) -> None:
+        await companion_entered.wait()
+        raise failure
+
+    async def stubborn_companion() -> None:
+        companion_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            companion_cleaning.set()
+            await release.wait()
+            raise
+        finally:
+            ended.append("companion")
+
+    monkeypatch.setattr(plugin, "_stop_listener", failing_stop)
+    monkeypatch.setattr(
+        plugin, "_end_non_owner_calls_when_idle", stubborn_companion
+    )
+    stop = asyncio.ensure_future(
+        plugin._stop_listener_for_owners(plugin.clock.monotonic() + 1)
+    )
+    await asyncio.wait_for(companion_cleaning.wait(), 1.0)
+    if cancelled_during_join:
+        for _ in range(3):
+            stop.cancel()
+            for _ in range(5):
+                await asyncio.sleep(0)
+    assert not stop.done(), "the companion is still ending"
+    release.set()
+    if cancelled_during_join:
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await stop
+        assert cancelled.value.__cause__ is failure
+    else:
+        with pytest.raises(RuntimeError) as raised:
+            await stop
+        assert raised.value is failure
+    assert ended == ["companion"], "joined before the stop exits"
+
+
+# @spec ING-EP-074
+async def test_a_non_owner_call_after_end_is_refused_unstarted() -> None:
+    from support.grpc_harness import FakeServicerContext, RpcAbort
+
+    from vllm_riva_frontend.grpc import NonOwnerCalls
+
+    calls = NonOwnerCalls()
+    calls.end()
+    started: list[bool] = []
+
+    async def handler() -> None:
+        started.append(True)
+
+    with pytest.raises(RpcAbort) as info:
+        await calls.serve(handler, FakeServicerContext())
+    assert info.value.code is grpc.StatusCode.UNAVAILABLE
+    assert started == [], "the handler never starts"
+
+
+# @spec ING-EP-074
+async def test_a_handler_failing_as_its_call_ends_has_its_failure_taken() -> (
+    None
+):
+    """A handler that fails in the turn ``end`` comes has its failure taken.
+
+    The call still ends with ``UNAVAILABLE``, and asyncio reports no task
+    exception that was never retrieved.
+    """
+    import gc
+
+    from support.grpc_harness import FakeServicerContext, RpcAbort
+
+    from vllm_riva_frontend.grpc import NonOwnerCalls
+
+    async def end_as_the_handler_fails() -> None:
+        calls = NonOwnerCalls()
+        entered = asyncio.Event()
+        fail = asyncio.Event()
+
+        async def handler() -> None:
+            entered.set()
+            await fail.wait()
+            raise RuntimeError("handler failed")
+
+        call = asyncio.ensure_future(
+            calls.serve(handler, FakeServicerContext())
+        )
+        await asyncio.wait_for(entered.wait(), 1.0)
+        fail.set()
+        calls.end()  # the same turn: both complete before ``serve`` resumes
+        with pytest.raises(RpcAbort) as info:
+            await call
+        assert info.value.code is grpc.StatusCode.UNAVAILABLE
+
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        await end_as_the_handler_fails()
+        for _ in range(3):  # the call's frames are released, then collected
+            gc.collect()
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == []
+
+
+# @spec ING-EP-074
+async def test_a_cancelled_non_owner_call_awaits_its_handler() -> None:
+    from support.grpc_harness import FakeServicerContext
+
+    from vllm_riva_frontend.grpc import NonOwnerCalls
+
+    calls = NonOwnerCalls()
+    entered = asyncio.Event()
+    events: list[str] = []
+
+    async def handler() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)  # a cleanup step that takes a turn
+            events.append("handler.cancelled")
+            raise
+
+    call = asyncio.ensure_future(calls.serve(handler, FakeServicerContext()))
+    await asyncio.wait_for(entered.wait(), 1.0)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert events == ["handler.cancelled"], "awaited, and no abort is sent"
+    calls.end()  # touches no ended call
+
+
+# @spec ING-EP-106
+@pytest.mark.parametrize("via_end", [True, False], ids=["after-end", "client"])
+async def test_a_non_owner_call_joins_its_handler_through_cancellations(
+    via_end: bool,
+) -> None:
+    """``serve`` cancelled again while its handler cleans up still joins it.
+
+    Covers a cancellation after ``end`` and a client cancellation; the call
+    re-raises cancellation only once the handler has ended.
+    """
+    from support.grpc_harness import FakeServicerContext
+
+    from vllm_riva_frontend.grpc import NonOwnerCalls
+
+    calls = NonOwnerCalls()
+    entered = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    ended: list[str] = []
+
+    async def handler() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleaning.set()
+            await release.wait()
+            ended.append("handler")
+            raise
+
+    call = asyncio.ensure_future(calls.serve(handler, FakeServicerContext()))
+    await asyncio.wait_for(entered.wait(), 1.0)
+    if via_end:
+        calls.end()
+    else:
+        call.cancel()
+    await asyncio.wait_for(cleaning.wait(), 1.0)
+    for _ in range(3):
+        call.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    assert not call.done(), "the handler is still cleaning up"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert ended == ["handler"], "joined before the call exits"
+
+
+# @spec ING-EP-106
+async def test_a_cancelled_non_owner_call_takes_its_handlers_failure() -> None:
+    """A handler failing in its cleanup after a client cancellation is taken.
+
+    The call re-raises its cancellation, and asyncio reports no task
+    exception that was never retrieved.
+    """
+    import gc
+
+    from support.grpc_harness import FakeServicerContext
+
+    from vllm_riva_frontend.grpc import NonOwnerCalls
+
+    async def cancel_as_the_handler_fails() -> None:
+        calls = NonOwnerCalls()
+        entered = asyncio.Event()
+
+        async def handler() -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("cleanup failed") from None
+
+        call = asyncio.ensure_future(
+            calls.serve(handler, FakeServicerContext())
+        )
+        await asyncio.wait_for(entered.wait(), 1.0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        await cancel_as_the_handler_fails()
+        for _ in range(3):  # the call's frames are released, then collected
+            gc.collect()
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == []
+
+
+#: RPCs whose request is one message: gRPC reads it before the handler runs.
+_UNARY_REQUEST_PATHS = (
+    "/grpc.health.v1.Health/Check",
+    "/grpc.health.v1.Health/Watch",
+    "/nvidia.riva.asr.RivaSpeechRecognition/Recognize",
+    "/nvidia.riva.asr.RivaSpeechRecognition/GetRivaSpeechRecognitionConfig",
+)
+#: A drain budget whose ``D`` is 0.5 s away (the engine reserve is 5 s).
+_SHORT_DRAIN = 5.5
+_SHORT_GRACE = 0.5
+#: Real-time scheduling slack allowed around the listener's grace expiry.
+_GRACE_TOLERANCE = 0.2
+
+
+# @spec ING-EP-074, ING-EP-109
+@pytest.mark.parametrize("path", _UNARY_REQUEST_PATHS)
+async def test_a_call_stalled_before_its_request_holds_the_stop_only_to_d(
+    started, clock, helpers, monkeypatch, path
+) -> None:
+    """A call whose request has not arrived is outside the plugin's reach.
+
+    The client opens the call and never sends its request message, so no
+    handler runs: the call is no owner and cannot be ended. It holds the
+    listener stop until its grace expires at ``D``, and the drain still
+    ends by ``D``.
+
+    The fake clock does not advance, so the stop's grace is exactly the
+    time to ``D``; the hold is then measured in real time, the clock gRPC's
+    grace runs on.
+    """
+    import time
+
+    from support.grpc_harness import aio_channel
+
+    plugin, state = started
+    real_stop = plugin.server.stop
+    stops: list[tuple[float, float, float]] = []
+
+    async def spy(grace):
+        began = time.monotonic()
+        try:
+            return await real_stop(grace)
+        finally:
+            stops.append((grace, began, time.monotonic()))
+
+    monkeypatch.setattr(plugin.server, "stop", spy)
+    async with aio_channel(plugin.config.grpc_bind) as channel:
+        call = channel.stream_stream(path)()
+        await asyncio.wait_for(call.wait_for_connection(), 2.0)
+        await asyncio.sleep(0.1)
+        assert not call.done(), "the call is pending at the server"
+        assert plugin.registry.settled(), "the stalled call is no owner"
+        t0 = clock.monotonic()
+        real0 = time.monotonic()
+        task = helpers.begin_drain(plugin, state, _SHORT_DRAIN)  # D t0 + 0.5
+        await asyncio.wait_for(task, 2.0)
+        elapsed = time.monotonic() - real0
+        assert clock.monotonic() == t0, "the fake clock stood still"
+        code = await asyncio.wait_for(call.code(), 2.0)
+    assert len(stops) == 1
+    grace, began, ended = stops[0]
+    assert grace == pytest.approx(_SHORT_GRACE), "the grace runs to D"
+    assert ended - began >= grace - _GRACE_TOLERANCE, "the call holds the stop"
+    assert elapsed >= _SHORT_GRACE - _GRACE_TOLERANCE, "held until near D"
+    assert elapsed < _SHORT_GRACE + _GRACE_TOLERANCE, "the drain ends by D"
+    assert code is not grpc.StatusCode.OK
+
+
+# @spec ING-EP-074, ING-LIFE-063
+async def test_a_streaming_call_is_an_owner_before_its_first_request(
+    started, helpers
+) -> None:
+    """``StreamingRecognize`` registers its owner before its first read."""
+    from support.grpc_harness import aio_channel
+
+    plugin, _ = started
+    path = "/nvidia.riva.asr.RivaSpeechRecognition/StreamingRecognize"
+    async with aio_channel(plugin.config.grpc_bind) as channel:
+        call = channel.stream_stream(path)()
+        await asyncio.wait_for(call.wait_for_connection(), 2.0)
+        await helpers.until(lambda: len(plugin.registry.records) == 1)
+        assert not plugin.registry.settled(), "an owner with no request yet"
+        call.cancel()
+    await helpers.until(plugin.registry.settled)
+
+
+# @spec ING-EP-109, ING-EP-036
+@OUTLASTS_DRAIN
+async def test_drain_ends_when_the_last_stream_ends(
+    started, fake_factory, clock, helpers, monkeypatch
+) -> None:
+    from grpc_health.v1 import health_pb2
+
+    plugin, state = started
+    run, lease = await helpers.stream_with_lease(plugin, fake_factory, clock)
+    events: list[Any] = []
+    spy_listener_stop(plugin, monkeypatch, events, clock)
+    t0 = clock.monotonic()
+    task = helpers.begin_drain(plugin, state, 60)  # settle point t0 + 49
+    await clock.advance(10)
+    assert events == [], "the open stream keeps the listener serving"
+    assert await _health(plugin) == health_pb2.HealthCheckResponse.NOT_SERVING
+    # The client finishes on its own and gets its final.
+    run.requests.close()
+    await helpers.settle_until(clock, lambda: run.done)
+    assert run.status is grpc.StatusCode.OK
+    assert lease.names()[-3:] == ["flush", "finish", "release"]
+    await helpers.drive(clock, task)
+    assert events and events[0][2] < t0 + 12, "stopped once the stream ended"
+    assert clock.monotonic() < t0 + 12, "drain ends with its last owner"
+    assert plugin.registry.shutdown_trigger is not None
 
 
 # @spec ING-EP-036

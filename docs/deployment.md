@@ -23,7 +23,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --tokenizer-mode nemotron_asr_streaming \
     --max-model-len 76800 \
     --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b1", "pin": "unspecified"}}' \
+    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b2", "pin": "unspecified"}}' \
     --hf-overrides '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
 ```
 
@@ -59,10 +59,17 @@ change, for example `--stream-admission-timeouts '{"never_fed_timeout": 30}'`, a
 `--shutdown-timeout` above `draining_timeout`. The deadlines are not part of the additional
 configuration: a `stream_admission` object there stops startup with an error naming the flag.
 
-**Shutdown.** The shutdown timeout is the frontend's whole drain budget: open streams are
-finalized, files settle and the gRPC listener stops before the engine shuts down, with time kept
-for core. It must exceed the engine's `draining_timeout`; 60 s is the documented value. A zero
-timeout means no drain runs, and the frontend logs a warning at startup.
+**Shutdown.** The shutdown timeout is the frontend's whole drain budget: open streams are finalized,
+files settle and the gRPC listener stops before the engine shuts down, with time kept for core. It
+must exceed the engine's `draining_timeout`; 60 s is the documented value. A zero timeout means no
+drain runs, and the frontend logs a warning at startup. The drain ends once no stream or file
+remains, so an idle server may close its gRPC listener soon after `SIGTERM`, before health checkers
+observe `NOT_SERVING`; an open health `Watch` or reflection stream then ends with `UNAVAILABLE`, and
+a reply already being sent may complete until the drain deadline, at which any unfinished call ends.
+A client that has opened a call but not yet sent its request message (a `Recognize`, configuration
+or health call) can hold the listener stop until the drain deadline, never past it. A deployment
+whose load balancers must stop routing to the server first adds a pre-stop delay before the signal
+(for Kubernetes, a `preStop` hook).
 
 **Shutdown signal.** Send `SIGTERM` or `SIGINT` to the `vllm serve` API-server process only; in a
 terminal, use `kill -INT <api-server-pid>`. A signal sent to the whole process group, such as

@@ -14,7 +14,8 @@ streaming surfaces read client input through the owner's bounded
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Mapping
+import functools
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
@@ -22,7 +23,7 @@ import grpc
 import grpc.aio
 import numpy as np
 from grpc_health.v1 import health, health_pb2_grpc
-from grpc_reflection.v1alpha import reflection
+from grpc_reflection.v1alpha import reflection, reflection_pb2_grpc
 from riva.client.proto import riva_asr_pb2 as rasr
 from riva.client.proto import riva_asr_pb2_grpc as rasr_grpc
 from riva.client.proto import riva_audio_pb2 as raudio
@@ -275,25 +276,140 @@ def config_response(plugin: Any) -> rasr.RivaSpeechRecognitionConfigResponse:
 # =============================================================== listener
 
 
-# @spec ING-GRPC-001
+# @spec ING-EP-074
+class NonOwnerCalls:
+    """The listener's long-lived RPCs that own nothing, ended on request.
+
+    A health ``Watch`` and a server reflection stream stay open for as long
+    as their client keeps them, so they would hold the listener's graceful
+    stop to the end of its grace. ``end`` ends each one still open with
+    ``UNAVAILABLE`` and makes one arriving afterwards end at once in the
+    same way; gRPC's graceful stop then waits only for the other RPCs.
+    """
+
+    def __init__(self) -> None:
+        """No call is open and the calls have not been ended."""
+        self.ended = False
+        self._signals: set[asyncio.Future[None]] = set()
+
+    def end(self) -> None:
+        """End every call still open, and each one arriving afterwards."""
+        self.ended = True
+        for signal in list(self._signals):
+            if not signal.done():
+                signal.set_result(None)
+
+    async def serve(
+        self, handler: Callable[[], Awaitable[None]], context: Any
+    ) -> None:
+        """Run ``handler`` for one call until it returns or ``end`` comes.
+
+        On ``end`` the handler is cancelled and awaited, and the call ends
+        with ``UNAVAILABLE``, even when the handler has ended in the same
+        turn. A cancellation of the call cancels the handler and awaits its
+        end through any further cancellations, then re-raises; an exception
+        the handler ends with is taken on every path, so asyncio never
+        reports it as unretrieved.
+        """
+        if not self.ended:
+            signal = asyncio.get_running_loop().create_future()
+            self._signals.add(signal)
+            work = asyncio.ensure_future(handler())
+            interrupted = False
+            try:
+                await asyncio.wait(
+                    {work, signal}, return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                interrupted = True
+            self._signals.discard(signal)
+            if not work.done():
+                work.cancel()
+            while not work.done():
+                try:
+                    await asyncio.wait({work})
+                except asyncio.CancelledError:
+                    interrupted = True
+            if interrupted:
+                if not work.cancelled():
+                    # The call's cancellation wins; the handler's own
+                    # exception is taken so it is not reported unretrieved.
+                    work.exception()
+                raise asyncio.CancelledError
+            if not signal.done():
+                return work.result()
+            if not work.cancelled():
+                # The handler ended in the turn ``end`` came: its exception
+                # is taken, so asyncio does not report it as unretrieved.
+                work.exception()
+        await context.abort(
+            grpc.StatusCode.UNAVAILABLE, "the server is shutting down"
+        )
+
+
+class _HealthServicer(health.aio.HealthServicer):  # type: ignore[misc]
+    """gRPC's health servicer, its ``Watch`` calls ended by ``calls``."""
+
+    def __init__(self, calls: NonOwnerCalls) -> None:
+        super().__init__()
+        self.non_owner_calls = calls
+
+    async def Watch(self, request: Any, context: Any) -> None:  # noqa: D102
+        await self.non_owner_calls.serve(
+            functools.partial(super().Watch, request, context), context
+        )
+
+
+class _ReflectionServicer(reflection.aio.ReflectionServicer):  # type: ignore[misc]
+    """gRPC's reflection servicer, its streams ended by ``calls``."""
+
+    def __init__(self, service_names: Any, calls: NonOwnerCalls) -> None:
+        super().__init__(service_names)
+        self.non_owner_calls = calls
+
+    async def ServerReflectionInfo(  # noqa: D102
+        self, request_iterator: Any, context: Any
+    ) -> None:
+        replies = super().ServerReflectionInfo(request_iterator, context)
+
+        async def send() -> None:
+            async for reply in replies:
+                await context.write(reply)
+
+        try:
+            await self.non_owner_calls.serve(send, context)
+        finally:
+            await replies.aclose()
+
+
+# @spec ING-GRPC-001, ING-EP-074
 def register_aio_services(
     server: grpc.aio.Server, servicer: RivaServicer
-) -> health.aio.HealthServicer:
-    """Register the Riva servicer, standard health and reflection."""
+) -> tuple[health.aio.HealthServicer, NonOwnerCalls]:
+    """Register the Riva servicer, standard health and reflection.
+
+    Returns the health servicer and the ``NonOwnerCalls`` that ends the
+    health ``Watch`` calls and the reflection streams when the drain asks
+    for it.
+    """
     rasr_grpc.add_RivaSpeechRecognitionServicer_to_server(servicer, server)
-    health_servicer = health.aio.HealthServicer()
+    calls = NonOwnerCalls()
+    health_servicer = _HealthServicer(calls)
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
-    reflection.enable_server_reflection(
-        (RIVA_SERVICE_NAME, health.SERVICE_NAME, reflection.SERVICE_NAME),
+    reflection_pb2_grpc.add_ServerReflectionServicer_to_server(
+        _ReflectionServicer(
+            (RIVA_SERVICE_NAME, health.SERVICE_NAME, reflection.SERVICE_NAME),
+            calls,
+        ),
         server,
     )
-    return health_servicer
+    return health_servicer, calls
 
 
 # @spec ING-GRPC-034
 def build_server(
     config: FrontendConfig, servicer: RivaServicer
-) -> tuple[grpc.aio.Server, health.aio.HealthServicer]:
+) -> tuple[grpc.aio.Server, health.aio.HealthServicer, NonOwnerCalls]:
     """An unbound ``grpc.aio`` server carrying the frontend's services.
 
     The receive cap is ``grpc_receive_max_bytes`` for every request message
@@ -309,7 +425,8 @@ def build_server(
     if keepalive is not None:
         options.append(("grpc.keepalive_time_ms", int(keepalive * 1000)))
     server = grpc.aio.server(options=options)
-    return server, register_aio_services(server, servicer)
+    health_servicer, calls = register_aio_services(server, servicer)
+    return server, health_servicer, calls
 
 
 def _rpc_deadline(clock: Any, context: Any) -> float | None:
@@ -1054,6 +1171,7 @@ __all__ = [
     "ENCODING_NAMES",
     "FIELD_DISPOSITIONS",
     "RIVA_SERVICE_NAME",
+    "NonOwnerCalls",
     "RivaServicer",
     "build_server",
     "config_response",
