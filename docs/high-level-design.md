@@ -147,13 +147,25 @@ owners from the moment core sets it, before or without a `drain` call.
   unchanged; a constructor returns `None` when it does not serve the model. Exactly one factory must
   accept, unless the configuration names one. A constructor that raises fails startup; that raise is
   the frontend's only engine-capability check.
-- **Protocol** (as published by the model plugin's session design): the factory exposes
-  `served_cadences`, `locales`, `default_locale` (possibly `None`), `open(cadence, locale)`,
+- **Protocol** (the model plugin's session design publishes it; `default_cadence` is owed there, see
+  Constraints): the factory exposes
+  `served_cadences`, `default_cadence` (one of `served_cadences`), `locales`, `default_locale`
+  (possibly `None`), `open(cadence, locale)`,
   `drain(deadline) -> list` of retained task faults (absolute `time.monotonic()` deadline) and
   `teardown_all() -> set` of tasks; a lease exposes `feed`, `update_locale` (returns `None`), `flush`
   (returns the final transcript), `finish`, `abort`, `release` and synchronous `teardown`.
-- **Cadence and locale.** Streaming surfaces open at `560ms`; `init_state` fails if the factory does
-  not serve it. A stream's locale is the client's, validated against `locales`; when the client
+- **Cadence.** A cadence names the duration of audio the model processes per step, as a label such
+  as `320ms`; the model plugin maps its configured encoder lookahead to that label. Cadence is a
+  server setting, as a deployed Riva pipeline fixes its own lookahead: every stream on the
+  frontend's surfaces opens at the factory's `default_cadence`, which is the checkpoint's own
+  default lookahead unless the operator sets `num_lookahead_tokens` in `--hf-overrides`. The same
+  setting fixes the cadence of complete files, so streams and files run at one cadence. The
+  frontend holds no cadence of its own and substitutes none: `init_state` fails if the factory has
+  no `default_cadence` or it is not in `served_cadences`. No Riva or Realtime request field selects
+  a cadence. Clients send audio in messages of any duration, within the ingress limits; the model
+  plugin's session layer accumulates it into model chunks, and message boundaries neither select
+  nor change the cadence.
+- **Locale.** A stream's locale is the client's, validated against `locales`; when the client
   names none, `default_locale`; when that is `None`, the client must name one.
 - **Error contract.** Seam exceptions carry `session_error` (`refused` or `failed`) and `reason`;
   the error catalog maps each reason on its own (for example `locale` is the client's bad input,
@@ -282,7 +294,8 @@ owners from the moment core sets it, before or without a `drain` call.
   attaches its transcription route only for such a model, so `attach_router` adds the frontend's
   file route only when core's `POST /v1/audio/transcriptions` is present (the frontend serves no
   translation route); without the task, `Recognize` answers
-  `UNIMPLEMENTED`. `GetRivaSpeechRecognitionConfig` lists the model once per served locale with
+  `UNIMPLEMENTED`. Every model entry and response names the model vLLM serves
+  (`--served-model-name`). `GetRivaSpeechRecognitionConfig` lists the model once per served locale with
   `type=online` and, when complete files are served, again per locale with `type=offline`; each
   entry names its `language_code` and the encodings and rates it accepts. Unsupported request
   features are refused explicitly, never ignored.
@@ -306,12 +319,17 @@ owners from the moment core sets it, before or without a `drain` call.
   with the same conformance run as the acceptance gate. Until the change lands, settlement still
   ends and awaits every task, but an exception a generation task raises after its session was handed
   over may go unreported.
+- **Model-plugin change for the default cadence.** The factory does not yet publish
+  `default_cadence`, and the plugin requires `num_lookahead_tokens` in `--hf-overrides` and discards
+  the checkpoint's default lookahead. Publishing the attribute, and defaulting to the checkpoint's
+  lookahead when no override is given, are owed in the plugin's registration and session designs,
+  specifications, tests and code. Until then, `init_state` fails against that plugin.
 - **Plugins.** `VLLM_PLUGINS=riva_frontend,nemotron_asr_streaming` (core loads no endpoint plugin
   when the variable is unset), one API server process (the frontend's `init_state` refuses to
   start when the server runs more than one API server process, since every process would bind the
   gRPC port; a count core leaves unset in single-process mode is one), with the model plugin's
   serve flags (float32, eager, synchronous scheduling, no prefix caching, its config format,
-  tokenizer mode and lookahead overrides). Experimental native burst is outside the supported
+  tokenizer mode and optional lookahead overrides). Experimental native burst is outside the supported
   all-surfaces deployment: the model refuses complete files in that mode.
 - **Model contract the frontend relies on.** Tasks exactly `transcription` and `realtime`; complete
   files advance at most one chunk per engine step on their own state slot; the model refuses at
@@ -346,6 +364,7 @@ module. Every spec ID cited in this repository resolves here or in the model plu
 | `--api-key` on the namespace | A path-scoped middleware from `attach_router` that takes core's configured tokens and calls core's token check; off only with no key configured and no core authentication installed, on only with a configured key and exactly one readable registration, and startup fails otherwise | Rely on core: its check covers only `/v1`, `/v2`, `/inference` and `/cohere`, so the namespace would be unauthenticated; a copy of the token check: two implementations of a security check; a FastAPI dependency on each route: covers only routes that declare it, not unknown paths under the prefix, and needs separate WebSocket handling; a change to core's prefixes: outside RFC 1 and RFC 2 |
 | Shutdown settlement | Graceful work within the deadline, then abort and await every owned task before `drain` ends, awaiting the factory's cleanup before closing it so no generation task is cancelled while it awaits the engine client's abort; `stop` settles in the same order | Return at the deadline with work still cancelling; a fixed wait in `stop`: RFC 2 requires owned work to be settled so that it cannot submit engine requests after the hook returns. Closing the factory with `teardown_all()` before its cleanup has ended: it cancels a generation task again while that task awaits the engine client's abort, and can interrupt the abort |
 | Complete-file HTTP route | A namespaced route with in-memory parsing, gate and guard, calling core's service | Middleware that buffers and replays the body to core's route: core's form parser spools large uploads to disk and the body is parsed twice; no guard: the model's own refusal depends on a pending core change, and without it beam search and completion limits break the model's single-slot file path |
+| Stream cadence | The factory's `default_cadence`: the checkpoint's default lookahead, with an optional server override; the reported model name stays `--served-model-name` | A cadence per request in `custom_configuration`: Riva documents no lookahead key, so this would be a frontend-specific selector that stock clients do not send; a model name per cadence: the reported name would differ from `--served-model-name`; a cadence fixed in the frontend: startup fails on a deployment whose served set omits it |
 | `Recognize` | Core's transcription service through the file gate | A stream at a long cadence: a second code path, and the model's file path exists for this |
 | Session seam | Entry-point discovery, structural protocol, error attributes read with `getattr` | Importing the model plugin: couples two packages that release separately |
 | Fault escalation | `request_shutdown()` on `engine_dead` or a collected retained fault | A failure latch: a state that outlives its cause |
