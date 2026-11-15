@@ -44,6 +44,77 @@ async def test_owner_registers_then_enters_configured_when_open_returns(
     assert fake_factory.names("lease:0") == []
 
 
+# @spec ING-EP-078, ING-CORE-014, ING-ERR-010
+async def test_a_factory_whose_open_requires_a_cadence_ends_the_stream_internal(
+    make_owner,
+):
+    # A model plugin release whose ``open`` still requires a cadence: the
+    # locale-only call raises TypeError, and the stream ends ``internal``.
+    from vllm_riva_frontend.errors import FrontendError
+
+    async def legacy_open(*, cadence: str, locale: str):
+        raise AssertionError("never reached")
+
+    owner = make_owner(lease_opener=legacy_open)
+    with pytest.raises(FrontendError) as ended:
+        await _open(owner)
+    assert ended.value.code == "internal"
+    assert owner.cause is not None and owner.cause.code == "internal"
+
+
+# @spec ING-ERR-010, ING-LIFE-056
+async def test_a_lease_call_that_raises_as_it_is_called_fails_the_call(
+    make_owner, fake_factory, monkeypatch
+):
+    # A raise while the call's arguments bind, before any coroutine
+    # exists, is the call's failure: ``internal``, then abort and release.
+    from vllm_riva_frontend.errors import FrontendError
+
+    owner = make_owner()
+    await _open(owner)
+    lease = _lease(fake_factory)
+
+    def feed(*args, **kwargs):
+        raise TypeError("feed() got an unexpected keyword argument")
+
+    monkeypatch.setattr(lease, "feed", feed)
+    with pytest.raises(FrontendError) as info:
+        await owner.feed(SAMPLES)
+
+    assert info.value.code == "internal"
+    assert owner.cause is not None and owner.cause.code == "internal"
+    assert lease.names()[-2:] == ["abort", "release"]
+    assert owner.lease_state == "released"
+
+
+# @spec ING-LIFE-036
+async def test_a_call_cancelled_before_its_first_step_never_calls_the_factory(
+    make_owner,
+):
+    import warnings
+
+    entered: list[str] = []
+
+    async def opener(*, locale: str):
+        entered.append(locale)
+        raise AssertionError("never reached")
+
+    owner = make_owner(lease_opener=opener)
+    opening = asyncio.create_task(_open(owner))
+    await asyncio.sleep(0)
+    call = owner._call
+    assert call is not None and not call.done()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        call.cancel()
+        with contextlib.suppress(BaseException):
+            await opening
+        await settle()
+
+    assert entered == []
+    assert owner._call is None
+
+
 # @spec ING-LIFE-017, ING-LIFE-025, ING-LIFE-063
 async def test_finalize_flushes_finishes_releases_and_returns_flush_text(
     make_owner, owner_parts, fake_factory

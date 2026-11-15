@@ -316,8 +316,9 @@ def _ending(
     owner was in provisional shutdown mode, or the drain deadline came
     first), 1013 for an engine refusal before configuration, and 1011 after
     a lease-call timeout or ``engine_dead``. A refusal of ``open`` (the
-    factory phase) is an ``error`` event, never ``failed``: ``cadence`` and
-    ``request_id_in_use`` close 1011 with ``internal``.
+    factory phase) is an ``error`` event, never ``failed``:
+    ``request_id_in_use`` and an unknown reason close 1011 with
+    ``internal``.
     """
     code = error.code
     cause = owner.cause if owner is not None else None
@@ -1066,11 +1067,7 @@ class RealtimeAdapter:
                 continue
             audio = self._adopt(session)
             try:
-                await self._call(
-                    owner.open(
-                        cadence=lease.STREAM_CADENCE, locale=self._locale
-                    )
-                )
+                await self._call(owner.open(locale=self._locale))
             except errors.FrontendError as refused:
                 # A locale refusal leaves the owner unconfigured with no
                 # cause (ING-ERR-063): an ``error`` with no close, and a

@@ -81,7 +81,7 @@ def test_exception_without_session_error_is_internal() -> None:
     assert _project(ValueError("bad samples")).code == "internal"
 
 
-# @spec ING-ERR-063, ING-ERR-008
+# @spec ING-ERR-063, ING-ERR-008, ING-ERR-010
 def test_a_cadence_refusal_takes_the_generic_internal_fallback() -> None:
     # No seam reason names a cadence: one that arrives is an unknown
     # refusal reason, with the generic detail.

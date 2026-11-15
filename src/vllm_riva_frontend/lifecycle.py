@@ -1073,12 +1073,12 @@ class RivaFrontendPlugin:
         """Discover the one session factory, owning every one constructed.
 
         Each factory discovery discards gets the factory settlement; if
-        discovery or a later check fails, so does every factory constructed
-        and not yet settled, before the error propagates. A cancellation
-        never cuts a settlement short: it is held until the settlement in
-        progress ends, then the selected factory is settled too and the
-        cancellation re-raised, so a cancelled ``init_state`` leaves no
-        factory behind.
+        discovery or servicer construction fails, so does every factory
+        constructed and not yet settled, before the error propagates. A
+        cancellation never cuts a settlement short: it is held until the
+        settlement in progress ends, then the selected factory is settled too
+        and the cancellation re-raised, so a cancelled ``init_state`` leaves
+        no factory behind.
         """
         from vllm_riva_frontend.lease import discover_session_factory
 
@@ -1103,7 +1103,6 @@ class RivaFrontendPlugin:
             await self._settle_factories([factory], "a cancelled startup")
             raise asyncio.CancelledError
         try:
-            self._check_cadence(factory)
             from vllm_riva_frontend.grpc import RivaServicer
 
             self.factory = factory
@@ -1142,20 +1141,6 @@ class RivaFrontendPlugin:
     async def _settle_and_report(self, factory: Any, where: str) -> None:
         faults, last_resort = await self._factory_settlement(factory)
         _report_settlement(faults, last_resort, where)
-
-    # @spec ING-CORE-014
-    def _check_cadence(self, factory: Any) -> None:
-        from vllm_riva_frontend.lease import STREAM_CADENCE
-
-        served = getattr(factory, "served_cadences", ())
-        if STREAM_CADENCE not in served:
-            raise StartupError(
-                [
-                    f"{PLUGIN_KEY}: the session factory does not serve the "
-                    f"streaming cadence {STREAM_CADENCE} (it serves "
-                    f"{sorted(served)})"
-                ]
-            )
 
     # --------------------------------------------------------------- start
 

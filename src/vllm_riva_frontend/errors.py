@@ -329,8 +329,6 @@ def _refused(reason: str) -> FrontendError:
         )
     if reason == "engine_paused":
         return FrontendError("service_unavailable", "the engine is paused")
-    if reason == "cadence":
-        return FrontendError("internal", "the factory refused the cadence")
     if reason == "request_id_in_use":
         return FrontendError("internal", "the session id is already in use")
     return FrontendError(
