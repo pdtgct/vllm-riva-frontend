@@ -100,8 +100,8 @@ entirely the engine scheduler's.
 
 The gRPC server is `grpc.aio.server()` with the servicer registered through the generated
 `add_RivaSpeechRecognitionServicer_to_server`; no OS thread is committed per concurrent streaming
-session for that session's duration. Every streaming adapter passes the factory's `default_cadence`
-and its validated locale only to `SessionFactory.open` and carries no per-session override through a process-shared
+session for that session's duration. Every streaming adapter passes only its validated
+locale to `SessionFactory.open` and carries no per-session override through a process-shared
 object. Engine rendering and the streaming integration stay inside the model plugin's session; the
 frontend renders no prompt and passes no transport-owned configuration to the engine. (The exact
 locale the file path sends in `vllm_xargs` is request data the model defines, not transport-owned
@@ -258,7 +258,7 @@ middleware's registration, and the 401 body).
    checks): the `app` kept from `attach_router` is searched, and `init_state` fails startup unless,
    in core's final table (after every plugin attached), the first route that matches each path the
    frontend added (and its method, for an HTTP route) is the frontend's own.
-9. **Session factory, last**: discovery, the single-accept rule and the `default_cadence` check
+9. **Session factory, last**: discovery and the single-accept rule
    (session leaf), then the servicer, which needs the factory. The vehicle owns every factory a
    constructor returned: a factory that discovery discards (not the named one, or one of several
    accepting) is settled when it is discarded, the selected one in `drain`, `stop` or a
@@ -848,8 +848,10 @@ The repository's deployment guide, `docs/deployment.md`, sets:
   lookahead, so the model plugin serves the checkpoint's default lookahead, 3 (320 ms), and the
   Riva streaming surfaces, complete files and core's own `/v1/realtime` all run at that cadence;
   an operator who sets `num_lookahead_tokens` in `--hf-overrides` moves all three together. This
-  needs the model-plugin change the HLD records (Constraints): until it lands, the plugin requires
-  `num_lookahead_tokens` and publishes no `default_cadence`, so this deployment cannot start;
+  needs the model-plugin change the HLD records (Constraints): until it lands, a model plugin that
+  requires `num_lookahead_tokens` fails startup under the reference command, and a factory whose
+  `open` requires a cadence raises on every `open`, so the server starts and each stream ends with
+  `internal`;
 - `--max-model-len` large enough for the longest file either frontend file surface admits, at the
   served cadence (lookahead `r`). The frontend's file route admits a file up to core's
   decode-duration limit (`VLLM_MAX_AUDIO_DECODE_DURATION_S`, 600 s by default), and `Recognize` up

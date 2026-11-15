@@ -114,10 +114,11 @@ prefix caching, its config format and tokenizer mode).
   To serve another cadence, set `num_lookahead_tokens` in `--hf-overrides` to one of the model
   plugin's implemented lookaheads (0, 1, 3, 6 or 13: 80, 160, 320, 560 or 1120 ms); clients cannot
   choose a cadence per request.
-- This needs a model plugin release that defaults to the checkpoint's lookahead, serves that one
-  cadence and publishes `default_cadence` (HLD, Constraints). With an earlier release the plugin
-  requires `num_lookahead_tokens`, and the frontend refuses to start because the factory publishes
-  no `default_cadence`.
+- This needs a model plugin release whose factory `open` takes only the locale and that defaults
+  to the checkpoint's lookahead (HLD, Constraints). With an earlier release: a model plugin that
+  requires `num_lookahead_tokens` fails startup under this command; a factory whose `open`
+  requires a cadence raises on every `open`, so the server starts and each stream ends with
+  `internal`.
 - Size `--max-model-len` for core's decode-duration limit (`VLLM_MAX_AUDIO_DECODE_DURATION_S`,
   600 s by default), which bounds both frontend file surfaces, at the served cadence. With lookahead `r`, `Q = (r + 1) * 10 + 1` tokens per
   chunk and `C` whole chunks of `(r + 1) * 1280` samples at 16 kHz, a file needs

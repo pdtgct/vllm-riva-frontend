@@ -151,7 +151,7 @@ selected cause and does not block a later deadline.
 | refused by `open`: engine capacity (the owner ends without a lease) | `busy`, `authority: provider` | `RESOURCE_EXHAUSTED` | `error`, 1013 |
 | refused by `open`: reason `locale` | `unknown_locale` | `INVALID_ARGUMENT` | `error`, no close: the session stays unconfigured and the client may retry with a corrected update within the original `preconfiguration_timeout` |
 | refused by `open`: reason `engine_paused` (the owner ends without a lease) | `service_unavailable` | `UNAVAILABLE` | `error`, 1013 |
-| refused by `open`: reason `cadence` or `request_id_in_use` (the owner ends without a lease) | `internal` | `INTERNAL` | `error`, 1011 |
+| refused by `open`: reason `request_id_in_use` (the owner ends without a lease) | `internal` | `INTERNAL` | `error`, 1011 |
 | first message wrong; later `streaming_config` | `protocol_order` | `FAILED_PRECONDITION` | `error`, 1008 |
 | configuration plus `open` exceeded its bound | `configuration_timeout` | `DEADLINE_EXCEEDED` | `error`, 1011 |
 | first-audio or idle bound; engine `expired` | `idle_timeout` | `ABORTED` | `error`, 1011 |
@@ -244,7 +244,6 @@ Each reason the model plugin's session reports is mapped on its own.
 | Raised | Reason | Code | Notes |
 | --- | --- | --- | --- |
 | `SessionRefused` | `locale` | `unknown_locale` | client input |
-| `SessionRefused` | `cadence` | `internal` | server configuration; startup should have failed |
 | `SessionRefused` | `capacity`, `active_limit` | `busy`, `authority: provider` | |
 | `SessionRefused` | `engine_paused` | `service_unavailable` | the engine is not taking new streams |
 | `SessionRefused` | `request_id_in_use` | `internal` | the factory mints ids; a collision is a bug |
@@ -298,7 +297,7 @@ failure or a cleanup bound that expires; none emits a final.
 | --- | --- | --- | --- |
 | One catalog, three projections | Codes projected mechanically per dialect | Per-surface error strings | Clients branch on one stable string; the dialect shape is only the carrier |
 | Code in gRPC details | `code: detail (fields: ...)` | A binary status detail message | The stock client prints the details string; a text prefix is readable everywhere |
-| Seam reasons | One mapping row per reason | All refusals to capacity | `locale` is a client error, `cadence` a configuration error, `capacity` is load; collapsing them hides the cause |
+| Seam reasons | One mapping row per reason | All refusals to capacity | `locale` is a client error, `capacity` is load; collapsing them hides the cause |
 | `engine_dead` projection | `service_unavailable` (and escalate) | `internal` | The client's right move is to retry elsewhere or later, which is what `UNAVAILABLE` says; the process is about to be restarted |
 | Phase mapping | One authoritative table in this leaf; siblings refer to it | Each leaf states its own codes | Several leaves describe the same phase; codes stated in each could disagree, while one table referred to from every leaf cannot conflict with itself |
 | Stalled upload | HTTP 408 | 504 | The client was slow, not the server; 504 stays for core execution |
