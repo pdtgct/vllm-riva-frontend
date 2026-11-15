@@ -186,12 +186,17 @@ owners from the moment core sets it, before or without a `drain` call.
   generation task completes its cancellation, including the engine client's abort of its request,
   and only then closes the factory with `teardown_all()` and awaits every task it returns.
 - **`drain(state, timeout)`.** Health `NOT_SERVING`; close admission; let owners finish until a
-  settle point; then each remaining stream's owner finalizes it (the client gets its final after
-  release) or, if that cannot finish, cleans it up as the session design prescribes (abort an open
-  lease, never a flushed one, then release), all within the deadline; stop the gRPC server with
-  the remaining grace; then `factory.drain(...)`, logging the faults it returns. The settle point
-  is a target for graceful work that leaves core time to shut the engine down; core reserves no
-  engine allowance, and settlement (below) takes precedence over that target.
+  settle point, or until none remains, whichever comes first; then each remaining stream's owner
+  finalizes it (the client gets its final after release) or, if that cannot finish, cleans it up as
+  the session design prescribes (abort an open lease, never a flushed one, then release), all
+  within the deadline; stop the gRPC server once with the remaining grace, in which owners' answers
+  may flush until the deadline (an empty registry never ends an RPC early, but the grace's expiry
+  at the deadline can end an unfinished one), while long-lived RPCs that own nothing (health `Watch`, reflection) are ended once
+  no owner remains (a call whose request message has not yet arrived is invisible to the plugin
+  and can hold the stop to the deadline, never past it); then `factory.drain(...)`, logging the
+  faults it returns. The settle point is a target for graceful work that leaves core time to shut
+  the engine down; core reserves no engine allowance, and settlement (below) takes precedence over
+  that target.
 - **Settlement.** RFC 2 requires a plugin to settle or abort, and await, all work it owns before
   `drain` returns, raises or is cancelled, and `stop` to settle any background work. So when the
   deadline passes, or `drain` fails or is cancelled, the frontend settles in one order: owner

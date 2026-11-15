@@ -537,7 +537,8 @@ async def test_refusal_send_after_registry_close_is_awaited_by_its_handler(
     try:
         # The settlement stops the listener, closes the registry and waits
         # for the stubborn owner.
-        await helpers.until(lambda: not helpers.port_open(grpc_port))
+        await helpers.until(lambda: plugin.registry.sends_closed)
+        assert not helpers.port_open(grpc_port)
         await clock.settle(20)
         assert not stopping.done()
         run = helpers.stubborn_stream(plugin, clock, config_request())

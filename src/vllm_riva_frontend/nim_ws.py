@@ -177,9 +177,16 @@ class RealtimeRoute:
     ``/v1/realtime`` route is not touched.
     """
 
+    # @spec ING-EP-115
     def __init__(self, plugin: Any) -> None:
-        """Bind the route to ``plugin``."""
+        """Bind the route to ``plugin``.
+
+        Core's launcher logs a route without methods by its endpoint's
+        ``__name__`` before it serves, so the route object carries one, as
+        a function endpoint would.
+        """
         self.plugin = plugin
+        self.__name__ = type(self).__name__
 
     # @spec ING-NIMWS-026, ING-NIMWS-027, ING-SHIM-022, ING-EP-095
     async def __call__(

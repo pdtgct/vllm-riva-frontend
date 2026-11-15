@@ -10,6 +10,8 @@ their path, methods, endpoint and order.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from support.app import (
     BOOTSTRAP_ROUTE,
@@ -176,6 +178,46 @@ def test_route_table_is_cores_plus_exactly_the_frontend_routes(
     # The frontend's route set collides with no route of core's table.
     for route in expected:
         assert not _collides(route, before), route
+
+
+# @spec ING-EP-115
+@pytest.mark.parametrize("tasks", TASK_SETS)
+async def test_cores_startup_route_listing_reads_every_frontend_route(
+    tasks, plugin, monkeypatch
+) -> None:
+    """Core's ``serve_http`` lists the table before it builds the server.
+
+    The listing is core's own code; the server it would build next is
+    replaced by a sentinel, so the test ends where serving would begin.
+    """
+    import uvicorn
+    from vllm.entrypoints.launchers import launcher
+
+    class ServerBuilt(Exception):
+        pass
+
+    def no_server(*args, **kwargs):
+        raise ServerBuilt
+
+    listed: list[tuple[Any, ...]] = []
+    real_info = launcher.logger.info
+
+    def record(message, *args, **kwargs):
+        listed.append((message, *args))
+        return real_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(uvicorn, "Config", no_server)
+    monkeypatch.setattr(launcher.logger, "info", record)
+    app = build_app([plugin], supported_tasks=tasks)
+    with pytest.raises(ServerBuilt):
+        await launcher.serve_http(app, None)
+    paths = {row[1] for row in listed if str(row[0]).startswith("Route:")}
+    expected = frontend_routes(file_route="transcription" in tasks)
+    assert {path for _, path in expected} <= paths
+    names = {
+        row[1]: row[2] for row in listed if str(row[0]).startswith("Route:")
+    }
+    assert names[REALTIME_PATH] == "RealtimeRoute"
 
 
 # @spec ING-SHIM-020

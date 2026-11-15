@@ -373,8 +373,9 @@ async def test_ready_is_false_before_start(initialized) -> None:
 
 
 # @spec ING-EP-065
-async def test_ready_is_false_while_draining(started, clock) -> None:
+async def test_ready_is_false_while_draining(started, clock, helpers) -> None:
     plugin, state = started
+    helpers.register_dummy(plugin)  # keeps drain in its graceful work
     state.draining = True
     task = asyncio.ensure_future(plugin.drain(state, 60))
     await clock.settle()

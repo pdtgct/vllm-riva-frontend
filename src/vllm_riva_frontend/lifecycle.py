@@ -26,7 +26,7 @@ import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from grpc_health.v1 import health_pb2
 
@@ -69,6 +69,9 @@ __all__ = [
     "engine_reserve",
     "settle_point",
 ]
+
+if TYPE_CHECKING:
+    from vllm_riva_frontend.grpc import NonOwnerCalls
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,30 @@ def _log_late_factory_drain(error: Exception) -> None:
         PLUGIN_KEY,
         exc_info=(type(error), error, error.__traceback__),
     )
+
+
+async def _cancel_to_end(task: asyncio.Future[Any]) -> bool:
+    """Cancel ``task`` and await its end through any caller cancellations.
+
+    Returns whether the caller was cancelled meanwhile (the caller re-raises
+    that cancellation afterwards). An exception the task ends with, other
+    than its cancellation, is logged, not raised.
+    """
+    task.cancel()
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError:
+            interrupted = True
+    error = None if task.cancelled() else task.exception()
+    if error is not None:
+        logger.error(
+            "%s: a lifecycle helper task failed",
+            PLUGIN_KEY,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    return interrupted
 
 
 async def _run_to_end(awaitable: Awaitable[Any]) -> bool:
@@ -701,6 +728,8 @@ class RivaFrontendPlugin:
         self.servicer: Any = None
         self.server: Any = None
         self.health: Any = None
+        # The listener's RPCs that own nothing, ended by the drain.
+        self.non_owner_calls: NonOwnerCalls | None = None
         self.fault_collector: asyncio.Task[None] | None = None
         self.listener_monitor: asyncio.Task[None] | None = None
         self.draining = False
@@ -1144,7 +1173,9 @@ class RivaFrontendPlugin:
 
         config = self.config
         try:
-            self.server, self.health = build_server(config, self.servicer)
+            self.server, self.health, self.non_owner_calls = build_server(
+                config, self.servicer
+            )
             await self._set_health(_NOT_SERVING)
             try:
                 bound = self.server.add_insecure_port(config.grpc_bind)
@@ -1287,12 +1318,17 @@ class RivaFrontendPlugin:
         """Finish or end every owner by ``D``, then settle everything.
 
         ``D`` is ``now + timeout - engine_reserve(timeout)``; every wait of
-        the graceful work is bounded by it. The listener keeps answering
-        ``NOT_SERVING`` until the settle point, where stream owners get the
+        the graceful work is bounded by it. While an owner remains, the
+        listener keeps answering ``NOT_SERVING`` until the settle point;
+        there, or as soon as no owner remains, stream owners get the
         shutdown trigger and file requests are cancelled; then the listener
-        stops with the time left to ``D`` as grace, the collector ends and
-        ``factory.drain(D)`` runs. When ``timeout`` is within the reserve the
-        graceful steps are skipped. The settlement always follows, through
+        stops once, gracefully, with the time left to ``D`` as grace, in
+        which owners' answers may flush until ``D`` while the RPCs that own
+        nothing are ended once no owner remains (a call whose request
+        message has not arrived is beyond the plugin's reach and may hold
+        the stop to ``D``, never past it); the collector ends and
+        ``factory.drain(D)`` runs. When ``timeout`` is within the reserve
+        the graceful steps are skipped. The settlement always follows, through
         any cancellation, and only then is a failure or cancellation
         re-raised. A ``factory.drain(D)`` failing by ``D`` is a failing
         step; one still running at ``D`` is awaited by the settlement, and
@@ -1352,11 +1388,12 @@ class RivaFrontendPlugin:
         """The graceful steps of ``drain``, every wait bounded by ``D``."""
         clock = self.clock
         registry = self.registry
-        # Health checkers see NOT_SERVING until the settle point, owners or
-        # not (ING-EP-109).
+        # Health checkers see NOT_SERVING on a serving listener until the
+        # settle point, or until no owner remains: with nothing left to
+        # finish the drain goes on at once (ING-EP-109).
         settle = settle_point(now, deadline)
-        await clock.sleep(max(0.0, settle - clock.monotonic()))
         if registry is not None:
+            await self._wait_until(registry.settled, settle)
             registry.deliver_shutdown(ShutdownTrigger(deadline))
             assert self.config is not None
             files_by = min(
@@ -1374,7 +1411,7 @@ class RivaFrontendPlugin:
         # begins now, while stream owners still finalize under its grace
         # (ING-EP-074); an RPC it then terminates is the plugin's
         # cancellation of its owner (ING-LIFE-064).
-        await self._stop_listener(max(0.0, deadline - clock.monotonic()))
+        await self._stop_listener_for_owners(deadline)
         if registry is not None:
             await self._wait_until(
                 lambda: registry.settled(STREAM_KINDS), deadline
@@ -1505,6 +1542,56 @@ class RivaFrontendPlugin:
         if work.cancelled():
             return asyncio.CancelledError()
         return work.exception()
+
+    # @spec ING-EP-074, ING-EP-109
+    async def _stop_listener_for_owners(self, deadline: float) -> None:
+        """Stop the listener once, with the time left to ``D`` as grace.
+
+        gRPC's graceful stop returns once every RPC still open has ended and
+        sent its response and status, or when the grace expires at ``D``, which
+        can end an RPC whose answer is unfinished; the plugin never ends an
+        owner's RPC before ``D``. The grace serves owners only: once no owner
+        remains, at the stop or later during its grace, the RPCs that own
+        nothing (a health ``Watch``, a reflection stream) are ended, so they
+        cannot hold the stop to ``D``. gRPC reads a single-message request
+        before invoking its handler, so a call whose request has not arrived is
+        neither kind; it may hold the stop to ``D``, never past it.
+
+        The companion task that ends those RPCs is cancelled and awaited
+        through any number of cancellations of the caller (ING-EP-106); the
+        stop's own failure propagates, and a cancellation of the caller is
+        re-raised once the companion has ended.
+        """
+        grace = max(0.0, deadline - self.clock.monotonic())
+        ender = asyncio.ensure_future(self._end_non_owner_calls_when_idle())
+        try:
+            await self._stop_listener(grace)
+        except BaseException as failure:
+            interrupted = await _cancel_to_end(ender)
+            if interrupted and not isinstance(failure, asyncio.CancelledError):
+                raise asyncio.CancelledError from failure
+            raise
+        if await _cancel_to_end(ender):
+            raise asyncio.CancelledError
+
+    async def _end_non_owner_calls_when_idle(self) -> None:
+        """Once no owner remains, end the RPCs that own nothing."""
+        registry = self.registry
+        while registry is not None and not registry.settled():
+            change = registry.changed()
+            try:
+                await asyncio.wait(
+                    {change, *registry.pending()},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                change.cancel()
+        self._end_non_owner_calls()
+
+    def _end_non_owner_calls(self) -> None:
+        """End the listener's RPCs that own nothing (ING-EP-074)."""
+        if self.non_owner_calls is not None:
+            self.non_owner_calls.end()
 
     async def _stop_listener(self, grace: float | None) -> None:
         """Stop the gRPC server once; its exit is then not a fault."""
