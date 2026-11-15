@@ -132,7 +132,7 @@ from one of its own test modules: its `conftest.py` calls
 imported, the module star-imports the suite, and it defines `seam`, returning its adapter. The
 frontend's CPU lane returns the adapter over its fake factory; the model plugin's run returns one
 over its real factory. The hooks an adapter provides are documented in the package. The suite
-imports frontend modules (`lease`, `errors`, `lifecycle`) when its tests run, so a consumer's
+imports frontend modules (`admission`, `config`, `errors`, `lease`, `lifecycle`) when its tests run, so a consumer's
 environment also needs what the frontend package imports, a vLLM tree included.
 
 ### Factory obligations

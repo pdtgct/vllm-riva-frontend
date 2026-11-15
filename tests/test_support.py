@@ -1,7 +1,9 @@
 """Tests of the shared test support itself.
 
-They import only ``tests/support`` and core, never the frontend package, so
-they pass before the port and keep passing while it is rewritten.
+They import only ``tests/support``, core and ``vllm_riva_frontend_dev`` (the
+development distribution the support re-exports from), never the frontend
+package, so they pass before the port and keep passing while it is
+rewritten.
 """
 
 from __future__ import annotations

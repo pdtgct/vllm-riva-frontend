@@ -20,6 +20,8 @@ awaitable and propagates.
 polls a condition for a bounded stretch of real time (it never moves virtual
 time), ``settle`` runs the loop until every ready callback has run, so each
 coroutine has reached its next wait (at least ``rounds`` turns, bounded).
+``settle`` and ``SETTLE_LIMIT`` come from ``vllm_riva_frontend_dev`` and are
+re-exported here, so the suite and the fakes settle the loop alike.
 ``FakeClock.advance`` settles before and after it moves time, so a
 coroutine on its way to a timed wait registers that wait before time moves,
 however many loop turns it needs. Work on another thread is outside what
@@ -36,10 +38,10 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, TypeVar
 
-T = TypeVar("T")
+from vllm_riva_frontend_dev import SETTLE_LIMIT as SETTLE_LIMIT
+from vllm_riva_frontend_dev import settle as settle
 
-#: The most loop turns ``settle`` spends waiting for the loop to go idle.
-SETTLE_LIMIT = 2_000
+T = TypeVar("T")
 
 
 class Clock(Protocol):
@@ -236,24 +238,3 @@ async def until(
         await asyncio.wait_for(poll(), timeout)
     except TimeoutError:
         raise AssertionError(f"condition not reached: {what}") from None
-
-
-async def settle(rounds: int = 50) -> None:
-    """Run the loop until it is idle: at least ``rounds`` turns.
-
-    After ``rounds`` turns it keeps yielding while other callbacks are ready
-    to run, and returns once two consecutive turns find none (or after
-    ``SETTLE_LIMIT`` turns, so a busy poller cannot hang a test). Timers and
-    callbacks from other threads do not count as ready.
-    """
-    for _ in range(rounds):
-        await asyncio.sleep(0)
-    ready = getattr(asyncio.get_running_loop(), "_ready", None)
-    if ready is None:
-        return
-    idle = 0
-    for _ in range(SETTLE_LIMIT):
-        idle = idle + 1 if not ready else 0
-        if idle >= 2:
-            return
-        await asyncio.sleep(0)

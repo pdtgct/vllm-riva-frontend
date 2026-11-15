@@ -98,11 +98,18 @@ def test_no_frontend_module_dispatches_on_a_cadence_reason() -> None:
     import ast
     from pathlib import Path
 
+    import vllm_riva_frontend_dev
+
     import vllm_riva_frontend
 
-    root = Path(vllm_riva_frontend.__file__).parent
+    # The development distribution's package obeys the same rule.
+    roots = [
+        Path(package.__file__).parent
+        for package in (vllm_riva_frontend, vllm_riva_frontend_dev)
+    ]
     offenders = [
-        f"{path.relative_to(root)}:{node.lineno}"
+        f"{path.relative_to(root.parent)}:{node.lineno}"
+        for root in roots
         for path in sorted(root.rglob("*.py"))
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
         if isinstance(node, ast.Constant)

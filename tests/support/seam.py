@@ -1,56 +1,15 @@
 """The seam conformance suite's hooks over a session factory.
 
-``tests/session/test_seam_conformance.py`` runs against a ``seam`` fixture:
+The suite (``vllm_riva_frontend_dev.seam_conformance``, run by
+``tests/session/test_seam_conformance.py``) runs against a ``seam`` fixture:
 an adapter that provides the factory, the clock its ``drain`` deadline is
 measured on and the hooks the suite needs to arrange each obligation of the
 session design ("Factory obligations" 1 to 8, ``ING-CORE-022`` to
 ``ING-CORE-034``). ``FakeSeam`` is that adapter over ``FakeSessionFactory``.
-The model plugin's repository overrides the ``seam`` fixture with an adapter
-of the same shape over its real factory, on the RFC 1 + RFC 2 build, so a
-hook here names an effect ("keep the generation task awaiting the engine's
-abort"), never a fake-only mechanism. Every hook acts on a lease the suite
-opened through ``factory.open``.
-
-Hooks:
-
-* ``inject_fault(fault)``: make ``fault`` a retained fault, as a cleanup
-  task's failed retirement wait would.
-* ``slow(lease, name)``: keep the lease call ``name`` (``feed``, ``flush``,
-  ``abort``, ``release``, ...) suspended until the returned ``Block`` is
-  released; ``slow_open()`` does the same for the next ``open``, after its
-  generation task has taken its first step or, with
-  ``before_generation=True``, while that task has not started.
-* ``refuse_next_open(reason)``: make the next ``open`` an ordinary refusal
-  (``session_error`` ``"refused"`` with ``reason``, ``capacity`` for a full
-  engine) that starts no session, as the factory's own admission refuses.
-* ``slow_abandoned_engine_abort()``: keep the engine abort of the next
-  ``open``'s session (one the suite then cancels, so the ``open`` gives it
-  up) pending until the returned ``Block`` is released (its generation
-  task, once cancelled, awaits it);
-  ``abandoned()`` returns that session (the last one a cancelled ``open``
-  gave up, ``None`` if none), on which ``generation``, ``engine_calls`` and
-  ``owns`` work as for a lease.
-* ``slow_cleanup()``: keep the retirement wait of the next session handed to
-  the factory's cleanup running until released (``then=Raise(exc)`` makes it
-  fail).
-* ``slow_engine_abort(lease)``: keep the session's generation task, once
-  cancelled, awaiting the engine's abort until released;
-  ``fail_engine_abort(lease, exc)`` makes that handler raise ``exc`` (after
-  the returned ``Block`` is released).
-* ``fail_generation(lease, exc)``: end the generation task with ``exc``.
-* ``generation(lease)``: the session's generation task (``None`` when the
-  factory has none for it).
-* ``engine_calls(lease)``: the engine calls the session's generation task
-  made, in order (``generate``, ``abort``).
-* ``handed_over(lease)``, ``owns(lease)``: whether the session was handed to
-  the factory's cleanup, and whether a cleanup or holding task still holds
-  it.
-* ``running_tasks()``: the factory's tasks not yet done.
-* ``late_cancellations()``: cancellations delivered to a generation task
-  after its cancellation handler began, other than by ``teardown_all`` or
-  ``teardown()``.
-* ``foreign_cancellations()``: cancellations of a factory task that the
-  factory did not request (the vehicle must cause none, ``ING-EP-098``).
+The model plugin's repository defines its own ``seam`` fixture with an
+adapter of the same shape over its real factory, on the RFC 1 + RFC 2
+build. The hooks and what each must do are documented once, in the package
+docstring of ``vllm_riva_frontend_dev``.
 """
 
 from __future__ import annotations

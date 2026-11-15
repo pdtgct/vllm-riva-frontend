@@ -26,7 +26,11 @@ from support.fake_session import Block
 
 from .conftest import open_stream
 
-PACKAGE = Path(__file__).parents[2] / "src" / "vllm_riva_frontend"
+ROOT = Path(__file__).parents[2]
+PACKAGE = ROOT / "src" / "vllm_riva_frontend"
+#: The development distribution's package (ING-CORE-036) obeys the same
+#: source rules.
+DEV_PACKAGE = ROOT / "dev" / "src" / "vllm_riva_frontend_dev"
 LIMIT = 1_000
 
 
@@ -191,8 +195,11 @@ async def test_credit_returns_at_on_accepted_while_feed_is_pending(
 
 
 def _modules() -> list[Path]:
-    paths = sorted(PACKAGE.rglob("*.py"))
-    assert paths, PACKAGE
+    paths = []
+    for package in (PACKAGE, DEV_PACKAGE):
+        found = sorted(package.rglob("*.py"))
+        assert found, package
+        paths.extend(found)
     return paths
 
 
@@ -212,7 +219,7 @@ def test_no_frontend_code_computes_or_reads_a_cadence_chunk_size() -> None:
     # The model chunk sizes at 16 kHz for lookahead 0, 1, 3, 6 and 13.
     forbidden = {1_280, 2_560, 5_120, 8_960, 17_920}
     offenders = {
-        str(path.relative_to(PACKAGE)): sorted(_constants(path) & forbidden)
+        path.relative_to(ROOT).as_posix(): sorted(_constants(path) & forbidden)
         for path in _modules()
         if _constants(path) & forbidden
     }
@@ -223,7 +230,7 @@ def test_no_frontend_code_computes_or_reads_a_cadence_chunk_size() -> None:
 def test_no_frontend_string_names_a_millisecond_cadence() -> None:
     # Docstrings included: no string constant such as "560ms".
     offenders = {
-        str(path.relative_to(PACKAGE)): sorted(
+        path.relative_to(ROOT).as_posix(): sorted(
             value
             for value in _constants(path)
             if isinstance(value, str) and re.search(r"\d+ms", value)
@@ -266,7 +273,7 @@ def test_no_frontend_identifier_names_a_cadence() -> None:
     # attribute names a cadence, and no string names a factory cadence
     # member, so no dead cadence code survives.
     offenders = {
-        str(path.relative_to(PACKAGE)): names
+        path.relative_to(ROOT).as_posix(): names
         for path in _modules()
         if (names := _cadence_names(ast.parse(path.read_text())))
     }

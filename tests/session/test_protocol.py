@@ -19,7 +19,11 @@ from support.audio import pcm16_bytes, pcm16_sine
 from support.fake_session import FakeSessionFactory, fake_entry_points
 from support.realtime import CREATED
 
-PACKAGE = Path(__file__).resolve().parents[2] / "src" / "vllm_riva_frontend"
+ROOT = Path(__file__).resolve().parents[2]
+PACKAGE = ROOT / "src" / "vllm_riva_frontend"
+#: The development distribution's package (ING-CORE-036) obeys the same
+#: source rules.
+DEV_PACKAGE = ROOT / "dev" / "src" / "vllm_riva_frontend_dev"
 
 FACTORY_MEMBERS = frozenset(
     {
@@ -40,8 +44,11 @@ MODEL_PLUGIN_EXCEPTIONS = frozenset(
 
 
 def _modules() -> list[tuple[Path, ast.Module]]:
-    paths = sorted(PACKAGE.rglob("*.py"))
-    assert paths, PACKAGE
+    paths = []
+    for package in (PACKAGE, DEV_PACKAGE):
+        found = sorted(package.rglob("*.py"))
+        assert found, package
+        paths.extend(found)
     return [(p, ast.parse(p.read_text(), filename=str(p))) for p in paths]
 
 
@@ -71,9 +78,10 @@ def _members(protocol: type) -> set[str]:
 def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
     offenders = []
     for path, tree in _modules():
+        where = path.relative_to(ROOT)
         for name in _imported(tree):
             if "nemotron" in name.lower():
-                offenders.append(f"{path.name}: import {name}")
+                offenders.append(f"{where}: import {name}")
         for node in ast.walk(tree):
             if isinstance(node, ast.ExceptHandler) and node.type is not None:
                 for sub in ast.walk(node.type):
@@ -85,7 +93,7 @@ def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
                         else None
                     )
                     if ident in MODEL_PLUGIN_EXCEPTIONS:
-                        offenders.append(f"{path.name}: except {ident}")
+                        offenders.append(f"{where}: except {ident}")
     assert offenders == []
 
 
@@ -129,26 +137,27 @@ def test_there_is_no_remote_provider_mode_or_websocket_loopback():
 
     offenders = []
     for path, tree in _modules():
+        where = path.relative_to(ROOT)
         stem = path.stem.lower()
         if any(word in stem for word in ("provider", "broker", "event_bus")):
-            offenders.append(f"module {path.name}")
+            offenders.append(f"module {where}")
         for name in _imported(tree):
             top = name.split(".")[0]
             if top in {"websockets", "websocket", "aiohttp", "httpx"}:
-                offenders.append(f"{path.name}: import {name}")
+                offenders.append(f"{where}: import {name}")
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and node.value.startswith(("ws://", "wss://"))
             ):
-                offenders.append(f"{path.name}: {node.value!r}")
+                offenders.append(f"{where}: {node.value!r}")
             if isinstance(node, ast.ClassDef):
                 lowered = node.name.lower()
                 if any(
                     w in lowered for w in ("provider", "broker", "eventbus")
                 ):
-                    offenders.append(f"{path.name}: class {node.name}")
+                    offenders.append(f"{where}: class {node.name}")
     assert offenders == []
 
     config = parse_config({"riva_frontend": {}})
