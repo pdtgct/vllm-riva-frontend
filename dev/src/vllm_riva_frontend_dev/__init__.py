@@ -85,7 +85,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-__version__ = "0.4.0b2"
+__version__ = "0.4.0b3"
 
 __all__ = [
     "Block",
