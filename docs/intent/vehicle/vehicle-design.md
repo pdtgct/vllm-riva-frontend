@@ -865,7 +865,10 @@ The repository's deployment guide, `docs/deployment.md`, sets:
   samples. At the reference `r = 3` (`Q = 41`, 5,120 samples per chunk) a 600 s file needs at
   least 76,918, and the deployment guide serves 77,000. A deployment at 1120 ms (`r = 13`,
   `Q = 141`, 17,920 samples per chunk) needs 75,578, and one at 560 ms (`r = 6`, `Q = 71`, 8,960
-  samples per chunk) needs 76,114. The frontend does not compute this
+  samples per chunk) needs 76,114; 77,000 covers both. One at 160 ms (`r = 1`, `Q = 21`, 2,560
+  samples per chunk) needs 78,773, and one at 80 ms (`r = 0`, `Q = 11`, 1,280 samples per chunk)
+  needs 82,513; either override needs `--max-model-len` raised to at least that count. The
+  frontend does not compute this
   count (it needs model-specific knowledge outside the structural seam); the formula and values
   here are for operators. Core's own `POST /v1/audio/transcriptions` admits files up to the same
   decode-duration limit, so the same value covers it.

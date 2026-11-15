@@ -123,7 +123,9 @@ prefix caching, its config format and tokenizer mode).
   600 s by default), which bounds both frontend file surfaces, at the served cadence. With lookahead `r`, `Q = (r + 1) * 10 + 1` tokens per
   chunk and `C` whole chunks of `(r + 1) * 1280` samples at 16 kHz, a file needs
   `1 + (C + 1) * Q + 1` tokens. At `r = 3` a 600 s file needs 76,918, covered by 77,000; at
-  `r = 6` it needs 76,114 and at `r = 13` 75,578. The frontend does not
+  `r = 6` it needs 76,114 and at `r = 13` 75,578. At `r = 1` it needs 78,773 and at `r = 0`
+  82,513, so a deployment that sets either override must raise `--max-model-len` to at least that
+  count. The frontend does not
   compute this budget. The model applies no input-length limit of its own: core ends a request
   that reaches `--max-model-len` with a `length` finish, and whether that is reported as a failure
   depends on the core build.
