@@ -845,8 +845,9 @@ The repository's deployment guide, `docs/deployment.md`, sets:
 - `--shutdown-timeout` above the engine's drain time (the engine's `draining_timeout` default is
   40 s; 60 s is the documented value);
 - the model plugin's own serve flags (HLD Constraints). The reference deployment sets no
-  lookahead, so the model plugin serves the checkpoint's default lookahead, 3 (320 ms), and the
-  Riva streaming surfaces, complete files and core's own `/v1/realtime` all run at that cadence;
+  lookahead, so the model plugin serves the default lookahead that the checkpoint's model
+  configuration sets (3, or 320 ms, for the reference checkpoint), and the Riva streaming surfaces,
+  complete files and core's own `/v1/realtime` all run at that cadence;
   an operator who sets `num_lookahead_tokens` in `--hf-overrides` moves all three together. This
   needs the model-plugin change the HLD records (Constraints): until it lands, a model plugin that
   requires `num_lookahead_tokens` fails startup under the reference command, and a factory whose

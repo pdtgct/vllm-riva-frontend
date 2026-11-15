@@ -25,7 +25,8 @@ DEFAULT_DRAINING_TIMEOUT = 40
 #: Core's decode-duration limit and its default, in seconds.
 DECODE_LIMIT_VARIABLE = "VLLM_MAX_AUDIO_DECODE_DURATION_S"
 DEFAULT_DECODE_LIMIT = 600
-#: The checkpoint's default lookahead, which the reference command serves.
+#: The default lookahead the reference checkpoint's model configuration sets;
+#: the reference command serves it.
 DEFAULT_LOOKAHEAD = 3
 #: The lookaheads the guide offers as an override.
 OFFERED_LOOKAHEADS = (0, 1, 3, 6, 13)

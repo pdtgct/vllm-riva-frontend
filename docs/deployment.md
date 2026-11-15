@@ -23,7 +23,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --tokenizer-mode nemotron_asr_streaming \
     --max-model-len 77000 \
     --shutdown-timeout 60 \
-    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b2", "pin": "unspecified"}}'
+    --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b3", "pin": "unspecified"}}'
 ```
 
 One process serves:
@@ -109,8 +109,11 @@ parallel sizes of 1, and slot count and active limit are read per engine.
 The model plugin's own serve flags are the ones above (float32, eager, synchronous scheduling, no
 prefix caching, its config format and tokenizer mode).
 
-- The command sets no lookahead, so the model plugin serves the checkpoint's default lookahead, 3
-  (320 ms). Riva streams, complete files and core's own `/v1/realtime` all run at that cadence.
+- The command sets no lookahead, so the model plugin serves the checkpoint's default lookahead,
+  which the checkpoint's model configuration sets. The reference checkpoint sets 3 (320 ms); a
+  checkpoint whose configuration sets another default serves that one, and `--max-model-len` must
+  be sized for it (below). Riva streams, complete files and core's own `/v1/realtime` all run at
+  the served cadence.
   To serve another cadence, set `num_lookahead_tokens` in `--hf-overrides` to one of the model
   plugin's implemented lookaheads (0, 1, 3, 6 or 13: 80, 160, 320, 560 or 1120 ms); clients cannot
   choose a cadence per request.
