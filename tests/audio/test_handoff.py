@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 from pathlib import Path
 
 import grpc
@@ -162,7 +163,7 @@ async def test_credit_returns_at_on_accepted_while_feed_is_pending(
     # then holds it on ``hold``. The owner's ``outstanding_samples`` must
     # fall at the callback, not when ``feed`` returns.
     owner = make_owner()
-    await owner.open(cadence="560ms", locale="en-US")
+    await owner.open(locale="en-US")
     lease = _lease(fake_factory)
     lease.defer_acceptance = True
     hold = Block()
@@ -189,6 +190,12 @@ async def test_credit_returns_at_on_accepted_while_feed_is_pending(
     assert owner.calls == ["feed"]
 
 
+def _modules() -> list[Path]:
+    paths = sorted(PACKAGE.rglob("*.py"))
+    assert paths, PACKAGE
+    return paths
+
+
 def _constants(path: Path) -> set:
     tree = ast.parse(path.read_text())
     return {
@@ -202,16 +209,66 @@ def _constants(path: Path) -> set:
 
 # @spec ING-FE-009, ING-FE-007
 def test_no_frontend_code_computes_or_reads_a_cadence_chunk_size() -> None:
-    import vllm_riva_frontend.lease as lease_module
-
-    assert lease_module.STREAM_CADENCE == "560ms"
-    # 560 ms and 1120 ms at 16 kHz, and the cadence strings outside the one
-    # module that names the cadence the surfaces open with
-    forbidden = {8_960, 17_920, "1120ms", "560ms"}
+    # The model chunk sizes at 16 kHz for lookahead 0, 1, 3, 6 and 13.
+    forbidden = {1_280, 2_560, 5_120, 8_960, 17_920}
     offenders = {
-        path.name: sorted(map(str, _constants(path) & forbidden))
-        for path in sorted(PACKAGE.glob("*.py"))
-        if path.name != "lease.py" and _constants(path) & forbidden
+        str(path.relative_to(PACKAGE)): sorted(_constants(path) & forbidden)
+        for path in _modules()
+        if _constants(path) & forbidden
+    }
+    assert offenders == {}
+
+
+# @spec ING-CORE-014
+def test_no_frontend_string_names_a_millisecond_cadence() -> None:
+    # Docstrings included: no string constant such as "560ms".
+    offenders = {
+        str(path.relative_to(PACKAGE)): sorted(
+            value
+            for value in _constants(path)
+            if isinstance(value, str) and re.search(r"\d+ms", value)
+        )
+        for path in _modules()
+    }
+    assert {name: hits for name, hits in offenders.items() if hits} == {}
+
+
+def _cadence_names(tree: ast.Module) -> list[str]:
+    """Identifiers naming a cadence, and strings naming a cadence member."""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+        elif isinstance(node, (ast.arg, ast.keyword)) and node.arg:
+            names.append(node.arg)
+        elif isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            names.append(node.name)
+        elif isinstance(node, ast.alias):
+            names.append(node.asname or node.name)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and re.search(r"(served|default)_cadences?\b", node.value)
+        ):
+            names.append(node.value)
+        found.extend(name for name in names if "cadence" in name.lower())
+    return found
+
+
+# @spec ING-CORE-014
+def test_no_frontend_identifier_names_a_cadence() -> None:
+    # Names, not prose: no constant, function, parameter, keyword or
+    # attribute names a cadence, and no string names a factory cadence
+    # member, so no dead cadence code survives.
+    offenders = {
+        str(path.relative_to(PACKAGE)): names
+        for path in _modules()
+        if (names := _cadence_names(ast.parse(path.read_text())))
     }
     assert offenders == {}
 

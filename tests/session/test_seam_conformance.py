@@ -62,18 +62,12 @@ def seam(request):
 # ------------------------------------------------------------------ helpers
 
 
-def _cadence() -> str:
-    from vllm_riva_frontend.lease import STREAM_CADENCE
-
-    return STREAM_CADENCE
-
-
 def _locale(factory: Any) -> str:
     return factory.default_locale or sorted(factory.locales)[0]
 
 
 async def _open(factory: Any) -> Any:
-    lease = await factory.open(cadence=_cadence(), locale=_locale(factory))
+    lease = await factory.open(locale=_locale(factory))
     # The generation task takes its first step.
     await settle()
     return lease
@@ -168,7 +162,6 @@ async def test_factory_and_lease_satisfy_the_structural_protocol(seam):
     from vllm_riva_frontend.lease import SessionFactory, SessionLease
 
     factory = seam.factory
-    assert _cadence() in factory.served_cadences
     assert isinstance(factory.locales, frozenset)
     for member in ("open", "drain", "teardown_all"):
         assert callable(getattr(factory, member))
@@ -291,7 +284,7 @@ async def test_teardown_all_closes_and_returns_every_task_it_owns(seam):
     await asyncio.wait_for(asyncio.wait(tasks), LIMIT)
     assert seam.running_tasks() == set()
     with pytest.raises(Exception) as refused:
-        await factory.open(cadence=_cadence(), locale=_locale(factory))
+        await factory.open(locale=_locale(factory))
     assert _attrs(refused.value)[0] == "failed"
     samples = np.zeros(1600, dtype=np.float32)
     with pytest.raises(Exception) as fed:
@@ -309,7 +302,7 @@ async def test_error_attributes_are_read_structurally_including_unknown(seam):
 
     factory = seam.factory
     with pytest.raises(Exception) as refused:
-        await factory.open(cadence=_cadence(), locale="no-such-locale")
+        await factory.open(locale="no-such-locale")
     assert _attrs(refused.value) == ("refused", "locale")
 
     class Unknown(Exception):
@@ -438,7 +431,7 @@ async def test_retained_fault_kinds_and_exclusions(seam):
     # Excluded: a refusal ``open`` raises (an ordinary capacity refusal).
     seam.refuse_next_open("capacity")
     with pytest.raises(Exception) as refused:
-        await factory.open(cadence=_cadence(), locale=_locale(factory))
+        await factory.open(locale=_locale(factory))
     assert _attrs(refused.value) == ("refused", "capacity")
     # Excluded: a generation failure the owner sees as a lease reason.
     surfaced = await _open(factory)
@@ -511,9 +504,7 @@ async def test_no_cancellation_reaches_a_generation_task_in_its_handler(seam):
     await _cancel_release(seam, handed)
     # A cancelled ``open`` after its generation task started.
     block = seam.slow_open()
-    opening = asyncio.create_task(
-        factory.open(cadence=_cadence(), locale=_locale(factory))
-    )
+    opening = asyncio.create_task(factory.open(locale=_locale(factory)))
     await asyncio.wait_for(block.entered.wait(), LIMIT)
     await settle()
     await _cancelled(opening)
@@ -570,7 +561,7 @@ async def test_closed_factory_starts_no_task(seam):
     assert not seam.owns(lease)
     # Nor does an ``open`` after it.
     with pytest.raises(Exception) as info:
-        await factory.open(cadence=_cadence(), locale=_locale(factory))
+        await factory.open(locale=_locale(factory))
     assert _attrs(info.value)[0] == "failed"
     await settle()
     assert seam.running_tasks() == set()
@@ -607,7 +598,7 @@ async def test_an_ordinary_refusal_and_generation_failure_leave_no_fault(
     factory = seam.factory
     seam.refuse_next_open("capacity")
     with pytest.raises(Exception) as refused:
-        await factory.open(cadence=_cadence(), locale=_locale(factory))
+        await factory.open(locale=_locale(factory))
     assert _attrs(refused.value) == ("refused", "capacity")
     assert seam.running_tasks() == set(), "a refusal started a task"
     lease = await _open(factory)
@@ -666,9 +657,7 @@ async def test_a_cancelled_open_after_its_generation_started_is_covered(seam):
     factory = seam.factory
     engine_abort = seam.slow_abandoned_engine_abort()
     block = seam.slow_open()
-    opening = asyncio.create_task(
-        factory.open(cadence=_cadence(), locale=_locale(factory))
-    )
+    opening = asyncio.create_task(factory.open(locale=_locale(factory)))
     await asyncio.wait_for(block.entered.wait(), LIMIT)
     await settle()  # the generation task has taken its first step
 
@@ -710,9 +699,7 @@ async def test_a_cancelled_open_before_the_first_step_never_runs(seam):
         opener["task"].cancel()
 
     seam.slow_open(before_generation=True, on_enter=cancel_opener)
-    opener["task"] = asyncio.create_task(
-        factory.open(cadence=_cadence(), locale=_locale(factory))
-    )
+    opener["task"] = asyncio.create_task(factory.open(locale=_locale(factory)))
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(opener["task"], LIMIT)
     session = seam.abandoned()
@@ -762,7 +749,7 @@ async def test_the_release_hand_over_runs_through_the_owners_cancellation(
         record=record,
         catalog=catalog(),
     )
-    await owner.open(_cadence(), _locale(seam.factory))
+    await owner.open(_locale(seam.factory))
     (lease,) = opened
     await settle()
     release = seam.slow(lease, "release")

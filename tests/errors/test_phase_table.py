@@ -132,7 +132,7 @@ async def test_locale_refusal_from_open_is_unknown_locale(
 
 
 # @spec ING-ERR-008, ING-ERR-010
-@pytest.mark.parametrize("reason", ["cadence", "request_id_in_use"])
+@pytest.mark.parametrize("reason", ["request_id_in_use"])
 async def test_server_side_refusals_are_internal(
     reason, started, stream, fake_factory, helpers
 ) -> None:

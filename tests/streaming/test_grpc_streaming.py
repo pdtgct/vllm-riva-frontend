@@ -104,7 +104,7 @@ async def test_open_completes_before_the_request_iterator_advances(served):
 
 
 # @spec ING-GRPC-002
-async def test_session_opens_at_560ms_with_the_validated_locale(served):
+async def test_session_opens_with_the_validated_locale(served):
     call = start_stream(
         served,
         [config_request(recognition_config(language_code="de-DE"))],
@@ -112,7 +112,7 @@ async def test_session_opens_at_560ms_with_the_validated_locale(served):
     await opened(served, call)
     call.half_close()
     await call.wait()
-    assert opens(served) == [{"cadence": "560ms", "locale": "de-DE"}]
+    assert opens(served) == [{"locale": "de-DE"}]
 
 
 # @spec ING-GRPC-002

@@ -1,8 +1,8 @@
 """A scriptable session factory and lease.
 
 They satisfy the structural protocol of the HLD's "Session-factory seam" and
-the model plugin's session design (``SessionFactory``: ``served_cadences``,
-``locales``, ``default_locale``, ``open(*, cadence, locale)``,
+the model plugin's session design (``SessionFactory``: ``locales``,
+``default_locale``, ``open(*, locale)``,
 ``drain(deadline) -> list``, ``teardown_all() -> set``; ``SessionLease``:
 ``feed(samples, *, on_accepted) -> list[str]``, ``update_locale(locale) ->
 None``, ``flush() -> str``, ``finish()``, ``abort()``, ``release()`` and the
@@ -128,7 +128,6 @@ REFUSED_REASONS = frozenset(
         "active_limit",
         "engine_paused",
         "request_id_in_use",
-        "cadence",
         "locale",
     }
 )
@@ -300,13 +299,11 @@ class FakeLease:
         factory: FakeSessionFactory,
         index: int,
         *,
-        cadence: str,
         locale: str,
         strict: bool = True,
     ) -> None:
         self.factory = factory
         self.index = index
-        self.cadence = cadence
         self.locale = locale
         self.strict = strict
         self.state = "open"
@@ -666,7 +663,6 @@ class FakeSessionFactory:
     def __init__(
         self,
         *,
-        served_cadences: Iterable[str] = ("560ms", "1120ms"),
         locales: Iterable[str] = ("en-US", "de-DE", "auto"),
         default_locale: str | None = "auto",
         final_text: str = "",
@@ -676,7 +672,6 @@ class FakeSessionFactory:
         start_generation: bool = True,
     ) -> None:
         self.clock = clock if clock is not None else RealClock()
-        self.served_cadences: frozenset[str] = frozenset(served_cadences)
         self.locales: frozenset[str] = frozenset(locales)
         self.default_locale = default_locale
         self.final_text = final_text
@@ -791,17 +786,12 @@ class FakeSessionFactory:
 
     # -- protocol ---------------------------------------------------------
 
-    async def open(self, *, cadence: str, locale: str) -> FakeLease:
-        self._record(
-            "factory", "open", (), {"cadence": cadence, "locale": locale}
-        )
+    async def open(self, *, locale: str) -> FakeLease:
+        self._record("factory", "open", (), {"locale": locale})
         if self.closed:
             raise failed("cancelled", "factory torn down")
-        if self.validate:
-            if cadence not in self.served_cadences:
-                raise refused("cadence", f"cadence {cadence!r} not served")
-            if locale not in self.locales:
-                raise refused("locale", f"locale {locale!r} unknown")
+        if self.validate and locale not in self.locales:
+            raise refused("locale", f"locale {locale!r} unknown")
         behaviour = self._scripts.next("open")
         if isinstance(behaviour, Raise):
             # A refusal before any session exists starts nothing.
@@ -809,7 +799,6 @@ class FakeSessionFactory:
         lease = FakeLease(
             self,
             len(self.leases),
-            cadence=cadence,
             locale=locale,
             strict=self.strict,
         )

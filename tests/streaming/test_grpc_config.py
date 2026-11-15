@@ -362,7 +362,7 @@ async def test_empty_language_takes_the_default_locale(served):
         served, config_request(recognition_config(language_code=""))
     )
     assert call.status == grpc.StatusCode.OK, call.details
-    assert opens(served) == [{"cadence": "560ms", "locale": "auto"}]
+    assert opens(served) == [{"locale": "auto"}]
 
 
 # @spec ING-GRPC-024

@@ -152,10 +152,10 @@ def clock():
 
 @pytest.fixture
 async def fake_factory(clock):
-    """A ``FakeSessionFactory`` with the default cadences and locales.
+    """A ``FakeSessionFactory`` with the default locales.
 
-    It serves ``560ms`` and ``1120ms`` with locales ``en-US``, ``de-DE``
-    and ``auto`` (default ``auto``), on ``clock``, the plugin's clock, so its
+    It serves the locales ``en-US``, ``de-DE`` and ``auto`` (default
+    ``auto``), on ``clock``, the plugin's clock, so its
     ``drain(deadline)`` waits in the same time the plugin's deadlines use.
     It models generation, cleanup and holding tasks (``support.fake_session``);
     whatever is still running at the end of the test is cancelled.

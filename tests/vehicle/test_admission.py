@@ -778,7 +778,7 @@ async def test_realtime_rejects_secondary_and_checkpoint_selectors(
 
 
 # @spec ING-VEH-007
-async def test_streams_pass_cadence_and_locale_only_to_open(
+async def test_streams_pass_only_the_locale_to_open(
     started, fake_factory, clock, helpers
 ) -> None:
     plugin, _ = started
@@ -792,8 +792,8 @@ async def test_streams_pass_cadence_and_locale_only_to_open(
     )
     opens = [c for c in fake_factory.calls if c.name == "open"]
     assert [c.kwargs for c in opens] == [
-        {"cadence": "560ms", "locale": "en-US"},
-        {"cadence": "560ms", "locale": "de-DE"},
+        {"locale": "en-US"},
+        {"locale": "de-DE"},
     ]
     assert [c.args for c in opens] == [(), ()]
     assert repr(plugin.config) == config_before

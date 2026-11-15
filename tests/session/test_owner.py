@@ -20,7 +20,7 @@ SAMPLES = np.zeros(1600, dtype=np.float32)
 
 
 async def _open(owner, locale: str = "en-US"):
-    return await owner.open(cadence="560ms", locale=locale)
+    return await owner.open(locale=locale)
 
 
 def _lease(fake_factory):

@@ -23,7 +23,6 @@ PACKAGE = Path(__file__).resolve().parents[2] / "src" / "vllm_riva_frontend"
 
 FACTORY_MEMBERS = frozenset(
     {
-        "served_cadences",
         "locales",
         "default_locale",
         "open",
@@ -41,7 +40,7 @@ MODEL_PLUGIN_EXCEPTIONS = frozenset(
 
 
 def _modules() -> list[tuple[Path, ast.Module]]:
-    paths = sorted(PACKAGE.glob("*.py"))
+    paths = sorted(PACKAGE.rglob("*.py"))
     assert paths, PACKAGE
     return [(p, ast.parse(p.read_text(), filename=str(p))) for p in paths]
 
@@ -101,9 +100,11 @@ def test_frontend_uses_only_the_structural_protocol_without_teardown():
     assert update.return_annotation in (None, "None", type(None))
     feed = inspect.signature(SessionLease.feed)
     assert feed.parameters["on_accepted"].kind is inspect.Parameter.KEYWORD_ONLY
+    # ``open`` takes the locale and nothing else: not even an optional
+    # cadence.
     opener = inspect.signature(SessionFactory.open)
-    for name in ("cadence", "locale"):
-        assert opener.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    assert list(opener.parameters) == ["self", "locale"]
+    assert opener.parameters["locale"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # @spec ING-CORE-033
@@ -173,6 +174,9 @@ def test_the_stream_owner_takes_no_provider_batcher_or_cadence_argument():
     }
     for parameter in parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    # A stream opens with its locale only.
+    opener = inspect.signature(StreamOwner.open).parameters
+    assert list(opener) == ["self", "locale"]
 
 
 # ----------------------------------------------------------------- runtime
@@ -222,7 +226,7 @@ class TestOnlyProtocolMembers:
         assert opens
         for call in opens:
             assert call.args == ()
-            assert set(call.kwargs) == {"cadence", "locale"}
+            assert set(call.kwargs) == {"locale"}
         feeds = [c for c in factory.calls if c.name == "feed"]
         assert feeds
         for call in feeds:
@@ -233,7 +237,7 @@ class TestOnlyProtocolMembers:
         for call in update:
             assert call.kwargs == {}
 
-    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-014, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_riva_stream_touches_only_protocol_members(
         self, riva, fake_factory, access_log, test_app
     ):
@@ -248,7 +252,7 @@ class TestOnlyProtocolMembers:
         self._check_calls(fake_factory)
         assert getattr(test_app.state, "core_realtime_scopes", []) == []
 
-    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-014, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_realtime_session_touches_only_protocol_members(
         self, realtime, first_update, fake_factory, access_log, test_app
     ):

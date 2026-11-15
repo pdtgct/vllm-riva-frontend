@@ -603,24 +603,32 @@ async def test_cancelled_discovery_settles_every_factory_then_re_raises(
         assert factory.running_tasks() == set()
 
 
+class _ServicerFailed(RuntimeError):
+    """The injected failure of the ``RivaServicer`` constructor."""
+
+
 # @spec ING-EP-069, ING-EP-097
 @pytest.mark.parametrize(
     "case",
-    ["unserved-cadence", "later-constructor-raises", "discard-then-fail"],
+    ["servicer-raises", "later-constructor-raises", "discard-then-fail"],
 )
 async def test_failed_init_state_settles_every_constructed_factory(
-    clock, helpers, case
+    clock, helpers, monkeypatch, case
 ) -> None:
     """A failed ``init_state`` settles each constructed factory, once."""
     from support.fake_session import FakeSessionFactory
 
+    import vllm_riva_frontend.grpc as grpc_module
+
     def raising(engine_client, model_config):
         raise RuntimeError("constructor failed")
 
-    if case == "unserved-cadence":
-        # The factory does not serve the 560ms streaming cadence: the
-        # cadence check after construction fails.
-        built = [FakeSessionFactory(served_cadences=("1120ms",))]
+    def servicer_raises(plugin):
+        raise _ServicerFailed("servicer constructor failed")
+
+    if case == "servicer-raises":
+        # Discovery succeeds; building the servicer afterwards fails.
+        built = [FakeSessionFactory()]
         factories = {"nemotron": built[0].constructor}
         options: dict[str, Any] = {}
     elif case == "later-constructor-raises":
@@ -628,19 +636,28 @@ async def test_failed_init_state_settles_every_constructed_factory(
         factories = {"first": built[0].constructor, "second": raising}
         options = {}
     else:
-        # "first" is discarded (and settled then); the named "second"
-        # fails the cadence check and is settled when startup fails.
-        built = [
-            FakeSessionFactory(),
-            FakeSessionFactory(served_cadences=("1120ms",)),
-        ]
+        # "first" is discarded (and settled then); the named "second" is
+        # selected, building the servicer fails, and "second" is settled
+        # when startup fails.
+        built = [FakeSessionFactory(), FakeSessionFactory()]
         factories = {
             "first": built[0].constructor,
             "second": built[1].constructor,
         }
         options = {"session_factory": "second"}
     plugin = helpers.make_frontend(clock, factories=factories)
-    await _expect_failure(helpers, plugin, helpers.engine_with(options=options))
+    engine = helpers.engine_with(options=options)
+    if case == "later-constructor-raises":
+        await _expect_failure(helpers, plugin, engine)
+    else:
+        # Patched on the module: lifecycle imports RivaServicer inside its
+        # post-discovery try (lifecycle.py), so the import must stay there.
+        monkeypatch.setattr(grpc_module, "RivaServicer", servicer_raises)
+        # The post-discovery failure propagates as itself, not wrapped.
+        with pytest.raises(_ServicerFailed):
+            await helpers.initialize(plugin, engine)
+        assert plugin.factory is None
+        assert plugin.servicer is None
     for factory in built:
         assert _settled(factory), factory.names()
         assert factory.running_tasks() == set()
