@@ -40,8 +40,22 @@ This repository is a development preview and is not published to PyPI. Install a
 from git:
 
 ```bash
-pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b2"
+pip install "git+https://github.com/pdtgct/vllm-riva-frontend.git@v0.4.0b3"
 ```
+
+A model plugin's tests install the seam conformance suite, the separate distribution
+`vllm-riva-frontend-dev` with no runtime role, from the same tag as the frontend. It requires the
+frontend at exactly its version, and no index carries the frontend, so install both from the tag
+in one command:
+
+```bash
+pip install \
+  "git+https://github.com/pdtgct/vllm-riva-frontend.git@<tag>" \
+  "git+https://github.com/pdtgct/vllm-riva-frontend.git@<tag>#subdirectory=dev"
+```
+
+In a `pyproject.toml`, list the same two direct references, at the same tag, among the test
+dependencies.
 
 The GitHub release notes for the tag give the full pinned recipe: the vLLM build and the model
 plugin version it was tested with.

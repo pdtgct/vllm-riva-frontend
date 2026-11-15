@@ -11,7 +11,6 @@ from support.fake_session import Raise, SeamError, failed, refused
 
 REFUSED = {
     "locale": "unknown_locale",
-    "cadence": "internal",
     "capacity": "busy",
     "active_limit": "busy",
     "engine_paused": "service_unavailable",
@@ -82,6 +81,44 @@ def test_exception_without_session_error_is_internal() -> None:
     assert _project(ValueError("bad samples")).code == "internal"
 
 
+# @spec ING-ERR-063, ING-ERR-008, ING-ERR-010
+def test_a_cadence_refusal_takes_the_generic_internal_fallback() -> None:
+    # No seam reason names a cadence: one that arrives is an unknown
+    # refusal reason, with the generic detail.
+    error = _project(refused("cadence"))
+    assert error.code == "internal"
+    assert error.detail == "the factory refused the stream: cadence"
+
+
+# @spec ING-ERR-063, ING-CORE-014
+def test_no_frontend_module_dispatches_on_a_cadence_reason() -> None:
+    # The behavioral check above cannot tell the generic fallback from a
+    # special case that copies its detail; no source string equals
+    # ``cadence``, so no branch can compare a reason against it.
+    import ast
+    from pathlib import Path
+
+    import vllm_riva_frontend_dev
+
+    import vllm_riva_frontend
+
+    # The development distribution's package obeys the same rule.
+    roots = [
+        Path(package.__file__).parent
+        for package in (vllm_riva_frontend, vllm_riva_frontend_dev)
+    ]
+    offenders = [
+        f"{path.relative_to(root.parent)}:{node.lineno}"
+        for root in roots
+        for path in sorted(root.rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.strip().lower() == "cadence"
+    ]
+    assert offenders == []
+
+
 # @spec ING-ERR-010
 @pytest.mark.parametrize(
     "exc",
@@ -121,7 +158,6 @@ def test_engine_dead_is_the_escalating_reason() -> None:
 #: ``None`` for ``locale`` on the Realtime adapter, which does not close.
 BY_REASON = {
     "engine_paused": ("service_unavailable", "UNAVAILABLE", 1013),
-    "cadence": ("internal", "INTERNAL", 1011),
     "request_id_in_use": ("internal", "INTERNAL", 1011),
     "locale": ("unknown_locale", "INVALID_ARGUMENT", None),
 }

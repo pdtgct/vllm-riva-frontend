@@ -91,7 +91,7 @@ async def test_the_bootstrap_object_round_trips_as_the_first_update(served):
     await client.send(update_event(body))
     updated = await client.next()
     assert updated["type"] == "transcription_session.updated", updated
-    assert opens(served) == [{"cadence": "560ms", "locale": "auto"}]
+    assert opens(served) == [{"locale": "auto"}]
 
 
 async def _bootstrap_object(served) -> dict:

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# @spec ING-CORE-036 (the seam conformance suite, at the frontend's version)
+[project]
+name = "vllm-riva-frontend-dev"
+dynamic = ["version"]
+description = "The seam conformance suite of vllm-riva-frontend, for tests only"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+dependencies = [
+    "vllm-riva-frontend==0.4.0b3",
+    "pytest>=8",
+    "pytest-asyncio>=1.4",
+    "numpy>=1.26",
+]
+
+[project.urls]
+Repository = "https://github.com/pdtgct/vllm-riva-frontend"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vllm_riva_frontend_dev = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vllm_riva_frontend_dev.__version__" }

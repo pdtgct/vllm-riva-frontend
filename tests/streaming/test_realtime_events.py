@@ -75,7 +75,7 @@ async def test_conversation_created_first(served):
 
 
 # @spec ING-NIMWS-023
-async def test_first_update_opens_at_560ms_then_acknowledges(served):
+async def test_first_update_opens_with_the_locale_then_acknowledges(served):
     gate = Block()
     served.factory.script("open", gate)
     client = RealtimeClient(served.app, served.clock)
@@ -87,7 +87,7 @@ async def test_first_update_opens_at_560ms_then_acknowledges(served):
     gate.release()
     updated = await client.next()
     assert updated["type"] == "transcription_session.updated"
-    assert opens(served) == [{"cadence": "560ms", "locale": "en-US"}]
+    assert opens(served) == [{"locale": "en-US"}]
 
 
 # @spec ING-NIMWS-023

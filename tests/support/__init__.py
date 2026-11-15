@@ -1,7 +1,9 @@
 """Shared fakes and helpers for the frontend's tests.
 
-The modules here import core (the vLLM tree on ``PYTHONPATH``) and the test
-dependencies, never the frontend package: ``tests/test_support.py`` checks
+The modules here import core (the vLLM tree on ``PYTHONPATH``), the test
+dependencies and ``vllm_riva_frontend_dev`` (the development distribution,
+whose ``Return``, ``Raise``, ``Block``, seam errors and ``settle`` they
+re-export), never the frontend package: ``tests/test_support.py`` checks
 them on their own. Each leaf's tests build on them through the fixtures in
 ``tests/conftest.py``.
 

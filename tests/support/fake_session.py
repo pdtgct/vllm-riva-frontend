@@ -1,8 +1,8 @@
 """A scriptable session factory and lease.
 
 They satisfy the structural protocol of the HLD's "Session-factory seam" and
-the model plugin's session design (``SessionFactory``: ``served_cadences``,
-``locales``, ``default_locale``, ``open(*, cadence, locale)``,
+the model plugin's session design (``SessionFactory``: ``locales``,
+``default_locale``, ``open(*, locale)``,
 ``drain(deadline) -> list``, ``teardown_all() -> set``; ``SessionLease``:
 ``feed(samples, *, on_accepted) -> list[str]``, ``update_locale(locale) ->
 None``, ``flush() -> str``, ``finish()``, ``abort()``, ``release()`` and the
@@ -97,8 +97,11 @@ session. ``aclose()`` cancels whatever is left at the end of a test.
 ``start_generation=False`` turns generation tasks off (the earlier model:
 no task until a cancelled ``release``).
 
-Seam errors are ``SeamError`` instances defined here, carrying
-``session_error`` and ``reason``; no model-plugin class is involved.
+``Return``, ``Raise``, ``Block``, ``SeamError``, ``refused`` and ``failed``
+come from ``vllm_riva_frontend_dev`` and are re-exported here, so the fake
+and a real factory's adapter share one set of types. Seam errors are
+``SeamError`` instances carrying ``session_error`` and ``reason``; no
+model-plugin class is involved.
 
 The lease enforces the model plugin's rules on the caller: overlapping calls
 raise ``RuntimeError``, calls after ``teardown_all`` raise
@@ -113,14 +116,19 @@ import contextlib
 import math
 from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from vllm_riva_frontend_dev import _DEFAULT
+from vllm_riva_frontend_dev import Block as Block
+from vllm_riva_frontend_dev import Raise as Raise
+from vllm_riva_frontend_dev import Return as Return
+from vllm_riva_frontend_dev import SeamError as SeamError
+from vllm_riva_frontend_dev import failed as failed
+from vllm_riva_frontend_dev import refused as refused
 
 from support.clock import RealClock
-
-_DEFAULT = object()
 
 REFUSED_REASONS = frozenset(
     {
@@ -128,7 +136,6 @@ REFUSED_REASONS = frozenset(
         "active_limit",
         "engine_paused",
         "request_id_in_use",
-        "cadence",
         "locale",
     }
 )
@@ -157,96 +164,7 @@ ALLOWED_CALLS: dict[str, frozenset[str]] = {
 }
 
 
-class SeamError(Exception):
-    """An exception carrying the seam's two attributes."""
-
-    def __init__(
-        self, session_error: str, reason: str, message: str = ""
-    ) -> None:
-        super().__init__(message or f"{session_error}: {reason}")
-        self.session_error = session_error
-        self.reason = reason
-
-
-def refused(reason: str, message: str = "") -> SeamError:
-    return SeamError("refused", reason, message)
-
-
-def failed(reason: str, message: str = "") -> SeamError:
-    return SeamError("failed", reason, message)
-
-
 # --------------------------------------------------------------- behaviours
-
-
-@dataclass
-class Return:
-    """Return ``value``; ``Return()`` returns the operation's default."""
-
-    value: Any = _DEFAULT
-
-
-@dataclass
-class Raise:
-    """Raise ``exc``.
-
-    ``skip_accept`` makes a scripted ``feed`` raise before it calls
-    ``on_accepted`` (the model's ``ValueError`` for bad audio behaves so).
-    """
-
-    exc: BaseException
-    skip_accept: bool = False
-
-
-@dataclass
-class Block:
-    """Park the call until ``release()``; then perform ``then``.
-
-    ``entered`` is set when the call has started waiting. A caller cancelled
-    while parked propagates the cancellation (and a ``feed`` or ``flush`` then
-    fails the lease with ``cancelled``, as the model plugin's does).
-
-    ``delay_cancel=True`` makes a call that delays its cancellation: while
-    parked it absorbs every cancellation (counted in ``cancellations``) and
-    keeps waiting; ``release()`` then settles it, as cancelled if it was
-    cancelled meanwhile and by ``then`` otherwise.
-
-    ``on_enter`` runs synchronously when the call starts waiting, before
-    the loop turns again: a test can cancel the calling task there, so the
-    cancellation lands at this very suspension (for example a cancelled
-    ``open`` whose generation task has not taken its first step).
-    """
-
-    then: Return | Raise = field(default_factory=Return)
-    entered: asyncio.Event = field(default_factory=asyncio.Event)
-    released: asyncio.Event = field(default_factory=asyncio.Event)
-    delay_cancel: bool = False
-    cancellations: int = 0
-    on_enter: Callable[[], Any] | None = None
-
-    def release(self, then: Return | Raise | None = None) -> None:
-        if then is not None:
-            self.then = then
-        self.released.set()
-
-    async def park(self) -> None:
-        """Wait for ``release()`` as the mode says (see the class doc)."""
-        self.entered.set()
-        if self.on_enter is not None:
-            self.on_enter()
-        if not self.delay_cancel:
-            await self.released.wait()
-            return
-        while not self.released.is_set():
-            try:
-                await self.released.wait()
-            except asyncio.CancelledError:
-                self.cancellations += 1
-                task = asyncio.current_task()
-                if task is not None:
-                    task.uncancel()
-        if self.cancellations:
-            raise asyncio.CancelledError
 
 
 Behaviour = Return | Raise | Block
@@ -300,13 +218,11 @@ class FakeLease:
         factory: FakeSessionFactory,
         index: int,
         *,
-        cadence: str,
         locale: str,
         strict: bool = True,
     ) -> None:
         self.factory = factory
         self.index = index
-        self.cadence = cadence
         self.locale = locale
         self.strict = strict
         self.state = "open"
@@ -666,7 +582,6 @@ class FakeSessionFactory:
     def __init__(
         self,
         *,
-        served_cadences: Iterable[str] = ("560ms", "1120ms"),
         locales: Iterable[str] = ("en-US", "de-DE", "auto"),
         default_locale: str | None = "auto",
         final_text: str = "",
@@ -676,7 +591,6 @@ class FakeSessionFactory:
         start_generation: bool = True,
     ) -> None:
         self.clock = clock if clock is not None else RealClock()
-        self.served_cadences: frozenset[str] = frozenset(served_cadences)
         self.locales: frozenset[str] = frozenset(locales)
         self.default_locale = default_locale
         self.final_text = final_text
@@ -791,17 +705,12 @@ class FakeSessionFactory:
 
     # -- protocol ---------------------------------------------------------
 
-    async def open(self, *, cadence: str, locale: str) -> FakeLease:
-        self._record(
-            "factory", "open", (), {"cadence": cadence, "locale": locale}
-        )
+    async def open(self, *, locale: str) -> FakeLease:
+        self._record("factory", "open", (), {"locale": locale})
         if self.closed:
             raise failed("cancelled", "factory torn down")
-        if self.validate:
-            if cadence not in self.served_cadences:
-                raise refused("cadence", f"cadence {cadence!r} not served")
-            if locale not in self.locales:
-                raise refused("locale", f"locale {locale!r} unknown")
+        if self.validate and locale not in self.locales:
+            raise refused("locale", f"locale {locale!r} unknown")
         behaviour = self._scripts.next("open")
         if isinstance(behaviour, Raise):
             # A refusal before any session exists starts nothing.
@@ -809,7 +718,6 @@ class FakeSessionFactory:
         lease = FakeLease(
             self,
             len(self.leases),
-            cadence=cadence,
             locale=locale,
             strict=self.strict,
         )

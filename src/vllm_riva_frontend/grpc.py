@@ -666,9 +666,7 @@ class _RivaStream:
                 "protocol",
             )
         locale, audio = await self._configure(first)
-        await self._call(
-            owner.open(cadence=lease.STREAM_CADENCE, locale=locale)
-        )
+        await self._call(owner.open(locale=locale))
         if audio is not None:
             owner.attach_frontend(audio)
         while True:

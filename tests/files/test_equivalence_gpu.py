@@ -8,14 +8,13 @@ comparison vacuous.
 
 Matched conditions (files design, Equivalence): one in-process engine serves
 both paths, so precision is the same, and endpointing is off on both. The
-file runs at the engine's default lookahead, ``num_lookahead_tokens`` (13 in
-the reference deployment, the 1120 ms cadence), and the comparison session
-opens at that cadence, not at the 560 ms streaming arm. Both use one fixed
-locale (no ``update_locale``) and the same samples: the input is PCM16, so
-the ``Recognize`` conversion's requantization is exact and the stream side
-is fed the same values. The file goes through the frontend's ``Recognize``
-into core's own transcription service; the session through the factory the
-frontend discovered.
+engine runs at the checkpoint's default lookahead (no lookahead override),
+so the file and the comparison session, opened with the locale only, run at
+one lookahead. Both use one fixed locale (no ``update_locale``) and the same
+samples: the input is PCM16, so the ``Recognize`` conversion's
+requantization is exact and the stream side is fed the same values. The
+file goes through the frontend's ``Recognize`` into core's own transcription
+service; the session through the factory the frontend discovered.
 """
 
 from __future__ import annotations
@@ -32,9 +31,6 @@ from support.riva import recognize, recognize_request
 
 pytestmark = [pytest.mark.gpu, pytest.mark.real_factory, pytest.mark.engine]
 
-FILE_RIGHT_CONTEXT = 13
-FILE_CADENCE = "1120ms"
-STREAM_RIGHT_CONTEXT = 6
 PIECE = 8_000
 
 
@@ -52,7 +48,7 @@ def _speech() -> np.ndarray:
 
 @pytest.fixture
 async def engine():
-    """An in-process engine on the published card at the file cadence."""
+    """An in-process engine on the published card at its default lookahead."""
     card = os.environ.get("NEMOTRON_CARD_DIR")
     if not card:
         pytest.skip("NEMOTRON_CARD_DIR is not set")
@@ -65,13 +61,6 @@ async def engine():
         model=card,
         config_format="nemotron_asr_streaming",
         tokenizer_mode="nemotron_asr_streaming",
-        hf_overrides={
-            "num_lookahead_tokens": FILE_RIGHT_CONTEXT,
-            "supported_num_lookahead_tokens": [
-                STREAM_RIGHT_CONTEXT,
-                FILE_RIGHT_CONTEXT,
-            ],
-        },
         async_scheduling=False,
         enable_prefix_caching=False,
         enforce_eager=True,
@@ -91,7 +80,7 @@ async def engine():
 
 
 async def _session_transcript(factory, samples, locale: str) -> str:
-    lease = await factory.open(cadence=FILE_CADENCE, locale=locale)
+    lease = await factory.open(locale=locale)
     try:
         audio = float_from_pcm16(samples)
         for start in range(0, audio.size, PIECE):
@@ -106,7 +95,9 @@ async def _session_transcript(factory, samples, locale: str) -> str:
 
 
 # @spec ING-FILE-056
-async def test_a_file_transcript_equals_a_session_at_the_file_cadence(engine):
+async def test_a_file_transcript_equals_a_session_at_the_default_lookahead(
+    engine,
+):
     from vllm.entrypoints.openai.models.protocol import BaseModelPath
     from vllm.entrypoints.openai.models.serving import OpenAIServingModels
     from vllm.entrypoints.speech_to_text.transcription.serving import (
@@ -126,7 +117,6 @@ async def test_a_file_transcript_equals_a_session_at_the_file_cadence(engine):
     )
     try:
         factory = served.factory
-        assert FILE_CADENCE in factory.served_cadences
         locale = factory.default_locale or min(factory.locales)
         outcome = await recognize(
             served.servicer,

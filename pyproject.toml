@@ -40,7 +40,20 @@ dev = [
     "ruff>=0.15",
     "soundfile>=0.12",
     "types-pyyaml>=6",
+    # @spec ING-CORE-036 (the suite's distribution, from the workspace)
+    "vllm-riva-frontend-dev",
+    # @spec ING-CORE-036 (the wheel check builds both wheels with build_meta)
+    "setuptools>=68",
 ]
+
+# The development distribution (ING-CORE-036) is a workspace member, so
+# ``uv sync`` installs both distributions from the working tree.
+[tool.uv.workspace]
+members = ["dev"]
+
+[tool.uv.sources]
+vllm-riva-frontend = { workspace = true }
+vllm-riva-frontend-dev = { workspace = true }
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -55,7 +68,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "engine: imports the RFC 1 + RFC 2 vLLM tree",
-    "real_factory: seam conformance against the model plugin's factory",
+    "real_factory: a test against the model plugin's factory",
     "gpu: needs an installed engine on CUDA",
 ]
 addopts = [
@@ -85,11 +98,20 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D1"]
+"dev/src/vllm_riva_frontend_dev/seam_conformance.py" = ["D1"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
-packages = ["vllm_riva_frontend"]
+mypy_path = ["src", "dev/src"]
+packages = ["vllm_riva_frontend", "vllm_riva_frontend_dev"]
+
+# The suite's tests take their fixtures untyped, as pytest tests do.
+[[tool.mypy.overrides]]
+module = ["vllm_riva_frontend_dev.seam_conformance"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false
 
 [[tool.mypy.overrides]]
 module = [

@@ -54,11 +54,6 @@ T = TypeVar("T")
 #: The entry-point group this package owns for session factories.
 SESSION_FACTORIES_GROUP = "vllm_riva_frontend.session_factories"
 
-# @spec ING-CORE-014
-#: The cadence every streaming surface opens at.
-STREAM_CADENCE = "560ms"
-
-
 # ------------------------------------------------------------------ protocol
 
 
@@ -96,11 +91,10 @@ class SessionLease(Protocol):
 class SessionFactory(Protocol):
     """What the frontend uses of the model plugin's session factory."""
 
-    served_cadences: frozenset[str]
     locales: frozenset[str]
     default_locale: str | None
 
-    async def open(self, *, cadence: str, locale: str) -> SessionLease:
+    async def open(self, *, locale: str) -> SessionLease:
         """Open one lease; may raise a refusal or a failure."""
 
     async def drain(self, deadline: float) -> list[BaseException]:
@@ -135,10 +129,10 @@ def discover_session_factory(
     names one: a constructor's raise is the engine-capability check, so any
     raise fails startup with its message. ``None`` means it does not serve
     the model. Exactly one must accept, unless ``selected`` names an entry
-    point, whose result alone is then used. The chosen factory must serve
-    ``STREAM_CADENCE``. Every failure is a ``StartupError`` naming the entry
-    points; a factory built and then not used is handed to ``discard``,
-    which the plugin uses to settle it (ING-EP-069).
+    point, whose result alone is then used. Every failure is a
+    ``StartupError`` naming the entry points; a factory built and then not
+    used is handed to ``discard``, which the plugin uses to settle it
+    (ING-EP-069).
     """
     points = list(entry_points(group=SESSION_FACTORIES_GROUP))
     names = ", ".join(point.name for point in points) or "none"
@@ -198,18 +192,7 @@ def discover_session_factory(
             )
         raise _startup_error([problem])
 
-    name, factory = accepted[0]
-    cadences = getattr(factory, "served_cadences", frozenset[str]())
-    if STREAM_CADENCE not in cadences:
-        discard(factory)
-        raise _startup_error(
-            [
-                f"session factory {name!r} does not serve the streaming "
-                f"cadence {STREAM_CADENCE} (it serves: "
-                f"{', '.join(sorted(cadences)) or 'none'})"
-            ]
-        )
-    return factory
+    return accepted[0][1]
 
 
 # @spec ING-CORE-015
@@ -631,7 +614,8 @@ class StreamOwner:
     # -- surface operations -------------------------------------------------
 
     # @spec ING-CORE-011, ING-LIFE-022, ING-LIFE-032, ING-LIFE-036
-    async def open(self, cadence: str, locale: str) -> None:
+    # @spec ING-CORE-014
+    async def open(self, locale: str) -> None:
         """Open the lease under the preconfiguration bound.
 
         On success the owner is ``configured`` and the first-audio and
@@ -639,7 +623,7 @@ class StreamOwner:
         projected code; a bound that expires cancels ``open``, and a lease
         the owner never received is the factory's to clean up.
         """
-        await self._guarded(self._open(cadence, locale))
+        await self._guarded(self._open(locale))
 
     # @spec ING-FE-007, ING-FE-015, ING-LIFE-040, ING-LIFE-041
     # @spec ING-LIFE-042, ING-LIFE-021
@@ -730,14 +714,14 @@ class StreamOwner:
 
     # -- operation bodies ---------------------------------------------------
 
-    async def _open(self, cadence: str, locale: str) -> None:
+    async def _open(self, locale: str) -> None:
         await self._check_live()
         if self._lease is not None or self._call is not None:
             raise RuntimeError("a stream owner opens exactly one lease")
         if self._trigger is not None:
             await self._end_with(Cause("service_unavailable", "shutdown"))
         task = await self._invoke(
-            "open", "open", lambda: self._opener(cadence=cadence, locale=locale)
+            "open", "open", lambda: self._opener(locale=locale)
         )
         if self._cause is None and task.cancelled():
             self._select(Cause("service_unavailable", "shutdown"))
@@ -950,7 +934,14 @@ class StreamOwner:
         """Run ``start()`` as the owner's one in-flight call and settle it."""
         if name != "open":
             self.calls.append(name)
-        task = self._spawn(name, start())
+
+        async def started() -> Any:
+            # ``start()`` runs inside the task, so a call that raises while
+            # its arguments bind (a factory whose ``open`` requires another
+            # argument) fails the call like any other raise.
+            return await start()
+
+        task = self._spawn(name, started())
         self._call, self._call_name = task, name
         self._mark_taken()
         await self._settle(task, kind)

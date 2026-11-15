@@ -1,4 +1,4 @@
-"""Factory discovery, selection, the cadence check and the locale rule."""
+"""Factory discovery and selection, no cadence member, and the locale rule."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 from support.clock import settle
 from support.fake_session import FakeSessionFactory, fake_entry_points
 
-from .conftest import failure_text, startup_failure
+from .conftest import failure_text
 
 
 def _teardown(factory):
@@ -243,20 +243,19 @@ async def test_init_state_reads_the_session_factory_option(clock):
     assert plugin.factory is first
 
 
-# ------------------------------------------------------------------ cadence
+# ------------------------------------------------------------- no cadence
 
 
 # @spec ING-CORE-014
-async def test_startup_fails_when_the_factory_does_not_serve_560ms(clock):
+async def test_startup_accepts_a_factory_without_cadence_members(clock):
     from support.app import build_app, init_state
     from support.fake_engine import FakeEngineClient
     from support.grpc_harness import free_port
 
-    from vllm_riva_frontend.lease import STREAM_CADENCE
     from vllm_riva_frontend.lifecycle import RivaFrontendPlugin
 
-    assert STREAM_CADENCE == "560ms"
-    factory = FakeSessionFactory(served_cadences=("320ms", "1120ms"))
+    factory = FakeSessionFactory()
+    assert not hasattr(factory, "served_cadences")
     plugin = RivaFrontendPlugin(
         clock=clock, entry_points=fake_entry_points(fake=factory.constructor)
     )
@@ -264,15 +263,13 @@ async def test_startup_fails_when_the_factory_does_not_serve_560ms(clock):
         riva_frontend={"grpc_bind": f"127.0.0.1:{free_port()}"}
     )
     app = build_app([plugin])
+    await init_state(app, engine)
 
-    with pytest.raises(BaseException) as info:
-        await init_state(app, engine)
-    assert startup_failure(info.value) is not None
-    assert "560ms" in failure_text(info.value)
+    assert plugin.factory is factory
 
 
 # @spec ING-CORE-014
-async def test_every_stream_opens_at_560ms(riva, fake_factory):
+async def test_every_stream_opens_with_the_locale_only(riva, fake_factory):
     from support.audio import pcm16_bytes, pcm16_sine
 
     call = riva()
@@ -282,7 +279,7 @@ async def test_every_stream_opens_at_560ms(riva, fake_factory):
     await call.wait()
 
     opens = [c for c in fake_factory.calls if c.name == "open"]
-    assert [c.kwargs["cadence"] for c in opens] == ["560ms"]
+    assert [c.kwargs for c in opens] == [{"locale": "en-US"}]
 
 
 # ------------------------------------------------------------------ locale

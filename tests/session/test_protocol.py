@@ -19,11 +19,14 @@ from support.audio import pcm16_bytes, pcm16_sine
 from support.fake_session import FakeSessionFactory, fake_entry_points
 from support.realtime import CREATED
 
-PACKAGE = Path(__file__).resolve().parents[2] / "src" / "vllm_riva_frontend"
+ROOT = Path(__file__).resolve().parents[2]
+PACKAGE = ROOT / "src" / "vllm_riva_frontend"
+#: The development distribution's package (ING-CORE-036) obeys the same
+#: source rules.
+DEV_PACKAGE = ROOT / "dev" / "src" / "vllm_riva_frontend_dev"
 
 FACTORY_MEMBERS = frozenset(
     {
-        "served_cadences",
         "locales",
         "default_locale",
         "open",
@@ -41,8 +44,11 @@ MODEL_PLUGIN_EXCEPTIONS = frozenset(
 
 
 def _modules() -> list[tuple[Path, ast.Module]]:
-    paths = sorted(PACKAGE.glob("*.py"))
-    assert paths, PACKAGE
+    paths = []
+    for package in (PACKAGE, DEV_PACKAGE):
+        found = sorted(package.rglob("*.py"))
+        assert found, package
+        paths.extend(found)
     return [(p, ast.parse(p.read_text(), filename=str(p))) for p in paths]
 
 
@@ -72,9 +78,10 @@ def _members(protocol: type) -> set[str]:
 def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
     offenders = []
     for path, tree in _modules():
+        where = path.relative_to(ROOT)
         for name in _imported(tree):
             if "nemotron" in name.lower():
-                offenders.append(f"{path.name}: import {name}")
+                offenders.append(f"{where}: import {name}")
         for node in ast.walk(tree):
             if isinstance(node, ast.ExceptHandler) and node.type is not None:
                 for sub in ast.walk(node.type):
@@ -86,7 +93,7 @@ def test_the_package_imports_no_model_plugin_and_catches_none_of_its_classes():
                         else None
                     )
                     if ident in MODEL_PLUGIN_EXCEPTIONS:
-                        offenders.append(f"{path.name}: except {ident}")
+                        offenders.append(f"{where}: except {ident}")
     assert offenders == []
 
 
@@ -101,9 +108,11 @@ def test_frontend_uses_only_the_structural_protocol_without_teardown():
     assert update.return_annotation in (None, "None", type(None))
     feed = inspect.signature(SessionLease.feed)
     assert feed.parameters["on_accepted"].kind is inspect.Parameter.KEYWORD_ONLY
+    # ``open`` takes the locale and nothing else: not even an optional
+    # cadence.
     opener = inspect.signature(SessionFactory.open)
-    for name in ("cadence", "locale"):
-        assert opener.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    assert list(opener.parameters) == ["self", "locale"]
+    assert opener.parameters["locale"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # @spec ING-CORE-033
@@ -128,26 +137,27 @@ def test_there_is_no_remote_provider_mode_or_websocket_loopback():
 
     offenders = []
     for path, tree in _modules():
+        where = path.relative_to(ROOT)
         stem = path.stem.lower()
         if any(word in stem for word in ("provider", "broker", "event_bus")):
-            offenders.append(f"module {path.name}")
+            offenders.append(f"module {where}")
         for name in _imported(tree):
             top = name.split(".")[0]
             if top in {"websockets", "websocket", "aiohttp", "httpx"}:
-                offenders.append(f"{path.name}: import {name}")
+                offenders.append(f"{where}: import {name}")
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and node.value.startswith(("ws://", "wss://"))
             ):
-                offenders.append(f"{path.name}: {node.value!r}")
+                offenders.append(f"{where}: {node.value!r}")
             if isinstance(node, ast.ClassDef):
                 lowered = node.name.lower()
                 if any(
                     w in lowered for w in ("provider", "broker", "eventbus")
                 ):
-                    offenders.append(f"{path.name}: class {node.name}")
+                    offenders.append(f"{where}: class {node.name}")
     assert offenders == []
 
     config = parse_config({"riva_frontend": {}})
@@ -173,6 +183,9 @@ def test_the_stream_owner_takes_no_provider_batcher_or_cadence_argument():
     }
     for parameter in parameters.values():
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    # A stream opens with its locale only.
+    opener = inspect.signature(StreamOwner.open).parameters
+    assert list(opener) == ["self", "locale"]
 
 
 # ----------------------------------------------------------------- runtime
@@ -222,7 +235,7 @@ class TestOnlyProtocolMembers:
         assert opens
         for call in opens:
             assert call.args == ()
-            assert set(call.kwargs) == {"cadence", "locale"}
+            assert set(call.kwargs) == {"locale"}
         feeds = [c for c in factory.calls if c.name == "feed"]
         assert feeds
         for call in feeds:
@@ -233,7 +246,7 @@ class TestOnlyProtocolMembers:
         for call in update:
             assert call.kwargs == {}
 
-    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-014, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_riva_stream_touches_only_protocol_members(
         self, riva, fake_factory, access_log, test_app
     ):
@@ -248,7 +261,7 @@ class TestOnlyProtocolMembers:
         self._check_calls(fake_factory)
         assert getattr(test_app.state, "core_realtime_scopes", []) == []
 
-    # @spec ING-CORE-009, ING-CORE-032, ING-CORE-033, ING-CORE-018
+    # @spec ING-CORE-009, ING-CORE-014, ING-CORE-032, ING-CORE-033, ING-CORE-018
     async def test_realtime_session_touches_only_protocol_members(
         self, realtime, first_update, fake_factory, access_log, test_app
     ):

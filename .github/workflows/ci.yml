@@ -9,6 +9,12 @@
 #
 # Dependencies are resolved per interpreter rather than shared, because a
 # floor run against ceiling-resolved dependencies is not floor evidence.
+# In the floor lane a missing prerequisite of the floor gate fails the lane
+# instead of skipping the gate (RIVA_FRONTEND_FLOOR_GATE_REQUIRED=1).
+#
+# The wheels job builds both distributions (the frontend and the seam
+# conformance suite's vllm-riva-frontend-dev, ING-CORE-036) and checks their
+# metadata and the suite's collection from a fresh environment.
 name: CI
 
 on:
@@ -55,7 +61,9 @@ jobs:
           --index-strategy unsafe-best-match
 
       - name: Lint
-        run: uv run --python ${{ matrix.python-version }} ruff check src tests
+        run: >-
+          uv run --python ${{ matrix.python-version }}
+          ruff check src tests dev scripts
 
       # Floor lane only: mypy's language level is pinned to the floor in
       # pyproject, and that verdict needs floor-resolved stubs.
@@ -64,6 +72,35 @@ jobs:
         run: uv run --python ${{ matrix.python-version }} mypy
 
       - name: Tests
+        if: matrix.python-version != '3.11'
         env:
           PYTHONPATH: vllm-core
         run: uv run --python ${{ matrix.python-version }} pytest -q
+
+      # The floor lane: the floor gate (ING-VEH-027) fails, not skips, on a
+      # missing prerequisite.
+      - name: Tests (floor gate required)
+        if: matrix.python-version == '3.11'
+        env:
+          PYTHONPATH: vllm-core
+          RIVA_FRONTEND_FLOOR_GATE_REQUIRED: "1"
+        run: uv run --python ${{ matrix.python-version }} pytest -q
+
+  wheels:
+    runs-on: ubuntu-latest
+    name: wheels
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build both distributions
+        run: uv build --all-packages --python 3.11 --out-dir dist
+
+      # Metadata of both wheels, then the suite collected from both wheels
+      # installed into a fresh environment outside the checkout (no vLLM).
+      - name: Check the wheels
+        run: >-
+          uv run --python 3.11 --no-project
+          python scripts/check_dev_wheels.py dist

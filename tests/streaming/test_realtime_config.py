@@ -361,7 +361,7 @@ async def test_default_object_round_trips_and_needs_a_locale_without_default(
         await client.open_session(
             copy.deepcopy(bootstrap_session(SERVED, "auto"))
         )
-        assert opens(served) == [{"cadence": "560ms", "locale": "auto"}]
+        assert opens(served) == [{"locale": "auto"}]
 
     factory = FakeSessionFactory(default_locale=None)
     async with serving(clock=clock, factory=factory) as served:

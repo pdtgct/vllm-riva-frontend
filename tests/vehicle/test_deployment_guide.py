@@ -2,8 +2,9 @@
 
 The guide is parsed as text: the ``VLLM_PLUGINS`` assignment, the JSON
 objects passed to ``--additional-config`` and ``--stream-admission-timeouts``,
-``--shutdown-timeout``, ``--max-model-len``, core's decode-duration limit
-and the model plugin's lookahead settings. A required statement is checked
+``--shutdown-timeout``, the reference serve command (the first ``bash``
+block that runs ``vllm serve``), its ``--max-model-len`` and core's
+decode-duration limit. A required statement is checked
 as a paragraph or list item of the guide that carries every term the
 statement needs, so a term scattered over unrelated paragraphs does not
 count.
@@ -24,6 +25,13 @@ DEFAULT_DRAINING_TIMEOUT = 40
 #: Core's decode-duration limit and its default, in seconds.
 DECODE_LIMIT_VARIABLE = "VLLM_MAX_AUDIO_DECODE_DURATION_S"
 DEFAULT_DECODE_LIMIT = 600
+#: The default lookahead the reference checkpoint's model configuration sets;
+#: the reference command serves it.
+DEFAULT_LOOKAHEAD = 3
+#: The lookaheads the guide offers as an override.
+OFFERED_LOOKAHEADS = (0, 1, 3, 6, 13)
+#: The model plugin's lookahead settings the reference command must not set.
+LOOKAHEAD_KEYS = ("supported_num_lookahead_tokens", "num_lookahead_tokens")
 
 
 def guide_text() -> str:
@@ -91,17 +99,16 @@ def model_budget(seconds: float, lookahead: int) -> int:
     return 1 + (whole_chunks + 1) * q + 1
 
 
-def find_lookahead(text: str) -> tuple[list[int], int]:
-    supported = re.search(
-        r"supported_num_lookahead_tokens\W*\[([0-9,\s]+)\]", text
-    )
-    assert supported, "the guide sets supported_num_lookahead_tokens"
-    values = [
-        int(v) for v in supported.group(1).replace(" ", "").split(",") if v
-    ]
-    single = re.search(r"(?<!supported_)num_lookahead_tokens\W*([0-9]+)", text)
-    assert single, "the guide sets num_lookahead_tokens"
-    return values, int(single.group(1))
+def reference_command(text: str) -> str:
+    """The guide's reference serve command: the first ``bash`` block of it.
+
+    The first fenced ``bash`` block that contains ``vllm serve``; prose and
+    other blocks are not part of it.
+    """
+    for block in re.findall(r"```bash\n(.*?)```", text, flags=re.S):
+        if "vllm serve" in block:
+            return block
+    raise AssertionError("the guide has a bash block that runs vllm serve")
 
 
 def decode_limit(text: str) -> float:
@@ -122,10 +129,18 @@ def decode_limit(text: str) -> float:
     return values.pop() if values else DEFAULT_DECODE_LIMIT
 
 
-def max_model_len_failures(text: str) -> list[str]:
-    """Why the guide's ``--max-model-len`` fails ING-EP-078, if it does."""
+def serve_command_failures(text: str) -> list[str]:
+    """Why the guide's reference serve command fails ING-EP-078, if it does.
+
+    The command sets no lookahead, so it serves the checkpoint's default,
+    and its ``--max-model-len`` covers a file as long as core's
+    decode-duration limit at that lookahead.
+    """
     failures: list[str] = []
-    _, lookahead = find_lookahead(text)
+    command = reference_command(text)
+    for key in LOOKAHEAD_KEYS:
+        if re.search(rf"(?<![\w]){key}\b", command):
+            failures.append(f"the reference serve command sets {key}")
     limit = decode_limit(text)
     changed = limit != DEFAULT_DECODE_LIMIT
     if changed and not any(
@@ -136,12 +151,13 @@ def max_model_len_failures(text: str) -> list[str]:
             f"the guide changes {DECODE_LIMIT_VARIABLE} to {limit:g} s "
             "without stating the limit"
         )
-    needed = model_budget(limit, lookahead)
-    configured = flag_number(text, "--max-model-len")
+    needed = model_budget(limit, DEFAULT_LOOKAHEAD)
+    configured = flag_number(command, "--max-model-len")
     if configured < needed:
         failures.append(
             f"--max-model-len {configured:g} is below the {needed} tokens a "
-            f"{limit:g} s file needs at num_lookahead_tokens {lookahead}"
+            f"{limit:g} s file needs at the default lookahead "
+            f"{DEFAULT_LOOKAHEAD}"
         )
     return failures
 
@@ -175,7 +191,10 @@ def states(text: str, *patterns: str) -> bool:
 
 
 # @spec ING-EP-078
-@pytest.mark.parametrize("lookahead, budget", [(13, 75_578), (6, 76_114)])
+@pytest.mark.parametrize(
+    "lookahead, budget",
+    [(0, 82_513), (1, 78_773), (3, 76_918), (6, 76_114), (13, 75_578)],
+)
 def test_budget_formula_matches_the_documented_values(
     lookahead, budget
 ) -> None:
@@ -254,10 +273,10 @@ def test_guide_stream_admission_timeouts_are_readable() -> None:
 
 
 # @spec ING-EP-078
-def test_guide_serves_the_streaming_arm_and_its_file_lookahead() -> None:
-    supported, lookahead = find_lookahead(guide_text())
-    assert 6 in supported, "6 is the 560 ms streaming arm"
-    assert lookahead in supported
+def test_reference_serve_command_sets_no_lookahead() -> None:
+    command = reference_command(guide_text())
+    for key in LOOKAHEAD_KEYS:
+        assert key not in command, f"the reference serve command sets {key}"
 
 
 # @spec ING-EP-078
@@ -267,36 +286,92 @@ def test_guide_sizes_max_model_len_for_cores_decode_limit() -> None:
     The limit is ``VLLM_MAX_AUDIO_DECODE_DURATION_S`` (600 s unless the
     guide changes it), not ``unary_max_decoded_duration_seconds``: the
     frontend keeps that option at or below core's limit, so core's limit is
-    the longest file either file surface admits.
+    the longest file either file surface admits. The count is taken at the
+    checkpoint's default lookahead, which the reference command serves.
     """
-    failures = max_model_len_failures(guide_text())
+    failures = serve_command_failures(guide_text())
     assert not failures, "\n".join(failures)
 
 
-_OVERRIDES = (
-    '{"supported_num_lookahead_tokens": [6, 13], "num_lookahead_tokens": 13}'
-)
-_SERVE = (
-    "```bash\n{env}vllm serve m --max-model-len {length} \\\n"
-    "    --hf-overrides '"
-    + _OVERRIDES.replace("{", "{{").replace("}", "}}")
-    + "'\n```\n"
-)
+# @spec ING-EP-078
+@pytest.mark.parametrize("lookahead", OFFERED_LOOKAHEADS)
+def test_guide_states_the_count_for_each_offered_lookahead(lookahead) -> None:
+    count = model_budget(decode_limit(guide_text()), lookahead)
+    assert states(
+        guide_text(), rf"\br\s*=\s*{lookahead}\b", rf"\b{count:,}\b"
+    ), f"the guide states that at r = {lookahead} a file needs {count:,}"
 
 
-_RAISED = "export VLLM_MAX_AUDIO_DECODE_DURATION_S=1200\n"
-_STATED = "Core's `VLLM_MAX_AUDIO_DECODE_DURATION_S` is raised to 1200 s."
+#: ING-EP-078's statements, each ``statement: patterns``.
+LOOKAHEAD_STATEMENTS = {
+    "the deployment needs a model plugin release whose open takes only the "
+    "locale and that uses the checkpoint's default lookahead": (
+        r"model plugin release",
+        r"\bopen\b",
+        r"only the locale",
+        r"checkpoint's (?:default )?lookahead",
+    ),
+    "a model plugin that requires num_lookahead_tokens fails startup": (
+        r"\brequires? num_lookahead_tokens",
+        r"fails startup",
+    ),
+    "a factory whose open requires a cadence raises on every open, so the "
+    "server starts and each stream ends with internal": (
+        r"\bopen\b",
+        r"requires? a cadence",
+        r"raises on every open",
+        r"server starts",
+        r"each stream ends with internal",
+    ),
+    "clients cannot choose a cadence per request": (
+        r"clients? cannot choose a cadence per request",
+    ),
+    "a deployment setting an override needs --max-model-len at least that "
+    "count": (
+        r"\boverride",
+        r"--max-model-len",
+        r"at least",
+    ),
+}
+
+LOOKAHEAD_IDS = [
+    "locale-only-release",
+    "required-lookahead-fails",
+    "cadence-open-internal",
+    "no-per-request-cadence",
+    "override-budget",
+]
 
 
 # @spec ING-EP-078
 @pytest.mark.parametrize(
-    "env, length, prose, expected",
+    "statement", list(LOOKAHEAD_STATEMENTS), ids=LOOKAHEAD_IDS
+)
+def test_guide_states_the_model_plugin_and_lookahead_requirements(
+    statement,
+) -> None:
+    found = states(guide_text(), *LOOKAHEAD_STATEMENTS[statement])
+    assert found, f"the guide states that {statement}"
+
+
+_SERVE = "```bash\n{env}vllm serve m --max-model-len {length}{extra}\n```\n"
+_OVERRIDE = " \\\n    --hf-overrides '{\"num_lookahead_tokens\": 6}'"
+_RAISED = "export VLLM_MAX_AUDIO_DECODE_DURATION_S=1200\n"
+_STATED = "Core's `VLLM_MAX_AUDIO_DECODE_DURATION_S` is raised to 1200 s."
+_DEFAULT = model_budget(DEFAULT_DECODE_LIMIT, DEFAULT_LOOKAHEAD)
+_RAISED_BUDGET = model_budget(1200, DEFAULT_LOOKAHEAD)
+
+
+# @spec ING-EP-078
+@pytest.mark.parametrize(
+    "env, length, extra, prose, expected",
     [
-        ("", 75_578, "", []),
-        ("", 75_577, "", ["600 s file"]),
-        (_RAISED, 151_154, _STATED, []),
-        (_RAISED, 76_800, _STATED, ["1200 s file"]),
-        (_RAISED, 151_154, "", ["without stating"]),
+        ("", 76_918, "", "", []),
+        ("", 76_917, "", "", ["600 s file"]),
+        (_RAISED, _RAISED_BUDGET, "", _STATED, []),
+        (_RAISED, _RAISED_BUDGET - 1, "", _STATED, ["1200 s file"]),
+        (_RAISED, _RAISED_BUDGET, "", "", ["without stating"]),
+        ("", 76_918, _OVERRIDE, "", ["sets num_lookahead_tokens"]),
     ],
     ids=[
         "default-fits",
@@ -304,16 +379,30 @@ _STATED = "Core's `VLLM_MAX_AUDIO_DECODE_DURATION_S` is raised to 1200 s."
         "raised-fits",
         "raised-short",
         "raised-unstated",
+        "sets-lookahead",
     ],
 )
-def test_max_model_len_check_follows_the_decode_limit(
-    env, length, prose, expected
+def test_serve_command_check_follows_the_decode_limit_and_lookahead(
+    env, length, extra, prose, expected
 ) -> None:
-    text = _SERVE.format(env=env, length=length) + "\n" + prose + "\n"
-    failures = max_model_len_failures(text)
+    assert _DEFAULT == 76_918
+    command = _SERVE.format(env=env, length=length, extra=extra)
+    text = command + "\n" + prose + "\n"
+    failures = serve_command_failures(text)
     assert len(failures) == len(expected), failures
     for needle in expected:
         assert any(needle in failure for failure in failures), failures
+
+
+# @spec ING-EP-078
+def test_only_the_reference_command_is_read_for_lookahead() -> None:
+    """Prose and later blocks may name the lookahead settings."""
+    text = (
+        _SERVE.format(env="", length=76_918, extra="")
+        + "\nSet `num_lookahead_tokens` to serve another cadence.\n\n"
+        + _SERVE.format(env="", length=76_918, extra=_OVERRIDE)
+    )
+    assert serve_command_failures(text) == []
 
 
 #: ING-EP-104's statements, each ``statement: patterns``.

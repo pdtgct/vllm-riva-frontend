@@ -1,7 +1,9 @@
 """Tests of the shared test support itself.
 
-They import only ``tests/support`` and core, never the frontend package, so
-they pass before the port and keep passing while it is rewritten.
+They import only ``tests/support``, core and ``vllm_riva_frontend_dev`` (the
+development distribution the support re-exports from), never the frontend
+package, so they pass before the port and keep passing while it is
+rewritten.
 """
 
 from __future__ import annotations
@@ -286,32 +288,28 @@ async def test_settle_runs_the_loop_until_it_is_idle():
 
 
 async def test_fake_factory_open_returns_a_recording_lease(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="en-US")
+    lease = await fake_factory.open(locale="en-US")
     assert fake_factory.leases == [lease]
     assert fake_factory.names() == ["open"]
-    assert fake_factory.calls[0].kwargs == {
-        "cadence": "560ms",
-        "locale": "en-US",
-    }
+    assert fake_factory.calls[0].kwargs == {"locale": "en-US"}
     assert lease.state == "open"
     assert lease.locale == "en-US"
 
 
-async def test_fake_factory_refuses_unserved_cadence_and_locale(fake_factory):
-    with pytest.raises(SeamError) as cadence:
-        await fake_factory.open(cadence="80ms", locale="en-US")
-    assert (cadence.value.session_error, cadence.value.reason) == (
-        "refused",
-        "cadence",
-    )
+async def test_fake_factory_takes_no_cadence_and_refuses_unknown_locale(
+    fake_factory,
+):
+    # ``open`` takes only the locale: a cadence argument is a TypeError.
+    with pytest.raises(TypeError):
+        await fake_factory.open(cadence="560ms", locale="en-US")
     with pytest.raises(SeamError) as locale:
-        await fake_factory.open(cadence="560ms", locale="xx-XX")
+        await fake_factory.open(locale="xx-XX")
     assert locale.value.reason == "locale"
     assert fake_factory.leases == []
 
 
 async def test_fake_lease_feed_credits_once_before_returning(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     credits: list[int] = []
     samples = np.zeros(1600, dtype=np.float32)
     assert await lease.feed(samples, on_accepted=credits.append) == []
@@ -326,7 +324,7 @@ async def test_fake_lease_feed_credits_once_before_returning(fake_factory):
 async def test_fake_lease_counts_outstanding_credit_and_can_defer_it(
     fake_factory,
 ):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     credits: list[int] = []
     await lease.feed(np.zeros(300, np.float32), on_accepted=credits.append)
     assert (lease.outstanding, lease.peak_outstanding) == (0, 300)
@@ -358,7 +356,7 @@ async def test_fake_lease_counts_outstanding_credit_and_can_defer_it(
 
     # A ``feed`` cancelled before its acknowledgement accepted nothing and
     # breaks the lease, as a cancelled ``feed`` breaks the model's.
-    other = await fake_factory.open(cadence="560ms", locale="auto")
+    other = await fake_factory.open(locale="auto")
     other.defer_acceptance = True
     pending = asyncio.ensure_future(
         other.feed(np.zeros(100, np.float32), on_accepted=credits.append)
@@ -377,7 +375,7 @@ async def test_fake_lease_counts_outstanding_credit_and_can_defer_it(
 async def test_fake_lease_after_hook_runs_when_the_call_succeeds(
     fake_factory,
 ):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     seen: list[str] = []
     lease.after("release", lambda: seen.append(lease.state))
     lease.script("abort", Raise(failed("state")))
@@ -390,7 +388,7 @@ async def test_fake_lease_after_hook_runs_when_the_call_succeeds(
 
 
 async def test_fake_lease_fed_samples_concatenates_every_feed(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     assert lease.fed_samples.dtype == np.float32
     assert lease.fed_samples.size == 0
     first = np.arange(3, dtype=np.float32)
@@ -401,7 +399,7 @@ async def test_fake_lease_fed_samples_concatenates_every_feed(fake_factory):
 
 
 async def test_fake_lease_block_parks_until_released(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     block = Block()
     lease.script("flush", block)
     task = asyncio.create_task(lease.flush())
@@ -413,7 +411,7 @@ async def test_fake_lease_block_parks_until_released(fake_factory):
 
 
 async def test_fake_lease_enforces_the_state_table(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     with pytest.raises(SeamError) as info:
         await lease.finish()
     assert (info.value.session_error, info.value.reason) == ("failed", "state")
@@ -438,7 +436,7 @@ async def test_fake_lease_enforces_the_state_table(fake_factory):
 async def test_fake_lease_failure_and_cancellation_break_the_lease(
     fake_factory,
 ):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     lease.script("feed", Raise(failed("expired")))
     with pytest.raises(SeamError):
         await lease.feed(np.zeros(1, np.float32), on_accepted=lambda n: None)
@@ -449,7 +447,7 @@ async def test_fake_lease_failure_and_cancellation_break_the_lease(
     await lease.abort()
     assert lease.state == "aborted"
 
-    other = await fake_factory.open(cadence="560ms", locale="auto")
+    other = await fake_factory.open(locale="auto")
     block = Block()
     other.script("flush", block)
     task = asyncio.create_task(other.flush())
@@ -461,7 +459,7 @@ async def test_fake_lease_failure_and_cancellation_break_the_lease(
 
 
 async def test_fake_lease_block_can_delay_its_cancellation(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     block = Block(delay_cancel=True)
     lease.script("feed", block)
     task = asyncio.create_task(
@@ -486,7 +484,7 @@ async def test_fake_lease_block_can_delay_its_cancellation(fake_factory):
     assert (lease.state, lease.failure_reason) == ("failed", "cancelled")
 
     # Never cancelled, it settles by ``then`` when released.
-    other = await fake_factory.open(cadence="560ms", locale="auto")
+    other = await fake_factory.open(locale="auto")
     late = Block(delay_cancel=True)
     other.script("flush", late)
     flushing = asyncio.create_task(other.flush())
@@ -497,7 +495,7 @@ async def test_fake_lease_block_can_delay_its_cancellation(fake_factory):
 
 
 async def test_fake_lease_rejects_overlapping_calls(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     block = Block()
     lease.script("feed", block)
     task = asyncio.create_task(
@@ -521,7 +519,7 @@ async def test_fake_factory_drain_returns_faults_once(fake_factory):
 
 
 async def test_fake_factory_teardown_all_is_terminal(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     parked = asyncio.create_task(asyncio.sleep(100))
     fake_factory.tasks.add(parked)
     assert fake_factory.teardown_all() == {parked, lease.generation}
@@ -531,7 +529,7 @@ async def test_fake_factory_teardown_all_is_terminal(fake_factory):
     with pytest.raises(asyncio.CancelledError):
         await lease.generation
     with pytest.raises(SeamError) as info:
-        await fake_factory.open(cadence="560ms", locale="auto")
+        await fake_factory.open(locale="auto")
     assert (info.value.session_error, info.value.reason) == (
         "failed",
         "cancelled",
@@ -543,7 +541,7 @@ async def test_fake_factory_teardown_all_is_terminal(fake_factory):
 
 
 async def test_fake_lease_cancelled_release_is_handed_over(fake_factory):
-    lease = await fake_factory.open(cadence="560ms", locale="auto")
+    lease = await fake_factory.open(locale="auto")
     await lease.abort()
     block = Block()
     lease.script("release", block)
@@ -558,7 +556,7 @@ async def test_fake_lease_cancelled_release_is_handed_over(fake_factory):
 
 async def test_fake_factory_drain_waits_for_cleanup_until_its_deadline(clock):
     factory = FakeSessionFactory(clock=clock)
-    lease = await factory.open(cadence="560ms", locale="auto")
+    lease = await factory.open(locale="auto")
     await lease.abort()
     cleanup = Block()
     factory.script("cleanup", cleanup)
@@ -585,7 +583,7 @@ async def test_fake_factory_drain_waits_for_cleanup_until_its_deadline(clock):
 
 async def _hand_over_with(factory, behaviour):
     """Open a lease, abort it and cancel its ``release`` after it began."""
-    lease = await factory.open(cadence="560ms", locale="auto")
+    lease = await factory.open(locale="auto")
     await lease.abort()
     factory.script("cleanup", behaviour)
     block = Block()
@@ -633,7 +631,7 @@ async def test_fake_factory_drain_returns_each_cleanup_fault_once(clock):
 
 async def test_fake_factory_teardown_all_cancels_running_cleanup():
     factory = FakeSessionFactory()
-    lease = await factory.open(cadence="560ms", locale="auto")
+    lease = await factory.open(locale="auto")
     await lease.abort()
     factory.script("cleanup", Block())
     block = Block()
@@ -1773,7 +1771,7 @@ def test_fake_transcription_keeps_the_served_models_sampling_settings():
 
 
 async def _open(factory: FakeSessionFactory):
-    return await factory.open(cadence="560ms", locale="auto")
+    return await factory.open(locale="auto")
 
 
 async def _cancel_release(lease, seam: FakeSeam) -> None:

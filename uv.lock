@@ -6,6 +6,12 @@ resolution-markers = [
     "python_full_version < '3.12'",
 ]
 
+[manifest]
+members = [
+    "vllm-riva-frontend",
+    "vllm-riva-frontend-dev",
+]
+
 [[package]]
 name = "anyio"
 version = "4.16.0"
@@ -1160,8 +1166,10 @@ dev = [
     { name = "pytest-cov" },
     { name = "pyyaml" },
     { name = "ruff" },
+    { name = "setuptools" },
     { name = "soundfile" },
     { name = "types-pyyaml" },
+    { name = "vllm-riva-frontend-dev" },
 ]
 
 [package.metadata]
@@ -1185,8 +1193,29 @@ dev = [
     { name = "pytest-cov", specifier = ">=7" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.15" },
+    { name = "setuptools", specifier = ">=68" },
     { name = "soundfile", specifier = ">=0.12" },
     { name = "types-pyyaml", specifier = ">=6" },
+    { name = "vllm-riva-frontend-dev", editable = "dev" },
+]
+
+[[package]]
+name = "vllm-riva-frontend-dev"
+source = { editable = "dev" }
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "vllm-riva-frontend" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=1.4" },
+    { name = "vllm-riva-frontend", editable = "." },
 ]
 
 [[package]]

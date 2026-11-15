@@ -6,8 +6,9 @@
 * ``engine``: CPU tests that need RFC 1 as well (the RFC 1 + RFC 2 build);
   only the stream-deadline pin (ING-EP-071) belongs here. Skipped when core's
   scheduler configuration lacks RFC 1's stream admission timeouts.
-* ``real_factory``: the seam conformance suite against the model plugin's
-  real factory. Skipped when the model plugin is not installed.
+* ``real_factory``: a test against the model plugin's factory. Skipped when
+  the model plugin is not installed. (The seam conformance suite runs
+  against the real factory in the model plugin's repository.)
 * ``gpu``: an installed engine on a CUDA device. Skipped without one.
 """
 
@@ -20,6 +21,9 @@ import threading
 from pathlib import Path
 
 import pytest
+
+# Before anything imports the suite, so its assertions are rewritten.
+pytest.register_assert_rewrite("vllm_riva_frontend_dev.seam_conformance")
 
 _TESTS = Path(__file__).parent
 sys.path.insert(0, str(_TESTS.parents[0] / "src"))
@@ -114,7 +118,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "real_factory: seam conformance against the model plugin's factory",
+        "real_factory: a test against the model plugin's factory",
     )
     config.addinivalue_line("markers", "gpu: needs an installed engine on CUDA")
 
@@ -152,10 +156,10 @@ def clock():
 
 @pytest.fixture
 async def fake_factory(clock):
-    """A ``FakeSessionFactory`` with the default cadences and locales.
+    """A ``FakeSessionFactory`` with the default locales.
 
-    It serves ``560ms`` and ``1120ms`` with locales ``en-US``, ``de-DE``
-    and ``auto`` (default ``auto``), on ``clock``, the plugin's clock, so its
+    It serves the locales ``en-US``, ``de-DE`` and ``auto`` (default
+    ``auto``), on ``clock``, the plugin's clock, so its
     ``drain(deadline)`` waits in the same time the plugin's deadlines use.
     It models generation, cleanup and holding tasks (``support.fake_session``);
     whatever is still running at the end of the test is cancelled.

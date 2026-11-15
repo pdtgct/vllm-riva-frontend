@@ -3,7 +3,9 @@
 These read ``pyproject.toml``, the README and the CI workflow, and the
 distributed modules under ``src/vllm_riva_frontend`` (static checks that read
 the syntax tree, never comments or strings), run the floor gate on the lowest
-supported interpreter, and import the package for the declaration.
+supported interpreter over the modules of both distributions (the frontend's
+and ``dev/src/vllm_riva_frontend_dev``), and import the package for the
+declaration.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import collections
 import importlib
 import inspect
 import json
+import os
 import re
 import shlex
 import shutil
@@ -28,6 +31,14 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_ROOT = PROJECT_ROOT / "src" / "vllm_riva_frontend"
+#: The development distribution's import package (ING-CORE-036).
+DEV_PROJECT = PROJECT_ROOT / "dev"
+DEV_PACKAGE_ROOT = DEV_PROJECT / "src" / "vllm_riva_frontend_dev"
+#: The import packages whose every module the floor gate covers.
+FLOOR_PACKAGES = (PACKAGE_ROOT, DEV_PACKAGE_ROOT)
+#: Set to ``1`` in the CI lane of the lowest supported version: a missing
+#: prerequisite of the floor gate then fails instead of skipping.
+FLOOR_GATE_REQUIRED = "RIVA_FRONTEND_FLOOR_GATE_REQUIRED"
 README = PROJECT_ROOT / "README.md"
 WORKFLOWS = PROJECT_ROOT / ".github" / "workflows"
 
@@ -59,15 +70,50 @@ def _project() -> dict[str, Any]:
 
 
 def _modules() -> list[Path]:
-    return sorted(PACKAGE_ROOT.glob("*.py"))
+    """Every module of the frontend's import package, recursively."""
+    return sorted(PACKAGE_ROOT.rglob("*.py"))
 
 
 def _sources() -> dict[str, str]:
-    return {path.name: path.read_text(encoding="utf-8") for path in _modules()}
+    """The frontend's modules, keyed by path relative to the package."""
+    return {
+        path.relative_to(PACKAGE_ROOT).as_posix(): path.read_text(
+            encoding="utf-8"
+        )
+        for path in _modules()
+    }
 
 
 def _trees() -> dict[str, ast.Module]:
     return {name: ast.parse(text) for name, text in _sources().items()}
+
+
+def _floor_modules() -> list[Path]:
+    """Every module of both distributions' import packages, recursively."""
+    return sorted(
+        path for package in FLOOR_PACKAGES for path in package.rglob("*.py")
+    )
+
+
+def _floor_trees() -> dict[str, ast.Module]:
+    """Both distributions' modules, keyed by path relative to the project.
+
+    A relative path keeps the two ``__init__.py`` apart.
+    """
+    return {
+        path.relative_to(PROJECT_ROOT).as_posix(): ast.parse(
+            path.read_text(encoding="utf-8")
+        )
+        for path in _floor_modules()
+    }
+
+
+def _source_root(path: Path) -> Path:
+    """The directory on ``sys.path`` that ``path``'s package is under."""
+    for package in FLOOR_PACKAGES:
+        if path.is_relative_to(package):
+            return package.parent
+    raise AssertionError(f"{path} is in no distributed package")
 
 
 def _requirement_name(requirement: str) -> str:
@@ -77,9 +123,11 @@ def _requirement_name(requirement: str) -> str:
 
 
 def _module_name(path: Path) -> str:
-    if path.stem == "__init__":
-        return "vllm_riva_frontend"
-    return f"vllm_riva_frontend.{path.stem}"
+    """The dotted name ``path`` imports as, from its source root."""
+    parts = list(path.relative_to(_source_root(path)).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
 
 
 # ----------------------------------------------------------- declaration
@@ -223,7 +271,7 @@ def test_declared_range_matches_the_pinned_core_tree() -> None:
 # @spec ING-VEH-027
 def test_every_module_parses_at_the_lowest_supported_version() -> None:
     offenders: list[str] = []
-    for module in _modules():
+    for module in _floor_modules():
         try:
             ast.parse(
                 module.read_text(encoding="utf-8"),
@@ -231,7 +279,8 @@ def test_every_module_parses_at_the_lowest_supported_version() -> None:
                 feature_version=LOWEST_SUPPORTED,
             )
         except SyntaxError as error:
-            offenders.append(f"{module.name}:{error.lineno}: {error.msg}")
+            relative = module.relative_to(PROJECT_ROOT).as_posix()
+            offenders.append(f"{relative}:{error.lineno}: {error.msg}")
     assert not offenders, "\n".join(offenders)
 
 
@@ -377,7 +426,7 @@ def _above_floor(name: str, tree: ast.Module) -> list[str]:
 def test_no_module_uses_a_name_introduced_above_the_floor() -> None:
     offenders = [
         offender
-        for name, tree in _trees().items()
+        for name, tree in _floor_trees().items()
         for offender in _above_floor(name, tree)
     ]
     assert not offenders, "\n".join(offenders)
@@ -510,24 +559,65 @@ sys.exit(1 if failures else 0)
 HOST_DISTRIBUTION = "vllm"
 
 
+def _host_source_roots() -> list[str]:
+    """Directories on this run's ``PYTHONPATH`` that hold a vLLM source tree.
+
+    CI provides the host as a checkout on ``PYTHONPATH`` rather than an
+    installed distribution; the gate then imports the host from that tree.
+    Only the host is taken from ``PYTHONPATH``: every declared dependency
+    must still be installed for the floor interpreter.
+    """
+    roots = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    return [
+        str(Path(root).resolve())
+        for root in roots
+        if root and (Path(root) / HOST_DISTRIBUTION / "__init__.py").is_file()
+    ]
+
+
 def _floor_distributions() -> list[str]:
     """The distributions an import on the floor needs installed.
 
-    The declared runtime dependencies whose markers hold on the floor, and
-    the host.
+    The declared runtime dependencies of both distributions whose markers
+    hold on the floor, and the host. The development distribution's pin on
+    the frontend is met by the workspace's editable install of it.
     """
     from packaging.requirements import Requirement
 
     floor = ".".join(str(part) for part in LOWEST_SUPPORTED)
     environment = {"python_version": floor, "python_full_version": floor + ".0"}
+    declared = [
+        *_project()["project"]["dependencies"],
+        *_dev_project()["project"]["dependencies"],
+    ]
     needed: list[str] = []
-    for item in _project()["project"]["dependencies"]:
+    for item in declared:
         requirement = Requirement(item)
+        if requirement.name in needed:
+            continue
         if requirement.marker is None or requirement.marker.evaluate(
             environment
         ):
             needed.append(requirement.name)
-    return [*needed, HOST_DISTRIBUTION]
+    host = [] if _host_source_roots() else [HOST_DISTRIBUTION]
+    return [*needed, *host]
+
+
+def _dev_project() -> dict[str, Any]:
+    with (DEV_PROJECT / "pyproject.toml").open("rb") as stream:
+        return tomllib.load(stream)
+
+
+def _floor_prerequisite_missing(reason: str) -> None:
+    """Skip the floor gate for ``reason``, or fail where it is required.
+
+    In the CI lane of the lowest supported version
+    (``RIVA_FRONTEND_FLOOR_GATE_REQUIRED=1``) a missing prerequisite fails
+    the lane; elsewhere it skips, and the skip is reported.
+    """
+    if os.environ.get(FLOOR_GATE_REQUIRED) == "1":
+        pytest.fail(f"{reason} ({FLOOR_GATE_REQUIRED}=1)", pytrace=False)
+    pytest.skip(reason)
 
 
 def _floor_interpreter() -> str:
@@ -541,10 +631,11 @@ def _floor_interpreter() -> str:
         return sys.executable
     found = shutil.which(f"python{floor}")
     if found is None:
-        pytest.skip(
+        _floor_prerequisite_missing(
             f"no Python {floor} interpreter found (python{floor} on PATH): "
             "the floor gate of ING-VEH-027 did not run"
         )
+        raise AssertionError("unreachable")  # pragma: no cover
     reported = subprocess.run(
         [found, "-I", "-c", "import sys; print(list(sys.version_info[:2]))"],
         capture_output=True,
@@ -579,7 +670,7 @@ def test_floor_gate_compiles_every_module_and_reports_all_offenders() -> None:
     status is read directly, with no pipeline.
     """
     interpreter = _floor_interpreter()
-    modules = [str(path) for path in _modules()]
+    modules = [str(path) for path in _floor_modules()]
     assert modules, "no distributed modules found"
     status, offenders = _gate(interpreter, COMPILE_GATE, *modules)
     assert status == (1 if offenders else 0), (status, offenders)
@@ -602,15 +693,17 @@ def test_floor_gate_imports_every_module_and_reports_all_failures() -> None:
     status, missing = _gate(interpreter, PREFLIGHT, *_floor_distributions())
     assert status == (1 if missing else 0), (status, missing)
     if missing:
-        pytest.skip(
+        _floor_prerequisite_missing(
             f"the floor interpreter {interpreter} lacks {', '.join(missing)}; "
             "the import half of the floor gate needs the declared runtime "
             "dependencies and the host installed for that interpreter"
         )
-    names = [_module_name(path) for path in _modules()]
-    status, failures = _gate(
-        interpreter, IMPORT_GATE, str(PACKAGE_ROOT.parent), *names
+    names = [_module_name(path) for path in _floor_modules()]
+    roots = os.pathsep.join(
+        [str(package.parent) for package in FLOOR_PACKAGES]
+        + _host_source_roots()
     )
+    status, failures = _gate(interpreter, IMPORT_GATE, roots, *names)
     assert status == (1 if failures else 0), (status, failures)
     assert not failures, "\n".join(failures)
 
@@ -638,8 +731,129 @@ def test_the_import_gate_fails_on_a_missing_module_it_was_not_promised(
     status, missing = _gate(sys.executable, PREFLIGHT, "no-such-dist-xyz")
     assert (status, missing) == (1, ["no-such-dist-xyz"])
     assert _gate(sys.executable, PREFLIGHT) == (0, [])
-    assert HOST_DISTRIBUTION in _floor_distributions()
+    assert (HOST_DISTRIBUTION in _floor_distributions()) != bool(
+        _host_source_roots()
+    )
     assert "numpy" in _floor_distributions()
+
+
+# @spec ING-VEH-027
+def test_the_floor_gate_covers_every_module_of_both_distributions() -> None:
+    """Both packages, recursively, keyed apart, under their dotted names."""
+    modules = _floor_modules()
+    for package in FLOOR_PACKAGES:
+        found = {p for p in modules if p.is_relative_to(package)}
+        assert found == set(package.rglob("*.py")), package
+        assert package / "__init__.py" in found, package
+    keys = list(_floor_trees())
+    assert len(keys) == len(modules) == len(set(keys))
+    assert "src/vllm_riva_frontend/__init__.py" in keys
+    assert "dev/src/vllm_riva_frontend_dev/__init__.py" in keys
+    names = [_module_name(path) for path in modules]
+    assert len(set(names)) == len(names)
+    assert {
+        "vllm_riva_frontend",
+        "vllm_riva_frontend.lifecycle",
+        "vllm_riva_frontend_dev",
+        "vllm_riva_frontend_dev.seam_conformance",
+    } <= set(names)
+    assert _module_name(PACKAGE_ROOT / "sub" / "mod.py") == (
+        "vllm_riva_frontend.sub.mod"
+    )
+    assert _module_name(DEV_PACKAGE_ROOT / "sub" / "__init__.py") == (
+        "vllm_riva_frontend_dev.sub"
+    )
+
+
+# @spec ING-VEH-027
+def test_the_floor_preflight_needs_both_distributions_dependencies(
+    monkeypatch, tmp_path
+) -> None:
+    needed = set(_floor_distributions())
+    assert {"pytest", "pytest-asyncio", "numpy", "vllm-riva-frontend"} <= needed
+    assert len(needed) == len(_floor_distributions()), "each named once"
+    # The host is a distribution to find unless a vLLM source tree is on
+    # PYTHONPATH, which the import gate then puts on its path.
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    assert HOST_DISTRIBUTION in _floor_distributions()
+    (tmp_path / HOST_DISTRIBUTION).mkdir()
+    (tmp_path / HOST_DISTRIBUTION / "__init__.py").write_text("")
+    assert _host_source_roots() == [str(tmp_path.resolve())]
+    assert HOST_DISTRIBUTION not in _floor_distributions()
+
+
+# @spec ING-VEH-027
+def test_a_missing_floor_prerequisite_fails_where_the_gate_is_required(
+    monkeypatch,
+) -> None:
+    """``RIVA_FRONTEND_FLOOR_GATE_REQUIRED=1`` turns the skip into a failure."""
+    monkeypatch.delenv(FLOOR_GATE_REQUIRED, raising=False)
+    with pytest.raises(pytest.skip.Exception, match="lacks vllm"):
+        _floor_prerequisite_missing("lacks vllm")
+    monkeypatch.setenv(FLOOR_GATE_REQUIRED, "0")
+    with pytest.raises(pytest.skip.Exception):
+        _floor_prerequisite_missing("lacks vllm")
+    monkeypatch.setenv(FLOOR_GATE_REQUIRED, "1")
+    with pytest.raises(pytest.fail.Exception, match="lacks vllm"):
+        _floor_prerequisite_missing("lacks vllm")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(sys, "version_info", (3, 99, 0))
+    with pytest.raises(pytest.fail.Exception, match="interpreter found"):
+        _floor_interpreter()
+
+
+# @spec ING-VEH-027
+def test_the_floor_lane_requires_the_floor_gate() -> None:
+    """The CI lane of the lowest supported version sets the switch."""
+    import yaml
+
+    floor = ".".join(str(part) for part in LOWEST_SUPPORTED)
+    required: list[str] = []
+    unset: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for name, job in (document.get("jobs") or {}).items():
+            if floor not in _job_test_versions(job):
+                continue
+            for step in job.get("steps") or []:
+                env = {**(job.get("env") or {}), **(step.get("env") or {})}
+                run = step.get("run")
+                if not (
+                    isinstance(run, str)
+                    and any(_runs_tests(w) for w in _shell_commands(run))
+                    and _holds(step.get("if"), floor)
+                ):
+                    continue
+                if str(env.get(FLOOR_GATE_REQUIRED)) == "1":
+                    required.append(name)
+                else:
+                    unset.append(f"{name}: {step.get('name', run)}")
+    assert required, f"no {floor} test step sets {FLOOR_GATE_REQUIRED}"
+    assert not unset, (
+        f"{floor} test steps without {FLOOR_GATE_REQUIRED}: {unset}"
+    )
+
+
+# @spec ING-CORE-036
+def test_a_ci_job_runs_the_full_wheel_check() -> None:
+    """Some job builds the wheels and runs the full check, not metadata only."""
+    import yaml
+
+    found: list[str] = []
+    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for name, job in (document.get("jobs") or {}).items():
+            runs = [
+                step.get("run")
+                for step in job.get("steps") or []
+                if isinstance(step.get("run"), str)
+            ]
+            if any(
+                "check_dev_wheels.py" in run and "--metadata-only" not in run
+                for run in runs
+            ) and any("build" in run for run in runs):
+                found.append(name)
+    assert found, "no CI job builds both wheels and runs check_dev_wheels.py"
 
 
 # @spec ING-VEH-027
@@ -647,7 +861,7 @@ def test_every_distributed_module_imports_and_all_failures_are_reported() -> (
     None
 ):
     failures: list[str] = []
-    for module in _modules():
+    for module in _floor_modules():
         name = _module_name(module)
         try:
             importlib.import_module(name)
