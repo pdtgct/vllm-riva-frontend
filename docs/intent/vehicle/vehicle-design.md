@@ -490,8 +490,9 @@ does not read it. The operational readiness route reports it alone (operations l
 `D = deadline - engine_reserve`, where `engine_reserve = max(5 s, 10% of timeout)`. The target is
 meant to leave core time to shut the engine down, and settlement (below) takes precedence over the
 target. Core reserves engine time of its own through `--endpoint-plugin-drain-timeout`, which gives
-the drains a part of `--shutdown-timeout` (half by default) and leaves the rest to engine shutdown,
-so `engine_reserve` is an additional margin inside the drain budget. Every wait of
+the drains a part of `--shutdown-timeout` (half by default) and leaves engine shutdown what remains
+of `--shutdown-timeout` once the drains have settled, so `engine_reserve` is an additional margin
+inside the drain budget. Every wait of
 graceful work inside `drain`, including each lease call's bound and the factory wait, is at most the
 time remaining to `D`: its own bound clipped to `D`, never enlarged. The one exception is a stream
 cleanup that begins during graceful drain, which takes the time remaining to `D` in place of
@@ -859,7 +860,10 @@ The repository's deployment guide, `docs/deployment.md`, sets:
   latter, or half of `--shutdown-timeout` when it is omitted) is at most `--shutdown-timeout` and
   its graceful-work target `T - engine_reserve(T)` is above the engine's `draining_timeout` (40 s
   by default); the documented values are 60 s and 50 s, which put `D` 45 s after the drain begins
-  and leave engine shutdown at least 10 s;
+  and nominally leave engine shutdown 10 s. That allocation holds when the drains settle by their
+  deadline: core cancels a drain still running at its deadline and then awaits its settlement with
+  no limit, and engine shutdown gets `max(0, --shutdown-timeout - elapsed)`, so a settlement that
+  ends at 55 s leaves it 5 s and one that ends after 60 s leaves it none;
 - the model plugin's own serve flags (HLD Constraints). The reference deployment sets no
   lookahead, so the model plugin serves the default lookahead that the checkpoint's model
   configuration sets (3, or 320 ms, for the reference checkpoint), and the Riva streaming surfaces,
@@ -910,8 +914,10 @@ The guide also sets:
   handshake.
 - **Kill grace.** The orchestrator's grace period before it kills the process (for Kubernetes,
   `terminationGracePeriodSeconds`) is above the sum of `--shutdown-timeout` and
-  `--endpoint-plugin-stop-timeout`, so a kill does not cut short the drain, the engine's shutdown or
-  `stop`.
+  `--endpoint-plugin-stop-timeout`, the length of the nominal shutdown: the drains and engine
+  shutdown within `--shutdown-timeout`, then `stop` within its limit. A drain settlement that runs
+  past its deadline lengthens the shutdown by its overrun, so a kill at the grace period can still
+  cut the settlement, the engine's shutdown or `stop` short.
 - **Stop limit at a zero drain budget.** With `--shutdown-timeout` 0 or
   `--endpoint-plugin-drain-timeout` 0, `stop` runs the whole settlement on a stopped engine and can
   need up to `session_cleanup_timeout` (30 s by default) plus the factory settlement. A deployment

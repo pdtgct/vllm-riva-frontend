@@ -486,9 +486,8 @@ OPERATION_STATEMENTS = {
     "the kill grace (terminationGracePeriodSeconds) is above the sum of "
     "--shutdown-timeout and --endpoint-plugin-stop-timeout": (
         r"terminationGracePeriodSeconds",
-        r"--shutdown-timeout",
-        r"--endpoint-plugin-stop-timeout",
-        r"\bsum\b|\bplus\b",
+        r"\b(?:above|exceeds|more than)\s+the\s+sum\s+of\s+"
+        r"--shutdown-timeout\s+and\s+--endpoint-plugin-stop-timeout\b",
     ),
     "at a zero drain budget stop runs the whole settlement on a stopped "
     "engine and can need up to session_cleanup_timeout plus the factory "
@@ -523,6 +522,39 @@ OPERATION_IDS = [
     "zero-budget-bound",
     "rust-frontend",
 ]
+
+
+#: Statements that reverse the comparison ING-EP-105 requires; the check
+#: must reject each of them.
+REVERSED_OPERATION_STATEMENTS = {
+    "kill-grace": (
+        "The kill grace (for Kubernetes, `terminationGracePeriodSeconds`) is "
+        "below the sum of `--shutdown-timeout` and "
+        "`--endpoint-plugin-stop-timeout`."
+    ),
+    "zero-budget-bound": (
+        "At a zero drain budget core calls no `drain`, so `stop` runs the "
+        "whole settlement on a stopped engine and can need up to "
+        "`session_cleanup_timeout` plus the factory settlement. A deployment "
+        "with a zero drain budget sets `--endpoint-plugin-stop-timeout` below "
+        "`session_cleanup_timeout`. Otherwise core cancels `stop` at the "
+        "limit, and owner cleanup may be cut short."
+    ),
+}
+
+
+# @spec ING-EP-105
+@pytest.mark.parametrize("statement_id", list(REVERSED_OPERATION_STATEMENTS))
+def test_operation_checks_reject_the_reversed_comparison(statement_id) -> None:
+    statement = list(OPERATION_STATEMENTS)[OPERATION_IDS.index(statement_id)]
+    reversed_text = REVERSED_OPERATION_STATEMENTS[statement_id]
+    assert not states(reversed_text, *OPERATION_STATEMENTS[statement]), (
+        f"the check for {statement_id} accepts: {reversed_text}"
+    )
+    upright = re.sub(r"\bbelow\b", "above", reversed_text)
+    assert states(upright, *OPERATION_STATEMENTS[statement]), (
+        f"the check for {statement_id} rejects: {upright}"
+    )
 
 
 # @spec ING-EP-104

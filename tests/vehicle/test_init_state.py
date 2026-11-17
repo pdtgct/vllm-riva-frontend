@@ -780,6 +780,32 @@ async def test_zero_drain_timeout_logs_that_no_drain_will_run(
 
 
 # @spec ING-EP-027
+async def test_both_zero_logs_one_warning_naming_the_shutdown_timeout(
+    clock, fake_factory, helpers, caplog
+) -> None:
+    from support.state import make_args
+
+    plugin = helpers.make_frontend(
+        clock, factories={"nemotron": fake_factory.constructor}
+    )
+    engine = helpers.engine_with(shutdown_timeout=0.0)
+    app = helpers.build(
+        plugin, args=make_args(endpoint_plugin_drain_timeout=0)
+    )
+    state = helpers.prepare_state(app, engine)
+    with caplog.at_level(logging.WARNING):
+        await helpers.run_init(app, engine, state)
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "drain" in r.getMessage()
+    ]
+    assert len(warnings) == 1, warnings
+    assert "--shutdown-timeout is 0" in warnings[0]
+    assert "--endpoint-plugin-drain-timeout" not in warnings[0]
+
+
+# @spec ING-EP-027
 async def test_a_positive_drain_timeout_logs_no_drain_warning(
     clock, fake_factory, helpers, caplog
 ) -> None:

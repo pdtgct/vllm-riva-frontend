@@ -62,13 +62,19 @@ the flag.
 
 **Shutdown.** Core splits `--shutdown-timeout` between the plugins' drains and engine shutdown:
 `--endpoint-plugin-drain-timeout` is the drain budget `T` (half of `--shutdown-timeout` when
-omitted, and at most `--shutdown-timeout`), and engine shutdown gets the rest. The frontend
+omitted, and at most `--shutdown-timeout`), and engine shutdown gets what remains of
+`--shutdown-timeout` once the drains have settled. The frontend
 finalizes open streams, settles files and stops the gRPC listener by its drain deadline,
 `T - max(5 s, T / 10)` after the signal, and leaves the remainder of `T` to core as a margin. The
 drain deadline must exceed the engine's `draining_timeout`. The documented values,
 `--shutdown-timeout 60` and `--endpoint-plugin-drain-timeout 50`, put the drain deadline at 45 s,
-5 s past the default `draining_timeout` of 40 s, and leave engine shutdown at least 10 s; with the
-default drain budget of 30 s the drain deadline would be 25 s, below `draining_timeout`. A zero
+5 s past the default `draining_timeout` of 40 s, and nominally leave engine shutdown 10 s; with the
+default drain budget of 30 s the drain deadline would be 25 s, below `draining_timeout`. The
+nominal allocation holds when the drains settle by their 50 s deadline. Core cancels a drain still
+running at that deadline and then waits for its settlement with no limit; the frontend's
+settlement awaits every owner and the session factory before `drain` returns. Engine shutdown then
+gets `max(0, 60 s - elapsed)`: a settlement that ends at 55 s leaves it 5 s, and one that ends
+after 60 s leaves it none. A zero
 `--shutdown-timeout` means no drain runs, and the frontend logs a warning at startup. The drain
 ends once no stream or file remains, so an idle server may close its gRPC listener soon after
 `SIGTERM`, before health checkers observe `NOT_SERVING`; an open health `Watch` or reflection stream
@@ -89,15 +95,19 @@ that process (exec form); a shell wrapper that runs it without `exec` may not fo
 Both platforms force-kill after a grace period (by default 30 s for Kubernetes'
 `terminationGracePeriodSeconds` and 10 s for `docker stop --time`), which is below the shutdown
 timeout above. Set the grace period above the sum of `--shutdown-timeout` and
-`--endpoint-plugin-stop-timeout`, with room for process exit and any pre-stop hook, or the drain
-is killed.
+`--endpoint-plugin-stop-timeout`, with room for process exit and any pre-stop hook, or a kill cuts
+the nominal shutdown short. A drain settlement that runs past its deadline delays engine shutdown
+and `stop` by its overrun, and a kill at the grace period can then still cut them short.
 
 ## Operations
 
 - The kill grace (for Kubernetes, `terminationGracePeriodSeconds`) is above the sum of
-  `--shutdown-timeout` and `--endpoint-plugin-stop-timeout` (5 s by default), so a kill does not
-  cut short the drain, the engine's shutdown or the plugin's `stop`. Core starts the stop limit
-  when the drains and engine shutdown have ended.
+  `--shutdown-timeout` and `--endpoint-plugin-stop-timeout` (5 s by default), the length of the
+  nominal shutdown: the drains and engine shutdown within `--shutdown-timeout`, then the plugin's
+  `stop` within the stop limit, which core starts when the drains and engine shutdown have ended.
+  A drain settlement that runs past its deadline (Shutdown, above) lengthens the shutdown by its
+  overrun, so a kill at the grace period can still cut the settlement, the engine's shutdown or
+  `stop` short.
 - At a zero drain budget (core's default `--shutdown-timeout 0`, or
   `--endpoint-plugin-drain-timeout 0`) core calls no `drain` and stops the engine before it calls
   `stop`, so `stop` runs the whole settlement on a stopped engine and can need up to
