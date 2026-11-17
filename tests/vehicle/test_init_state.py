@@ -731,6 +731,77 @@ async def test_the_args_namespace_is_not_the_shutdown_timeout_source(
 
 
 # @spec ING-EP-027
+async def test_zero_shutdown_timeout_warning_names_the_shutdown_timeout(
+    clock, fake_factory, helpers, caplog
+) -> None:
+    plugin = helpers.make_frontend(
+        clock, factories={"nemotron": fake_factory.constructor}
+    )
+    engine = helpers.engine_with(shutdown_timeout=0.0)
+    app = helpers.build(plugin)
+    state = helpers.prepare_state(app, engine)
+    with caplog.at_level(logging.WARNING):
+        await helpers.run_init(app, engine, state)
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert any("--shutdown-timeout is 0" in m for m in warnings), warnings
+    assert not any("--endpoint-plugin-drain-timeout" in m for m in warnings)
+
+
+# @spec ING-EP-027
+async def test_zero_drain_timeout_logs_that_no_drain_will_run(
+    clock, fake_factory, helpers, caplog
+) -> None:
+    # Core's launcher reads ``--endpoint-plugin-drain-timeout`` from
+    # ``app.state.args``; 0 gives the drains no budget, so no ``drain`` runs
+    # although ``--shutdown-timeout`` is 60.
+    from support.state import make_args
+
+    plugin = helpers.make_frontend(
+        clock, factories={"nemotron": fake_factory.constructor}
+    )
+    engine = helpers.engine_with()  # vllm_config.shutdown_timeout = 60
+    app = helpers.build(
+        plugin, args=make_args(endpoint_plugin_drain_timeout=0)
+    )
+    state = helpers.prepare_state(app, engine)
+    with caplog.at_level(logging.WARNING):
+        await helpers.run_init(app, engine, state)
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
+    assert any(
+        "--endpoint-plugin-drain-timeout is 0" in m
+        and "drain" in m
+        and "stop" in m
+        for m in warnings
+    ), warnings
+
+
+# @spec ING-EP-027
+async def test_a_positive_drain_timeout_logs_no_drain_warning(
+    clock, fake_factory, helpers, caplog
+) -> None:
+    from support.state import make_args
+
+    plugin = helpers.make_frontend(
+        clock, factories={"nemotron": fake_factory.constructor}
+    )
+    engine = helpers.engine_with()
+    app = helpers.build(
+        plugin, args=make_args(endpoint_plugin_drain_timeout=50)
+    )
+    state = helpers.prepare_state(app, engine)
+    with caplog.at_level(logging.WARNING):
+        await helpers.run_init(app, engine, state)
+    assert not any(
+        "drain" in r.getMessage().lower() and r.levelno >= logging.WARNING
+        for r in caplog.records
+    )
+
+
+# @spec ING-EP-027
 async def test_nonzero_shutdown_timeout_logs_no_drain_warning(
     initialized, caplog
 ) -> None:

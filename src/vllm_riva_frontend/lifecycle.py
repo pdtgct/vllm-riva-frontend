@@ -928,11 +928,25 @@ class RivaFrontendPlugin:
 
         await self._discover_factory(engine_client, config)
 
+        # Core's launcher reads --shutdown-timeout from vllm_config and
+        # --endpoint-plugin-drain-timeout from app.state.args; an unset drain
+        # timeout is half of --shutdown-timeout. The warning names the
+        # setting that is 0, since the two have different remedies.
+        drain_timeout = getattr(
+            getattr(state, "args", None), "endpoint_plugin_drain_timeout", None
+        )
         if getattr(vllm_config, "shutdown_timeout", None) == 0:
+            zero_setting = "--shutdown-timeout"
+        elif drain_timeout == 0:
+            zero_setting = "--endpoint-plugin-drain-timeout"
+        else:
+            zero_setting = None
+        if zero_setting is not None:
             logger.warning(
-                "%s: --shutdown-timeout is 0, so no drain will run; "
+                "%s: %s is 0, so no drain will run; "
                 "shutdown is stop alone, which settles open streams",
                 PLUGIN_KEY,
+                zero_setting,
             )
 
     # @spec ING-FILE-006, ING-FILE-009, ING-FILE-015, ING-FILE-016

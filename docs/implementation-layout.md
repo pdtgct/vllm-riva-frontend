@@ -349,10 +349,11 @@ entry names its ground: a design section, a spec, a core file or the public clie
   `drain_deadline`. Ground: vehicle design, the lifecycle table (`attach_router` runs in
   `build_app`, before `init_state`).
 - `--shutdown-timeout` is read from `engine_client.vllm_config.shutdown_timeout`, the value core's
-  launcher reads (`vllm/entrypoints/launchers/launcher.py:331`) before it passes the deadline
-  `time.monotonic() + shutdown_timeout` to `drain_endpoint_plugins` (`launcher.py:332-334`), which
-  hands each plugin's `drain` the seconds left to that deadline
-  (`vllm/plugins/endpoint_plugins/interface.py:279-293`). Ground: ING-EP-027.
+  launcher reads (`vllm/entrypoints/launchers/launcher.py:305`) before it passes a drain deadline,
+  `--endpoint-plugin-drain-timeout` seconds after the shutdown begins (half of `--shutdown-timeout`
+  when that option is unset), to `drain_endpoint_plugins` (`launcher.py:308-316`), which hands each
+  plugin's `drain` the seconds left to that deadline
+  (`vllm/plugins/endpoint_plugins/interface.py:335-346`). Ground: ING-EP-027.
 - `init_state` reads the served model's generation settings (ING-FILE-054) from
   `state.openai_serving_transcription.default_sampling_params`, the mapping core's serving builds
   from `model_config.get_diff_sampling_param()` (`vllm/entrypoints/speech_to_text/base/serving.py:114`).

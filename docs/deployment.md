@@ -23,6 +23,7 @@ vllm serve nvidia/nemotron-3.5-asr-streaming-0.6b \
     --tokenizer-mode nemotron_asr_streaming \
     --max-model-len 77000 \
     --shutdown-timeout 60 \
+    --endpoint-plugin-drain-timeout 50 \
     --additional-config '{"riva_frontend": {"grpc_bind": "0.0.0.0:50051", "deployment_image": "registry.example/riva-frontend:0.4.0b3", "pin": "unspecified"}}'
 ```
 
@@ -54,17 +55,25 @@ draining past its deadlines, which core's `--stream-admission-timeouts` flag set
 `never_fed_timeout` 15 s, `parked_idle_timeout` 60 s, `draining_timeout` 40 s). The frontend reads
 the same setting at startup; its own bounds must stay below these deadlines, and startup fails
 otherwise. When these defaults change, add the flag to the command above with only the keys that
-change, for example `--stream-admission-timeouts '{"never_fed_timeout": 30}'`, and keep
-`--shutdown-timeout` above `draining_timeout`. The deadlines are not part of the additional
-configuration: a `stream_admission` object there stops startup with an error naming the flag.
+change, for example `--stream-admission-timeouts '{"never_fed_timeout": 30}'`, and keep the
+frontend's drain deadline (Shutdown, below) above `draining_timeout`. The deadlines are not part of
+the additional configuration: a `stream_admission` object there stops startup with an error naming
+the flag.
 
-**Shutdown.** The shutdown timeout is the frontend's whole drain budget: open streams are finalized,
-files settle and the gRPC listener stops before the engine shuts down, with time kept for core. It
-must exceed the engine's `draining_timeout`; 60 s is the documented value. A zero timeout means no
-drain runs, and the frontend logs a warning at startup. The drain ends once no stream or file
-remains, so an idle server may close its gRPC listener soon after `SIGTERM`, before health checkers
-observe `NOT_SERVING`; an open health `Watch` or reflection stream then ends with `UNAVAILABLE`, and
-a reply already being sent may complete until the drain deadline, at which any unfinished call ends.
+**Shutdown.** Core splits `--shutdown-timeout` between the plugins' drains and engine shutdown:
+`--endpoint-plugin-drain-timeout` is the drain budget `T` (half of `--shutdown-timeout` when
+omitted, and at most `--shutdown-timeout`), and engine shutdown gets the rest. The frontend
+finalizes open streams, settles files and stops the gRPC listener by its drain deadline,
+`T - max(5 s, T / 10)` after the signal, and leaves the remainder of `T` to core as a margin. The
+drain deadline must exceed the engine's `draining_timeout`. The documented values,
+`--shutdown-timeout 60` and `--endpoint-plugin-drain-timeout 50`, put the drain deadline at 45 s,
+5 s past the default `draining_timeout` of 40 s, and leave engine shutdown at least 10 s; with the
+default drain budget of 30 s the drain deadline would be 25 s, below `draining_timeout`. A zero
+`--shutdown-timeout` means no drain runs, and the frontend logs a warning at startup. The drain
+ends once no stream or file remains, so an idle server may close its gRPC listener soon after
+`SIGTERM`, before health checkers observe `NOT_SERVING`; an open health `Watch` or reflection stream
+then ends with `UNAVAILABLE`, and a reply already being sent may complete until the drain deadline,
+at which any unfinished call ends.
 A client that has opened a call but not yet sent its request message (a `Recognize`, configuration
 or health call) can hold the listener stop until the drain deadline, never past it. A deployment
 whose load balancers must stop routing to the server first adds a pre-stop delay before the signal
@@ -79,17 +88,23 @@ Kubernetes and `docker stop` signal only the container's main process, so start 
 that process (exec form); a shell wrapper that runs it without `exec` may not forward the signal.
 Both platforms force-kill after a grace period (by default 30 s for Kubernetes'
 `terminationGracePeriodSeconds` and 10 s for `docker stop --time`), which is below the shutdown
-timeout above. Set the grace period above `--shutdown-timeout`, with room for shutdown overhead
-and any pre-stop hook, or the drain is killed.
+timeout above. Set the grace period above the sum of `--shutdown-timeout` and
+`--endpoint-plugin-stop-timeout`, with room for process exit and any pre-stop hook, or the drain
+is killed.
 
 ## Operations
 
-- The kill grace (for Kubernetes, `terminationGracePeriodSeconds`) is above `--shutdown-timeout`,
-  with room for the plugin's `stop` and the engine's shutdown, so a kill does not cut the drain and
-  its settlement short.
-- At a zero shutdown budget (core's default `--shutdown-timeout 0`) core calls no `drain` and stops
-  the engine before it calls `stop`, so the kill grace is the only bound, besides a repeated
-  signal, on a `stop` that waits on a stopped engine.
+- The kill grace (for Kubernetes, `terminationGracePeriodSeconds`) is above the sum of
+  `--shutdown-timeout` and `--endpoint-plugin-stop-timeout` (5 s by default), so a kill does not
+  cut short the drain, the engine's shutdown or the plugin's `stop`. Core starts the stop limit
+  when the drains and engine shutdown have ended.
+- At a zero drain budget (core's default `--shutdown-timeout 0`, or
+  `--endpoint-plugin-drain-timeout 0`) core calls no `drain` and stops the engine before it calls
+  `stop`, so `stop` runs the whole settlement on a stopped engine and can need up to
+  `session_cleanup_timeout` (30 s by default) plus the factory settlement. A deployment with a zero
+  drain budget sets `--endpoint-plugin-stop-timeout` above `session_cleanup_timeout`, for example
+  `--endpoint-plugin-stop-timeout 35`. Otherwise core cancels `stop` at the limit and stops waiting
+  for it, and owner cleanup may be cut short.
 - The serve mode that runs core's Rust frontend is unsupported: it starts a Rust frontend process
   instead of Python API-server processes, so no endpoint plugin loads and the frontend's startup
   checks never run.

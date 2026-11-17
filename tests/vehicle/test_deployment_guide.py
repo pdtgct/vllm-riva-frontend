@@ -2,9 +2,10 @@
 
 The guide is parsed as text: the ``VLLM_PLUGINS`` assignment, the JSON
 objects passed to ``--additional-config`` and ``--stream-admission-timeouts``,
-``--shutdown-timeout``, the reference serve command (the first ``bash``
-block that runs ``vllm serve``), its ``--max-model-len`` and core's
-decode-duration limit. A required statement is checked
+``--shutdown-timeout`` and ``--endpoint-plugin-drain-timeout``, the
+reference serve command (the first ``bash`` block that runs ``vllm serve``),
+its ``--max-model-len`` and core's decode-duration limit. A required
+statement is checked
 as a paragraph or list item of the guide that carries every term the
 statement needs, so a term scattered over unrelated paragraphs does not
 count.
@@ -82,12 +83,17 @@ def stream_admission_timeouts(text: str) -> dict[str, Any]:
     return merged
 
 
-def flag_number(text: str, flag: str) -> float:
+def optional_flag_number(text: str, flag: str) -> float | None:
     match = re.search(
         re.escape(flag) + r"[ =]+([0-9][0-9_]*(?:\.[0-9]+)?)", text
     )
-    assert match, f"the guide sets {flag}"
-    return float(match.group(1).replace("_", ""))
+    return float(match.group(1).replace("_", "")) if match else None
+
+
+def flag_number(text: str, flag: str) -> float:
+    value = optional_flag_number(text, flag)
+    assert value is not None, f"the guide sets {flag}"
+    return value
 
 
 def model_budget(seconds: float, lookahead: int) -> int:
@@ -223,12 +229,37 @@ def test_guide_passes_frontend_options_that_validate() -> None:
 
 
 # @spec ING-EP-113
-def test_guide_shutdown_timeout_exceeds_the_engine_draining_timeout() -> None:
+def test_guide_drain_target_exceeds_the_engine_draining_timeout() -> None:
+    """The drain's graceful-work target ``D`` lies past ``draining_timeout``.
+
+    Core gives plugin drains ``--endpoint-plugin-drain-timeout`` seconds of
+    ``--shutdown-timeout`` (half of it when the flag is omitted) and the
+    frontend keeps ``engine_reserve`` of that budget, so ``D`` falls
+    ``T - engine_reserve(T)`` after the drain begins.
+    """
+    from vllm_riva_frontend.lifecycle import engine_reserve
+
     text = guide_text()
+    command = reference_command(text)
     draining = stream_admission_timeouts(text).get(
         "draining_timeout", DEFAULT_DRAINING_TIMEOUT
     )
-    assert flag_number(text, "--shutdown-timeout") > draining
+    shutdown = flag_number(command, "--shutdown-timeout")
+    drain_budget = optional_flag_number(
+        command, "--endpoint-plugin-drain-timeout"
+    )
+    if drain_budget is None:
+        drain_budget = shutdown / 2
+    assert drain_budget <= shutdown, (
+        "core refuses an --endpoint-plugin-drain-timeout above "
+        "--shutdown-timeout"
+    )
+    target = drain_budget - engine_reserve(drain_budget)
+    assert target > draining, (
+        f"the drain target {target:g} s is not above draining_timeout "
+        f"{draining:g} s (drain budget {drain_budget:g} s of "
+        f"--shutdown-timeout {shutdown:g} s)"
+    )
 
 
 # @spec ING-EP-113
@@ -452,19 +483,24 @@ OPERATION_STATEMENTS = {
         r"data parallel",
         r"\b1\b",
     ),
-    "the kill grace (terminationGracePeriodSeconds) is above "
-    "--shutdown-timeout with room for stop and the engine's shutdown": (
+    "the kill grace (terminationGracePeriodSeconds) is above the sum of "
+    "--shutdown-timeout and --endpoint-plugin-stop-timeout": (
         r"terminationGracePeriodSeconds",
         r"--shutdown-timeout",
-        r"\bstop\b",
-        r"engine",
+        r"--endpoint-plugin-stop-timeout",
+        r"\bsum\b|\bplus\b",
     ),
-    "at a zero shutdown budget the kill grace is the only bound besides a "
-    "repeated signal on a stop that waits on a stopped engine": (
+    "at a zero drain budget stop runs the whole settlement on a stopped "
+    "engine and can need up to session_cleanup_timeout plus the factory "
+    "settlement, so the deployment sets --endpoint-plugin-stop-timeout above "
+    "session_cleanup_timeout; otherwise core cancels stop and owner cleanup "
+    "may be cut short": (
         r"\bzero\b|--shutdown-timeout 0\b|\b0 s\b",
-        r"repeated signal",
-        r"\bstop\b",
         r"stopped engine",
+        r"factory settlement",
+        r"--endpoint-plugin-stop-timeout\b.*\babove\b.*session_cleanup_timeout",
+        r"\bcancels\b.*\bstop\b",
+        r"cut short",
     ),
     "the serve mode that runs core's Rust frontend is unsupported, because "
     "no endpoint plugin loads there": (
