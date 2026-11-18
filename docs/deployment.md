@@ -96,8 +96,9 @@ Both platforms force-kill after a grace period (by default 30 s for Kubernetes'
 `terminationGracePeriodSeconds` and 10 s for `docker stop --time`), which is below the shutdown
 timeout above. Set the grace period above the sum of `--shutdown-timeout` and
 `--endpoint-plugin-stop-timeout`, with room for process exit and any pre-stop hook, or a kill cuts
-the nominal shutdown short. A drain settlement that runs past its deadline delays engine shutdown
-and `stop` by its overrun, and a kill at the grace period can then still cut them short.
+the nominal shutdown short. A drain settlement that runs past its deadline first takes time from
+engine shutdown, and can delay `stop` once it runs past the end of `--shutdown-timeout`; a kill at
+the grace period can then still cut them short.
 
 ## Operations
 
@@ -105,9 +106,9 @@ and `stop` by its overrun, and a kill at the grace period can then still cut the
   `--shutdown-timeout` and `--endpoint-plugin-stop-timeout` (5 s by default), the length of the
   nominal shutdown: the drains and engine shutdown within `--shutdown-timeout`, then the plugin's
   `stop` within the stop limit, which core starts when the drains and engine shutdown have ended.
-  A drain settlement that runs past its deadline (Shutdown, above) lengthens the shutdown by its
-  overrun, so a kill at the grace period can still cut the settlement, the engine's shutdown or
-  `stop` short.
+  A drain settlement that runs past its deadline (Shutdown, above) first takes time from engine
+  shutdown, and can lengthen the shutdown once it runs past the end of `--shutdown-timeout`, so a
+  kill at the grace period can still cut the settlement, the engine's shutdown or `stop` short.
 - At a zero drain budget (core's default `--shutdown-timeout 0`, or
   `--endpoint-plugin-drain-timeout 0`) core calls no `drain` and stops the engine before it calls
   `stop`, so `stop` runs the whole settlement on a stopped engine and can need up to

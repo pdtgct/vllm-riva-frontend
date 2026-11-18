@@ -202,8 +202,9 @@ owners from the moment core sets it, before or without a `drain` call.
   no owner remains (a call whose request message has not yet arrived is invisible to the plugin
   and can hold the stop to the deadline, never past it); then `factory.drain(...)`, logging the
   faults it returns. The settle point is a target for graceful work that leaves core time to shut
-  the engine down; core reserves no engine allowance, and settlement (below) takes precedence over
-  that target.
+  the engine down; core's engine allocation, the rest of `--shutdown-timeout` after
+  `--endpoint-plugin-drain-timeout`, is nominal, since a late settlement consumes it, and
+  settlement (below) takes precedence over that target.
 - **Settlement.** RFC 2 requires a plugin to settle or abort, and await, all work it owns before
   `drain` returns, raises or is cancelled, and `stop` to settle any background work. So when the
   deadline passes, or `drain` fails or is cancelled, the frontend settles in one order: owner
