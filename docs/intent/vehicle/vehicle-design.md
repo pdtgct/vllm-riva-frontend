@@ -275,11 +275,15 @@ provides no hook between a completed `init_state` and `start` (it calls `stop` o
 whose `start` completed), and this invariant is what makes a startup failure in that interval,
 for instance another plugin's `init_state` raising, leave nothing of this plugin's running.
 
-If `--shutdown-timeout` is 0, `init_state` logs a warning that no `drain` will run and that
-shutdown is `stop` alone. With that budget core stops the engine before it calls `stop`
-(`stop(state)`), so `stop`'s settlement ends only when the lease calls and the retirement wait
-end on a stopped engine; if one of them does not, only a repeated signal or the orchestrator's
-kill grace (Deployment) ends the process.
+If `--shutdown-timeout` is 0, or `--endpoint-plugin-drain-timeout` is 0, `init_state` logs a
+warning that names the setting, says that no `drain` will run and that shutdown is `stop` alone.
+It reads `--shutdown-timeout` from `engine_client.vllm_config` and
+`--endpoint-plugin-drain-timeout` from `state.args`, where core's launcher reads them; an unset
+drain timeout means half of `--shutdown-timeout`, which is 0 only when `--shutdown-timeout` is.
+The warning names the setting because the two causes have different remedies. With a zero drain
+budget core stops the engine before it calls `stop` (`stop(state)`), so `stop`'s settlement ends
+only when the lease calls and the retirement wait end on a stopped engine. Core waits for `stop`
+no longer than `--endpoint-plugin-stop-timeout`, then cancels it and stops waiting (Deployment).
 
 #### Engine deadlines and the frontend's bounds
 
@@ -484,8 +488,11 @@ does not read it. The operational readiness route reports it alone (operations l
 
 `drain` computes the core deadline, `now + timeout`, and a target for graceful work,
 `D = deadline - engine_reserve`, where `engine_reserve = max(5 s, 10% of timeout)`. The target is
-meant to leave core time to shut the engine down; core reserves no engine allowance and passes the
-engine only what remains, and settlement (below) takes precedence over the target. Every wait of
+meant to leave core time to shut the engine down, and settlement (below) takes precedence over the
+target. Core reserves engine time of its own through `--endpoint-plugin-drain-timeout`, which gives
+the drains a part of `--shutdown-timeout` (half by default) and leaves engine shutdown what remains
+of `--shutdown-timeout` once the drains have settled, so `engine_reserve` is an additional margin
+inside the drain budget. Every wait of
 graceful work inside `drain`, including each lease call's bound and the factory wait, is at most the
 time remaining to `D`: its own bound clipped to `D`, never enlarged. The one exception is a stream
 cleanup that begins during graceful drain, which takes the time remaining to `D` in place of
@@ -666,8 +673,9 @@ This order settles the case where an owner's `abort` outlives its cleanup bound.
 factory cleanup task, which waits for the retirement and then for that generation task; step 1
 awaits the cleanup task, and the generation task completes its abort before `teardown_all` runs.
 
-The awaits have no fixed time limit; they are cooperative, as core's own shutdown is, and core's
-exit on a repeated signal bounds a hang. A further cancellation of `drain` during settlement does
+The awaits have no fixed time limit; they are cooperative, as core's own shutdown is. Core waits
+for a drain to end without a limit of its own, so only the orchestrator's kill grace bounds a hang
+in a drain's settlement. A further cancellation of `drain` during settlement does
 not interrupt it: settlement continues, and `drain` re-raises the cancellation after it completes,
 however many cancellations arrive. When a step raised and `drain` was also cancelled, the
 cancellation is re-raised; otherwise the step's exception is, after settlement. When settlement
@@ -712,10 +720,16 @@ the model plugin's `abort` and `release`, the retirement wait and the abort of a
 `generate()` task end on an engine that core has stopped, and a required test establishes it against
 the real factory on a stopped engine. That test runs in the model plugin repository's conformance
 suite on the RFC 1 + RFC 2 build with a real engine client (its GPU lane); the frontend's RFC 2-only
-CPU lane covers the same settlement order with the fake factory. A call that never ends there holds
-`stop` until a repeated signal or the orchestrator's kill grace ends the process (Deployment). The
-same holds on a live engine for a `generate()` task or engine-client call that never ends after its
-cancellation, or a retirement wait that never returns.
+CPU lane covers the same settlement order with the fake factory. Core bounds all `stop` hooks
+together with `--endpoint-plugin-stop-timeout` (5 s by default, counted from the end of the drains
+and engine shutdown): at that limit it cancels the running `stop` and abandons it. `stop` runs its
+steps to the end through a cancellation, so the abandoned settlement continues until the process
+exits, and owner cleanup still in progress then may be cut short. On a stopped engine `stop` can
+need up to `session_cleanup_timeout` for its owners' cleanup plus the factory settlement, so a
+deployment with a zero drain budget sets `--endpoint-plugin-stop-timeout` above
+`session_cleanup_timeout` (Deployment). The same limit applies on a live engine to a `generate()`
+task or engine-client call that never ends after its cancellation, or a retirement wait that never
+returns.
 
 `stop` starts no engine work of its own: the lease calls of its owners are the cleanup the
 session leaf prescribes, and a cancelled `generate()` task completes the engine client's abort of
@@ -842,8 +856,14 @@ The repository's deployment guide, `docs/deployment.md`, sets:
   must be named too;
 - `--additional-config` carrying `riva_frontend` options, and, when the engine's stream deadlines
   change, `--stream-admission-timeouts` with the changed keys;
-- `--shutdown-timeout` above the engine's drain time (the engine's `draining_timeout` default is
-  40 s; 60 s is the documented value);
+- `--shutdown-timeout` and `--endpoint-plugin-drain-timeout` such that the drain budget `T` (the
+  latter, or half of `--shutdown-timeout` when it is omitted) is at most `--shutdown-timeout` and
+  its graceful-work target `T - engine_reserve(T)` is above the engine's `draining_timeout` (40 s
+  by default); the documented values are 60 s and 50 s, which put `D` 45 s after the drain begins
+  and nominally leave engine shutdown 10 s. That allocation holds when the drains settle by their
+  deadline: core cancels a drain still running at its deadline and then awaits its settlement with
+  no limit, and engine shutdown gets `max(0, --shutdown-timeout - elapsed)`, so a settlement that
+  ends at 55 s leaves it 5 s and one that ends after 60 s leaves it none;
 - the model plugin's own serve flags (HLD Constraints). The reference deployment sets no
   lookahead, so the model plugin serves the default lookahead that the checkpoint's model
   configuration sets (3, or 320 ms, for the reference checkpoint), and the Riva streaming surfaces,
@@ -893,10 +913,17 @@ The guide also sets:
   puts an intermediary in front that adds the token to the bootstrap request and the WebSocket
   handshake.
 - **Kill grace.** The orchestrator's grace period before it kills the process (for Kubernetes,
-  `terminationGracePeriodSeconds`) is above `--shutdown-timeout`, with room for `stop` and the
-  engine's shutdown, so the drain and its settlement are not cut short by a kill. At a zero
-  shutdown budget the kill grace is also the only bound, besides a repeated signal, on a `stop`
-  whose settlement waits on an engine call that does not end on the stopped engine (`stop(state)`).
+  `terminationGracePeriodSeconds`) is above the sum of `--shutdown-timeout` and
+  `--endpoint-plugin-stop-timeout`, the length of the nominal shutdown: the drains and engine
+  shutdown within `--shutdown-timeout`, then `stop` within its limit. A drain settlement that runs
+  past its deadline first takes time from engine shutdown, and can lengthen the shutdown once it
+  runs past the end of `--shutdown-timeout`, so a kill at the grace period can still cut the
+  settlement, the engine's shutdown or `stop` short.
+- **Stop limit at a zero drain budget.** With `--shutdown-timeout` 0 or
+  `--endpoint-plugin-drain-timeout` 0, `stop` runs the whole settlement on a stopped engine and can
+  need up to `session_cleanup_timeout` (30 s by default) plus the factory settlement. A deployment
+  with that budget sets `--endpoint-plugin-stop-timeout` above `session_cleanup_timeout`; otherwise
+  core cancels `stop` at that limit and owner cleanup may be cut short (`stop(state)`).
 - **Python API server only.** The serve mode that runs core's Rust frontend
   (`vllm/entrypoints/cli/serve.py`) starts a Rust frontend process instead of Python API-server
   processes, so no endpoint plugin loads and `init_state`'s checks never run. The frontend does not
@@ -927,22 +954,22 @@ The guide also sets:
 | Route collisions | Raise in `attach_router` for any route of the frontend (all are new) that an existing HTTP route, WebSocket route or mount would serve | Last registration wins (core's behaviour); check HTTP routes only | Core overrides silently; two plugins serving one path is a deployment error that should stop the server; a WebSocket route or mount earlier in the table wins over a later route, so checking HTTP routes alone misses it |
 | Core's route table | CPU tests verify that core's table with the plugin is core's table without it plus exactly the frontend's namespaced routes | Check only that the frontend's routes are present | The namespace exists so that core's surfaces do not depend on which plugins load; only a comparison against core's own table shows that no core route changed |
 | Configuration channel | `--additional-config` key `riva_frontend`, strict validator, errors listed together | A separate flag; a file path option | One flag surface already exists and core's own settings use it; strictness names the failing option. Core hashes `additional_config` into the compile cache key, which costs nothing under eager execution |
-| Plugin shutdown budget | No separate plugin shutdown budget; `drain` uses the time core passes it | A `plugin_shutdown_grace` option as the drain budget | Core passes `drain` the remaining `--shutdown-timeout`; two budgets would disagree |
+| Plugin shutdown budget | No separate plugin shutdown budget; `drain` uses the time core passes it | A `plugin_shutdown_grace` option as the drain budget | Core passes `drain` the time left to its drain deadline, which `--shutdown-timeout` and `--endpoint-plugin-drain-timeout` set; two budgets would disagree |
 | File backlog and streams | File owners count against a sub-cap `max_file_owners` inside the ingress cap | One shared cap | A backlog of waiting files would fill a shared cap and refuse streams with `busy`; the sub-cap leaves streams the remaining headroom |
 | Sub-unit traffic | The engine is the authority; document the limit | A frontend check on units delivered; a seam change | The engine's clock resets on units sent, which the frontend cannot observe without a seam change; the engine's expiry is already a safe backstop |
 | Startup order | Factory built last; any later failure runs the factory settlement; admission opens last in `start`; a failed or cancelled `start` tears the factory down and awaits what it cancels before re-raising | Build it first; re-raise without awaiting | A factory owns engine-facing tasks, so a failed startup must not leave any, and core calls `stop` only for a plugin whose `start` completed; admitting before `start` completes would admit owners into a failing plugin |
 | Live streams at drain | The frontend finalizes them at the settle point (tail, `flush`, final, then gRPC `OK` or WebSocket 1001); failures abort with `UNAVAILABLE` or 1012 | Cancel everything at the settle point; wait for clients | Clients that sent audio get a complete transcript; an aborted stream is told to retry elsewhere |
-| Drain with no owner left | Step 2 ends when the last owner ends, and at once when none is open | Hold `NOT_SERVING` on a serving listener until the settle point, owners or not | Holding keeps an idle server in its drain for most of its budget (49 s of the documented 60 s) and delays engine shutdown and exit by as much; health and core's `/ready` already report `NOT_SERVING` and 503 from the start of the drain, and a client that reaches a closed listener retries elsewhere just as it does on `NOT_SERVING` |
+| Drain with no owner left | Step 2 ends when the last owner ends, and at once when none is open | Hold `NOT_SERVING` on a serving listener until the settle point, owners or not | Holding keeps an idle server in its drain for most of its budget (40 s of the documented 50 s drain budget) and delays engine shutdown and exit by as much; health and core's `/ready` already report `NOT_SERVING` and 503 from the start of the drain, and a client that reaches a closed listener retries elsewhere just as it does on `NOT_SERVING` |
 | Non-owner RPCs at the listener stop | One graceful stop; once no owner remains, the plugin ends each health `Watch` and reflection stream with `UNAVAILABLE` and refuses new ones the same way | A second stop without grace once the registry holds no owner | An owner's record leaves the registry before gRPC has sent its handler's response, so a stop without grace at that moment cuts a reply already being sent (a large `Recognize` response most of all); gRPC's graceful stop already waits for exactly the RPCs still sending, and only the RPCs that own nothing need ending |
-| Drain deadline | A graceful-work target `D = deadline - max(5 s, 10% of timeout)`; settlement may run past it | The full core deadline | The target aims to leave core time to shut the engine down after plugins drain; core reserves no engine allowance, so the target is not a guarantee, and settlement takes precedence |
+| Drain deadline | A graceful-work target `D = deadline - max(5 s, 10% of timeout)`; settlement may run past it | The full core deadline | The target aims to leave core time to shut the engine down after plugins drain; core's engine allocation, the rest of `--shutdown-timeout` after `--endpoint-plugin-drain-timeout`, is nominal because a late settlement consumes it, so the target is not a guarantee, and settlement takes precedence |
 | Shutdown settlement | Graceful work within `D`, then abort and await every owner, continuation, unsettled send and the fault collector, then the factory settlement, before `drain` returns, raises or re-raises a cancellation | Return at the deadline with work still cancelling; leave the remainder to `stop` | RFC 2 requires owned work to be settled so that it cannot submit engine requests after the hook returns; core shuts the engine down once `drain` returns |
 | Factory settlement | Owners, continuations and unsettled sends settle and the fault collector ends; then `factory.drain(math.inf)`, then `teardown_all()`, await every task it returns, then `factory.drain(now)` once more, and report the faults both `drain` calls return plus last-resort cancellations | `teardown_all()` first and await what it returns; `factory.drain` with a large finite deadline, then `teardown_all()`; the lease's `teardown()` on bound expiry | `teardown_all` cancels unconditionally, so calling it while a generation task is still completing the engine client's abort (after `abort` or a cancelled `open`) interrupts that abort. `factory.drain(math.inf)` lets every handed-over generation task finish its cancellation, so the later `teardown_all` cancels only ended tasks. A finite bound reintroduces a deadline after which `teardown_all` would cancel a task still awaiting the abort. `teardown()` also cancels again and starts no factory task that the settlement could await |
-| Cancellation of a generation task | Owned by the party that ends the session: `abort` or a cancelled `open`; no cancellation reaches a generation task after its cancellation handler has begun; the vehicle cancels a factory task only as a last resort, when `teardown_all` returns one still running, and records it as a fault | `teardown_all` alone, as the single cancellation; re-cancel still-running tasks periodically; a change to `teardown_all` so that it skips tasks already cancelled; a literal limit of one `cancel()` request per task | The session leaf's cleanup cancels the generation task through `abort` before the factory closes, so `teardown_all` can never be the only cancellation; a cancellation delivered while the task awaits the engine client's abort interrupts that abort. A cancelled `open` requests cancellation twice with no suspension between the requests, which is harmless, so a request count is the wrong property to test. Skipping cancelled tasks in `teardown_all` would alter its terminal contract (it cancels every task it owns, `SESS-OWN-005`) for a case the settlement order already makes safe; the model-plugin code change the frontend does require is confined to fault retention (Open Questions, Dependencies). Core's repeated-signal exit bounds a task that never ends |
+| Cancellation of a generation task | Owned by the party that ends the session: `abort` or a cancelled `open`; no cancellation reaches a generation task after its cancellation handler has begun; the vehicle cancels a factory task only as a last resort, when `teardown_all` returns one still running, and records it as a fault | `teardown_all` alone, as the single cancellation; re-cancel still-running tasks periodically; a change to `teardown_all` so that it skips tasks already cancelled; a literal limit of one `cancel()` request per task | The session leaf's cleanup cancels the generation task through `abort` before the factory closes, so `teardown_all` can never be the only cancellation; a cancellation delivered while the task awaits the engine client's abort interrupts that abort. A cancelled `open` requests cancellation twice with no suspension between the requests, which is harmless, so a request count is the wrong property to test. Skipping cancelled tasks in `teardown_all` would alter its terminal contract (it cancels every task it owns, `SESS-OWN-005`) for a case the settlement order already makes safe; the model-plugin code change the frontend does require is confined to fault retention (Open Questions, Dependencies). Core's `--endpoint-plugin-stop-timeout` bounds how long it waits in `stop` for a task that never ends, and the orchestrator's kill grace bounds a drain's wait |
 | Factory seam obligation | The frontend imposes the numbered obligations of the session leaf (Factory obligations 1 to 8) on every factory, checks them in its seam conformance suite, and is owed them as statements in the model plugin's session specification; obligations 3 and 4 (retained faults, sole reporter) also need a change to the model plugin's code. The suite also tests what `SESS-OWN-004`, `SESS-OWN-005`, `SESS-OWN-006`, `SESS-REL-003` and `SESS-ABORT-002` state | Settle through a new factory method that also awaits; collect faults from the tasks `teardown_all` returns; leave the coverage untested | After `drain(math.inf)` an ended cleanup task has left the factory's table and dropped its session, so `teardown_all` no longer returns it or its generation task, and the done-callback that retrieves a generation task's exception consumes it without recording it: an exception raised while the task awaits the engine abort would never be reported. Only the factory sees every task it owns, so it must keep their faults. The model plugin's factory already accepts an infinite deadline (its wait timeout is the non-negative time to the deadline), its cleanup tasks already await the generation task, and its `release` first suspends inside the covered retirement wait, but its specification states none of these; a gap in another factory would break `drain`'s guarantee silently, so the suite that every factory runs checks every obligation |
 | Cleanup after the drain deadline | `session_cleanup_timeout`, then the same cancelled-`release` hand-over as before the deadline; the factory settlement ends whatever the hand-over leaves | The time remaining to `D`; unbounded `abort` and `release`; the lease's `teardown()` on expiry | After `D` the remaining time is zero, which would skip `abort` and `release`; an unbounded call can hang on a stuck engine; one expiry rule in and out of shutdown keeps the owner's sequence identical; the hand-over's cleanup task, which the factory settlement awaits, covers the generation task, which `teardown()` would cancel again while it awaits the engine client's abort, and leave unawaited |
 | Rollback ownership of factories | The vehicle settles every constructed factory: a discarded candidate when discarded, the selected one on any later failure or at shutdown; the constructor and `init_state` start no task | Settle only the selected factory; allow constructors that start tasks | A discarded candidate is still a factory whose tasks nobody else would end; core has no hook between `init_state` and `start`, so only an inert factory makes a failure in that interval safe |
 | `stop` order | `drain`'s settlement order: owners take the shutdown abort row, then the factory settlement | Close the factory first and have owners call the lease's `teardown()` | Core does not guarantee a stopped engine when `stop` runs, so a further cancellation of an aborted generation task could still interrupt the engine client's abort; one settlement order serves `drain`, `stop` and rollback |
-| `stop` wait | Await every owner, continuation, send and factory task, with no fixed time limit | A fixed 1 s wait that returns whether or not tasks finished | RFC 2 makes `stop` cooperative and requires it to settle background work; a task left running could still call the engine client while core deletes app state. Core's repeated-signal exit bounds a hang |
+| `stop` wait | Await every owner, continuation, send and factory task, with no fixed time limit | A fixed 1 s wait that returns whether or not tasks finished | RFC 2 makes `stop` cooperative and requires it to settle background work; a task left running could still call the engine client while core deletes app state. Core's `--endpoint-plugin-stop-timeout` bounds how long it waits for `stop` |
 | Refusal sends during settlement | Each admission or query refusal send is awaited inline by its own handler under `response_send_timeout`; a send abandoned after its bound enters the registry from the moment of abandonment while the registry is open; settlement closes the registry before its final wait, and a refusal send that passes its bound after that is cancelled and awaited by its own handler | Register every refusal send in the registry when it starts; snapshot the abandoned sends when settlement begins; refuse all requests without sending once settlement begins | Core keeps HTTP serving while plugins drain, so refusals arrive during settlement. A snapshot misses a send abandoned while the final wait runs, which then outlives `drain` as detached plugin work. Registering every send at creation adds a registry entry to the common path for a case the close already settles. Refusing without a send would drop the `service_unavailable` answer that tells a client to retry elsewhere |
 | Fault reporting across settlements | The factory is the sole reporter of its tasks' faults, each exactly once through `drain`; the vehicle reports `drain`'s faults as returned, calls `factory.drain(now)` again after awaiting what `teardown_all` returns, and originates only last-resort cancellations, keyed by the task it saw cancelled | Merge `drain`'s faults with the exceptions of the tasks `teardown_all` returns and deduplicate per task; report everything `teardown_all` returns each time | `drain` returns exceptions without the task that raised them, and exception identity is not task identity (two tasks can raise one object; a retained retirement failure is not the cleanup task's own result), so a per-task deduplication cannot be implemented through the seam. `teardown_all` returns ended tasks still in the factory's table again, so reading their exceptions makes `stop` after a `drain` settlement log the same faults twice. One reporter makes repetition impossible by construction |
 | Ending the fault collector | Signal it and await its end; its call in progress finishes | Cancel it | The factory clears faults as `drain` returns them, so cancelling a call in progress could lose the faults it was taking |

@@ -643,9 +643,10 @@ every engine-facing task of its sessions, including the cleanup of a session who
 2. Outside shutdown, a cleanup that expires while its `abort` is cancelled mid-flight leaves the
    factory to retire the session through the cancelled `release`; the factory's cleanup task has
    no deadline of its own, so a stuck engine call holds that session until shutdown, where the
-   factory settlement awaits it and core's repeated-signal exit bounds the wait. This cleanup
-   order relies on the model plugin's `SESS-ABORT-002`: a cancelled `abort` leaves the lease
-   `aborted`, where `release` is allowed.
+   factory settlement awaits it; core bounds that wait in `stop` with
+   `--endpoint-plugin-stop-timeout`, and in a drain only the orchestrator's kill grace bounds it.
+   This cleanup order relies on the model plugin's `SESS-ABORT-002`: a cancelled `abort` leaves
+   the lease `aborted`, where `release` is allowed.
 
 ## References
 

@@ -17,8 +17,8 @@ paths are in the RFC 1 + RFC 2 tree):
   (``vllm/config/scheduler.py:62``, ``:69``);
 * ``vllm_config.parallel_config.data_parallel_size``
   (``vllm/config/parallel.py:155``);
-* ``vllm_config.shutdown_timeout`` (``vllm/config/vllm.py:482``; the launcher
-  passes it to ``drain_endpoint_plugins``);
+* ``vllm_config.shutdown_timeout`` (``vllm/config/vllm.py:484``; the launcher
+  derives from it the deadline it passes to ``drain_endpoint_plugins``);
 * ``model_config.served_model_name`` and ``model_config.max_model_len``
   (``vllm/config/model.py:336``, ``:256``).
 

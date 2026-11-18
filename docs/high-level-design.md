@@ -202,8 +202,9 @@ owners from the moment core sets it, before or without a `drain` call.
   no owner remains (a call whose request message has not yet arrived is invisible to the plugin
   and can hold the stop to the deadline, never past it); then `factory.drain(...)`, logging the
   faults it returns. The settle point is a target for graceful work that leaves core time to shut
-  the engine down; core reserves no engine allowance, and settlement (below) takes precedence over
-  that target.
+  the engine down; core's engine allocation, the rest of `--shutdown-timeout` after
+  `--endpoint-plugin-drain-timeout`, is nominal, since a late settlement consumes it, and
+  settlement (below) takes precedence over that target.
 - **Settlement.** RFC 2 requires a plugin to settle or abort, and await, all work it owns before
   `drain` returns, raises or is cancelled, and `stop` to settle any background work. So when the
   deadline passes, or `drain` fails or is cancelled, the frontend settles in one order: owner
@@ -220,8 +221,9 @@ owners from the moment core sets it, before or without a `drain` call.
   cancelled by `abort` or a cancelled `open` and receives no cancellation after its cancellation
   handler has begun, so the engine client's abort of its request is never interrupted. No frontend
   or factory task can then submit engine work while core shuts the engine down. The deadline bounds
-  the graceful work; the settlement after it is cooperative and has no fixed time limit, as in core,
-  whose repeated-signal exit bounds a hang.
+  the graceful work; the settlement after it is cooperative and has no fixed time limit. Core waits
+  for a drain to end without a limit of its own, so only the orchestrator's kill grace bounds a hang
+  there.
 - **Startup rollback.** Core calls `stop` only for a plugin whose `start` completed. When
   `init_state` or `start` fails after the factory or a task exists, the frontend cancels and awaits
   the tasks it started, then settles the factory in the same order (`factory.drain(math.inf)`, then
@@ -229,12 +231,18 @@ owners from the moment core sets it, before or without a `drain` call.
 - **`stop(state)`.** Terminal: mark torn down and run the same settlement as `drain`, because core
   does not guarantee a stopped engine when `stop` runs; because only the factory reports task
   faults, nothing a `drain` settlement reported is reported again. It starts no engine work of its
-  own beyond its owners' `abort` and `release`, and has no fixed time limit. With core's default
-  zero shutdown budget, core stops the engine before `stop`, so `stop` completes only if `abort`,
-  `release` and the retirement wait end on a stopped engine. A test in the model plugin repository's
-  conformance suite, on the RFC 1 + RFC 2 build with a real engine client (its GPU lane),
-  establishes that they do; the frontend's RFC 2-only CPU lane covers the same order with a fake
-  factory. A hang there is bounded only by a repeated signal or the orchestrator's kill grace.
+  own beyond its owners' `abort` and `release`, and has no fixed time limit of its own. Core bounds
+  all `stop` hooks together with `--endpoint-plugin-stop-timeout` (5 s by default, counted from the
+  end of the drains and engine shutdown); at that limit core cancels the running `stop` and stops
+  waiting for it. At a zero drain budget (core's default `--shutdown-timeout` of 0, or
+  `--endpoint-plugin-drain-timeout` 0), core stops the engine before `stop`, so `stop` runs the
+  whole settlement on a stopped engine and completes only if `abort`, `release` and the retirement
+  wait end there; it can need up to `session_cleanup_timeout` plus the factory settlement. A
+  deployment with that budget sets `--endpoint-plugin-stop-timeout` above `session_cleanup_timeout`;
+  otherwise core cancels `stop` at its limit and owner cleanup may be cut short. A test in the model
+  plugin repository's conformance suite, on the RFC 1 + RFC 2 build with a real engine client (its
+  GPU lane), establishes that those calls end on a stopped engine; the frontend's RFC 2-only CPU
+  lane covers the same order with a fake factory.
 - **Faults.** A frontend task collects the factory's retained faults while serving (calling the
   factory's `drain` with an immediate deadline, serialized with the shutdown `drain`), and a
   listener monitor watches the gRPC server. The factory retains exactly the faults no caller can

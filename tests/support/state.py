@@ -89,6 +89,7 @@ def make_args(**overrides: Any) -> Namespace:
         "enable_log_requests": False,
         "max_log_len": None,
         "log_error_stack": False,
+        "endpoint_plugin_drain_timeout": None,
     }
     values.update(overrides)
     return Namespace(
